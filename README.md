@@ -1,4 +1,4 @@
-# QuantumVault — C++ Edition (Enhanced Skeleton, v4.1)
+# QuantumVault — C++ Edition
 
 Security-first encrypted filesystem with plugin architecture.
 
