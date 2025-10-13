@@ -19,6 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # TSK022
+
+      - name: Install dudect runner # TSK022
+        run: python -m pip install --upgrade pip dudect
+
       - name: Install dependencies (Ubuntu) # TSK018
         if: runner.os == 'Linux'
         run: |
@@ -94,6 +101,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # TSK022
+
+      - name: Install dudect runner # TSK022
+        run: python -m pip install --upgrade pip dudect
 
       - name: Install dependencies (Ubuntu) # TSK018
         run: |

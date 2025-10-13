@@ -265,14 +265,20 @@ struct TimingSnapshot {
 };
 
 struct TimingState {
+  enum class Mode { Calibrating, Production }; // TSK022
+
   std::atomic<uint64_t> target_ns{120'000'000};
   std::atomic<uint64_t> last_log_ns{0};
+  std::atomic<Mode> mode{Mode::Calibrating};       // TSK022
+  std::atomic<uint64_t> fixed_target_ns{kConfiguredP99Ns}; // TSK022
   std::mutex mutex;
   std::array<uint64_t, kHistogramBuckets> histogram{};
   uint64_t total_samples{0};
   uint64_t last_p95{0};
   uint64_t last_p99{0};
 };
+
+constexpr uint64_t kCalibrationSamples = 8192; // TSK022
 
 TimingState& GetTimingState() {
   static TimingState state;
@@ -284,7 +290,11 @@ void RecordSample(std::chrono::nanoseconds duration) {
   uint64_t ns = static_cast<uint64_t>(duration.count());
   size_t bucket = std::min<size_t>(ns / kHistogramBucketNs, kHistogramBuckets - 1);
   std::lock_guard<std::mutex> guard(state.mutex);
-  state.histogram[bucket] += 1;
+  for (size_t i = 0; i < kHistogramBuckets; ++i) { // TSK022
+    bool is_bucket = (i == bucket);
+    uint64_t increment = qv::crypto::ct::Select<uint64_t>(0, 1, is_bucket); // TSK022
+    state.histogram[i] += increment;
+  }
   state.total_samples += 1;
 
   if (state.total_samples < 8) {
@@ -317,16 +327,27 @@ void RecordSample(std::chrono::nanoseconds duration) {
   state.last_p99 = p99_bucket * kHistogramBucketNs;
 
   uint64_t desired = state.last_p99 + kPaddingSlackNs;
-  if (desired < kMinTargetNs) desired = kMinTargetNs;
-  if (desired > kConfiguredP99Ns) desired = kConfiguredP99Ns;
-  state.target_ns.store(desired, std::memory_order_relaxed);
+  desired = std::max<uint64_t>(desired, kMinTargetNs);   // TSK022
+  desired = std::min<uint64_t>(desired, kConfiguredP99Ns); // TSK022
+
+  auto mode = state.mode.load(std::memory_order_acquire); // TSK022
+  if (mode == TimingState::Mode::Calibrating) {           // TSK022
+    state.target_ns.store(desired, std::memory_order_relaxed);
+    state.fixed_target_ns.store(desired, std::memory_order_relaxed);
+    if (state.total_samples >= kCalibrationSamples) {
+      state.mode.store(TimingState::Mode::Production, std::memory_order_release);
+    }
+  }
 }
 
 TimingSnapshot SnapshotTiming() {
   TimingSnapshot snap{};
   auto& state = GetTimingState();
   std::lock_guard<std::mutex> guard(state.mutex);
-  snap.target_ns = state.target_ns.load(std::memory_order_relaxed);
+  auto mode = state.mode.load(std::memory_order_acquire);                // TSK022
+  snap.target_ns = (mode == TimingState::Mode::Production)
+                       ? state.fixed_target_ns.load(std::memory_order_relaxed)
+                       : state.target_ns.load(std::memory_order_relaxed); // TSK022
   snap.p95_ns = state.last_p95;
   snap.p99_ns = state.last_p99;
   snap.samples = state.total_samples;
@@ -335,10 +356,14 @@ TimingSnapshot SnapshotTiming() {
 
 std::chrono::nanoseconds ComputePadding(std::chrono::nanoseconds actual) {
   auto& state = GetTimingState();
-  uint64_t target = state.target_ns.load(std::memory_order_relaxed);
+  auto mode = state.mode.load(std::memory_order_acquire); // TSK022
+  uint64_t target = (mode == TimingState::Mode::Production)
+                        ? state.fixed_target_ns.load(std::memory_order_relaxed)
+                        : state.target_ns.load(std::memory_order_relaxed); // TSK022
   uint64_t actual_ns = static_cast<uint64_t>(actual.count());
-  uint64_t min_val = qv::crypto::ct::Select<uint64_t>(target, actual_ns, actual_ns < target);
-  uint64_t diff = target - min_val;
+  bool over_target = actual_ns > target;
+  uint64_t clamped = qv::crypto::ct::Select<uint64_t>(actual_ns, target, over_target); // TSK022
+  uint64_t diff = target - clamped;
   return std::chrono::nanoseconds(diff);
 }
 
@@ -445,7 +470,11 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
       std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
   bool mac_ok = qv::crypto::ct::CompareEqual(stored_mac, computed_mac);
 
-  uint32_t mask = (io_ok ? 1u : 0u) & (parsed.valid ? 1u : 0u) & (pqc_ok ? 1u : 0u) & (mac_ok ? 1u : 0u);
+  bool result = io_ok && parsed.valid && pqc_ok && mac_ok;                // TSK022
+  uint32_t mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, result);      // TSK022
+  std::atomic_signal_fence(std::memory_order_seq_cst);                   // TSK022
+  volatile uint32_t guard_mask = mask;                                   // TSK022
+  (void)guard_mask;                                                      // TSK022
 
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));

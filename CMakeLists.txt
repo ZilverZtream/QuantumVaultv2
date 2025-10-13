@@ -180,6 +180,15 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_constant_time_mount.cpp")
   add_test(NAME qv_constant_time_mount COMMAND qv_constant_time_mount_test)
 endif()
 
+  find_program(DUDECT_RUNNER dudect_runner)
+  if (DUDECT_RUNNER)
+    add_test(NAME constant_time_dudect
+             COMMAND ${DUDECT_RUNNER} --test=mount_timing --samples=1000000
+             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}) # TSK022
+  else()
+    message(WARNING "dudect_runner not found; constant-time analysis skipped") # TSK022
+  endif()
+
 endif()
 
 # --- Wiring check gate ---
