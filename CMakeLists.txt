@@ -195,6 +195,15 @@ endif()
     message(WARNING "dudect_runner not found; constant-time analysis skipped") # TSK022
   endif()
 
+  add_custom_target(fuzz_tests COMMENT "Build fuzzing targets") # TSK030
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_executable(qv_fuzz_header tests/fuzz/fuzz_header_parser.cpp) # TSK030
+    target_link_libraries(qv_fuzz_header PRIVATE qv_core qv_orchestrator) # TSK030
+    target_compile_options(qv_fuzz_header PRIVATE -fsanitize=fuzzer,address) # TSK030
+    target_link_options(qv_fuzz_header PRIVATE -fsanitize=fuzzer,address) # TSK030
+    add_dependencies(fuzz_tests qv_fuzz_header) # TSK030
+  endif()
+
 endif()
 
 # --- Wiring check gate ---
