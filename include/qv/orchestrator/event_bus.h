@@ -18,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include "qv/crypto/hmac_sha256.h" // TSK033 migration tooling reuse
 #include "qv/crypto/sha256.h"
 
 namespace qv::orchestrator {
@@ -72,8 +73,8 @@ namespace qv::orchestrator {
     void EnsureOpen();
     void RotateIfNeeded(size_t incoming_bytes);
     std::filesystem::path LogPath() const;
-    void EnsureKey();        // TSK029
-    bool VerifyLogFile();    // TSK029
+    void EnsureKey();               // TSK029
+    bool VerifyLogFile();           // TSK029
     size_t ResolveMaxBytes() const; // TSK029
     bool ParseLog(std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE>& mac,
                   uint64_t& sequence); // TSK029
@@ -81,14 +82,14 @@ namespace qv::orchestrator {
     std::mutex mutex_;
     std::ofstream stream_;
     std::filesystem::path log_path_;
-    std::filesystem::path key_path_;          // TSK029
-    size_t max_bytes_;                        // TSK029
+    std::filesystem::path key_path_; // TSK029
+    size_t max_bytes_;               // TSK029
     const size_t max_files_ = 3;
     size_t dropped_{0};
     std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> hmac_key_{}; // TSK029
     std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> last_mac_{}; // TSK029
-    uint64_t entry_counter_{0};                                           // TSK029
-    bool key_loaded_{false};                                              // TSK029
+    uint64_t entry_counter_{0};                                         // TSK029
+    bool key_loaded_{false};                                            // TSK029
   };
 
   inline JsonLineLogger& DefaultJsonLogger() { // TSK019
@@ -116,6 +117,5 @@ namespace qv::orchestrator {
     std::mutex mutex_;
     std::shared_ptr<SyslogPublisher> syslog_client_; // TSK029
   };
-
 
 } // namespace qv::orchestrator

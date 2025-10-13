@@ -1,13 +1,13 @@
 #include <algorithm>
-#include <chrono>   // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <cerrno>   // TSK028_Secure_Deletion_and_Data_Remanence
 #include <charconv> // TSK029
+#include <chrono>   // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <cstddef>  // TSK028_Secure_Deletion_and_Data_Remanence
 #include <ctime>    // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <filesystem>
 #include <fstream> // TSK028_Secure_Deletion_and_Data_Remanence
+#include <iomanip> // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <iostream>
-#include <iomanip>  // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional>
 #include <random>  // TSK028_Secure_Deletion_and_Data_Remanence
 #include <span>    // TSK028_Secure_Deletion_and_Data_Remanence
@@ -19,10 +19,10 @@
 
 #include "qv/common.h" // TSK029
 #include "qv/core/nonce.h"
-#include "qv/crypto/sha256.h"                       // TSK032_Backup_Recovery_and_Disaster_Recovery
+#include "qv/crypto/sha256.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/error.h"
-#include "qv/orchestrator/event_bus.h" // TSK027
-#include "qv/orchestrator/constant_time_mount.h"    // TSK032_Backup_Recovery_and_Disaster_Recovery
+#include "qv/orchestrator/constant_time_mount.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
+#include "qv/orchestrator/event_bus.h"           // TSK027
 #include "qv/orchestrator/volume_manager.h"
 
 #ifdef _WIN32
@@ -72,9 +72,11 @@ namespace {
     std::cerr << "  qv mount  <container>\n";
     std::cerr
         << "  qv rekey  [--backup-key=<path>] <container>\n"; // TSK024_Key_Rotation_and_Lifecycle_Management
+    std::cerr << "  qv migrate [--migrate-to=<version>] <container>\n"; // TSK033
     std::cerr << "  qv migrate-nonces <container>\n";
-    std::cerr << "  qv backup --output=<dir> <container>\n"; // TSK032_Backup_Recovery_and_Disaster_Recovery
-    std::cerr << "  qv fsck <container>\n";                   // TSK032_Backup_Recovery_and_Disaster_Recovery
+    std::cerr
+        << "  qv backup --output=<dir> <container>\n"; // TSK032_Backup_Recovery_and_Disaster_Recovery
+    std::cerr << "  qv fsck <container>\n";    // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::cerr << "  qv destroy <container>\n"; // TSK028_Secure_Deletion_and_Data_Remanence
   }
 
@@ -91,7 +93,8 @@ namespace {
     return MetadataDirFor(container) / "nonce.log";
   }
 
-  std::string BytesToHexLower(std::span<const uint8_t> bytes) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+  std::string
+  BytesToHexLower(std::span<const uint8_t> bytes) { // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
     for (auto byte : bytes) {
@@ -100,7 +103,8 @@ namespace {
     return oss.str();
   }
 
-  std::string ComputeSha256Hex(const std::filesystem::path& path) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+  std::string ComputeSha256Hex(
+      const std::filesystem::path& path) { // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
       throw qv::Error{qv::ErrorDomain::IO, errno,
@@ -140,6 +144,23 @@ namespace {
   void SecureZero(std::string& s) {
     std::fill(s.begin(), s.end(), '\0');
     s.clear();
+  }
+
+  std::optional<uint32_t> ParseVersionFlag(std::string_view value) { // TSK033 parse migration target
+    if (value.empty()) {
+      return std::nullopt;
+    }
+    uint32_t version = 0;
+    std::from_chars_result result{};
+    if (value.size() > 2 && (value[0] == '0') && (value[1] == 'x' || value[1] == 'X')) {
+      result = std::from_chars(value.data() + 2, value.data() + value.size(), version, 16);
+    } else {
+      result = std::from_chars(value.data(), value.data() + value.size(), version, 10);
+    }
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+      return std::nullopt;
+    }
+    return version;
   }
 
 #ifdef _WIN32
@@ -600,6 +621,21 @@ namespace {
     return kExitOk;
   }
 
+  int HandleMigrate(const std::filesystem::path& container, std::optional<uint32_t> target_version,
+                    qv::orchestrator::VolumeManager& vm) { // TSK033
+    auto password = ReadPassword("Password: ");
+    const uint32_t version =
+        target_version.value_or(qv::orchestrator::VolumeManager::kLatestHeaderVersion);
+    auto handle = vm.Migrate(container, version, password);
+    SecureZero(password);
+    if (!handle) {
+      std::cout << "Already at requested version." << std::endl; // TSK033
+    } else {
+      std::cout << "Migrated." << std::endl; // TSK033
+    }
+    return kExitOk;
+  }
+
   int HandleMigrateNonces(const std::filesystem::path& container) {
     auto legacy = std::filesystem::current_path() / "qv_nonce.log";
     if (!std::filesystem::exists(legacy)) {
@@ -631,8 +667,9 @@ namespace {
     return kExitOk;
   }
 
-  int HandleBackup(const std::filesystem::path& container,
-                   const std::filesystem::path& output_dir) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+  int HandleBackup(
+      const std::filesystem::path& container,
+      const std::filesystem::path& output_dir) { // TSK032_Backup_Recovery_and_Disaster_Recovery
     if (!std::filesystem::exists(container)) {
       std::cerr << "Container not found." << std::endl;
       return kExitIO;
@@ -697,7 +734,8 @@ namespace {
     return kExitOk;
   }
 
-  int HandleFsck(const std::filesystem::path& container) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+  int HandleFsck(
+      const std::filesystem::path& container) { // TSK032_Backup_Recovery_and_Disaster_Recovery
     if (!std::filesystem::exists(container)) {
       std::cerr << "Container not found." << std::endl;
       return kExitIO;
@@ -973,6 +1011,38 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       return HandleRekey(container_path, backup_path, vm);
+    }
+    if (cmd == "migrate") { // TSK033
+      if (argc - index < 1 || argc - index > 2) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      std::optional<uint32_t> target_version;
+      std::optional<std::filesystem::path> container_path;
+      for (int i = index; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg.rfind("--migrate-to=", 0) == 0) {
+          auto value = arg.substr(std::string_view("--migrate-to=").size());
+          auto parsed = ParseVersionFlag(value);
+          if (!parsed) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          target_version = *parsed;
+          continue;
+        }
+        if (!container_path) {
+          container_path = std::filesystem::path(std::string(arg));
+        } else {
+          PrintUsage();
+          return kExitUsage;
+        }
+      }
+      if (!container_path) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleMigrate(*container_path, target_version, vm);
     }
     if (cmd == "migrate-nonces") {
       if (argc - index != 1) {
