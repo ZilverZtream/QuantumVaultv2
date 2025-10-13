@@ -1,15 +1,17 @@
 #include "qv/core/nonce.h"
 #include "qv/security/secure_buffer.h"
 #include "qv/security/zeroizer.h"
-#include <array>
 #include <algorithm> // TSK014
+#include <array>
 #include <cassert>
+#include <chrono> // TSK015
 #include <cstdint>
 #include <filesystem> // TSK014
+#include <fstream>   // TSK021_Nonce_Log_Durability_and_Crash_Safety
 #include <iostream>
+#include <iterator> // TSK021_Nonce_Log_Durability_and_Crash_Safety
 #include <span>
 #include <vector>
-#include <chrono> // TSK015
 
 namespace {
 
@@ -60,6 +62,7 @@ void TestSecureBufferLifecycle() { // TSK006
 
 void TestNonceRekeyPolicy() { // TSK015
   std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal"); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   qv::core::NonceGenerator ng(11, 0);
   ng.SetPolicy(2, std::chrono::hours{24 * 365});
   [[maybe_unused]] auto initial_status = ng.GetStatus();
@@ -82,10 +85,86 @@ void TestNonceRekeyPolicy() { // TSK015
   assert(refused && "generator must refuse once nonce budget depleted");
 }
 
+void TestNonceWalRecovery() { // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal");
+  {
+    qv::core::NonceLog log(std::filesystem::path("qv_nonce.log"));
+    [[maybe_unused]] auto mac = log.Append(1);
+  }
+  std::filesystem::path wal_path{"qv_nonce.log.wal"};
+  assert(std::filesystem::exists(wal_path) && "wal file must exist after append");
+  std::ifstream wal_in(wal_path, std::ios::binary);
+  std::vector<uint8_t> wal_bytes((std::istreambuf_iterator<char>(wal_in)),
+                                 std::istreambuf_iterator<char>());
+  constexpr std::array<char, 8> kWalMagic{'Q', 'V', 'W', 'A', 'L', '0', '1', 'A'};
+  [[maybe_unused]] constexpr uint32_t kWalVersion = 1; // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  constexpr size_t kWalHeaderSize = kWalMagic.size() + sizeof(uint32_t) + sizeof(uint32_t) +
+                                    sizeof(uint64_t) + sizeof(uint32_t);
+  size_t offset = 0;
+  size_t last_commit_offset = 0;
+  while (offset + kWalHeaderSize <= wal_bytes.size()) {
+    const uint8_t* base = wal_bytes.data() + offset;
+    assert(std::equal(kWalMagic.begin(), kWalMagic.end(), base) && "wal magic must match");
+    base += kWalMagic.size();
+    uint32_t version_le;
+    std::memcpy(&version_le, base, sizeof(version_le));
+    base += sizeof(version_le);
+    [[maybe_unused]] uint32_t version = qv::ToLittleEndian(version_le);
+    assert(version == kWalVersion && "unexpected wal version");
+    uint32_t type_le;
+    std::memcpy(&type_le, base, sizeof(type_le));
+    base += sizeof(type_le);
+    uint32_t type = qv::ToLittleEndian(type_le);
+    uint64_t size_le;
+    std::memcpy(&size_le, base, sizeof(size_le));
+    base += sizeof(size_le);
+    uint64_t payload_size = qv::ToLittleEndian(size_le);
+    uint32_t checksum_le;
+    std::memcpy(&checksum_le, base, sizeof(checksum_le));
+    base += sizeof(checksum_le);
+    (void)checksum_le;
+    offset += kWalHeaderSize + static_cast<size_t>(payload_size);
+    if (type == 2) {
+      last_commit_offset = offset - (kWalHeaderSize + static_cast<size_t>(payload_size));
+    }
+  }
+  assert(last_commit_offset > 0 && "commit record must exist");
+  std::filesystem::resize_file(wal_path, last_commit_offset);
+  qv::core::NonceLog recovered(std::filesystem::path("qv_nonce.log"));
+  assert(recovered.EntryCount() == 1 && "recovery must preserve entries");
+  assert(recovered.GetLastCounter() == 1 && "recovered counter must match");
+  qv::core::NonceLog verifier(std::filesystem::path("qv_nonce.log"));
+  assert(verifier.EntryCount() == 1 && "log should remain stable post recovery");
+}
+
+void TestNonceDetectsCorruption() { // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal");
+  {
+    qv::core::NonceLog log(std::filesystem::path("qv_nonce.log"));
+    [[maybe_unused]] auto mac = log.Append(1);
+  }
+  auto log_path = std::filesystem::path("qv_nonce.log");
+  auto size = std::filesystem::file_size(log_path);
+  std::filesystem::resize_file(log_path, size - 1);
+  [[maybe_unused]] bool threw = false;
+  try {
+    qv::core::NonceLog fail(log_path);
+    (void)fail;
+  } catch (const qv::Error&) {
+    threw = true;
+  }
+  assert(threw && "corrupt log must throw on reload");
+  std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal");
+}
+
 } // namespace
 
 int main() {
-  std::filesystem::remove("qv_nonce.log"); // TSK014
+  std::filesystem::remove("qv_nonce.log");      // TSK014
+  std::filesystem::remove("qv_nonce.log.wal"); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   qv::core::NonceGenerator ng(7, 0);
   [[maybe_unused]] auto record_a = ng.NextAuthenticated();
   [[maybe_unused]] auto record_b = ng.NextAuthenticated();
@@ -100,6 +179,8 @@ int main() {
   TestZeroizerVectorHelper();
   TestSecureBufferLifecycle();
   TestNonceRekeyPolicy();
+  TestNonceWalRecovery();       // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  TestNonceDetectsCorruption(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   std::cout << "nonce test ok\n";
   return 0;
 }
