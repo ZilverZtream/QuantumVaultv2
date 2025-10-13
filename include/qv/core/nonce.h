@@ -5,22 +5,33 @@
 #include <mutex>
 #include "qv/common.h"
 #include "qv/error.h"
+#include <vector>
 
 namespace qv::core {
 
 class NonceLog {
-  int fd_{-1};
+  struct LogEntry {
+    uint64_t counter;
+    std::array<uint8_t, 32> mac;
+  };
   std::array<uint8_t, 32> key_{};
   std::array<uint8_t, 32> last_mac_{};
   std::filesystem::path path_;
+  std::vector<LogEntry> entries_;
+  bool loaded_{false};
   mutable std::mutex mu_;
 public:
   NonceLog() = default;
   explicit NonceLog(const std::filesystem::path& path);
-  ~NonceLog();
   void Append(uint64_t counter);
   bool VerifyChain();
   uint64_t GetLastCounter() const;
+  size_t EntryCount() const;
+private:
+  void EnsureLoadedUnlocked();
+  void ReloadUnlocked();
+  void PersistUnlocked();
+  void InitializeNewLog();
 };
 
 class NonceGenerator {
