@@ -9,6 +9,7 @@
 #include <iostream>
 #include <span>
 #include <vector>
+#include <chrono> // TSK015
 
 namespace {
 
@@ -57,6 +58,30 @@ void TestSecureBufferLifecycle() { // TSK006
   }
 }
 
+void TestNonceRekeyPolicy() { // TSK015
+  std::filesystem::remove("qv_nonce.log");
+  qv::core::NonceGenerator ng(11, 0);
+  ng.SetPolicy(2, std::chrono::hours{24 * 365});
+  [[maybe_unused]] auto initial_status = ng.GetStatus();
+  assert(initial_status.reason == qv::core::NonceGenerator::RekeyReason::kNone &&
+         "fresh generator must not require rekey");
+  [[maybe_unused]] auto first = ng.NextAuthenticated();
+  [[maybe_unused]] auto second = ng.NextAuthenticated();
+  [[maybe_unused]] auto persisted = ng.LastPersisted();
+  assert(persisted.has_value() && "persisted record must exist after appends");
+  assert(persisted->counter == second.counter && "persisted counter must match last append");
+  [[maybe_unused]] auto status = ng.GetStatus();
+  assert(status.reason == qv::core::NonceGenerator::RekeyReason::kNonceBudget &&
+         "nonce budget should trigger rekey status");
+  [[maybe_unused]] bool refused = false;
+  try {
+    (void)ng.NextAuthenticated();
+  } catch (const qv::Error& err) {
+    refused = (err.domain == qv::ErrorDomain::Security);
+  }
+  assert(refused && "generator must refuse once nonce budget depleted");
+}
+
 } // namespace
 
 int main() {
@@ -74,6 +99,7 @@ int main() {
   TestZeroizerScopeWiper();
   TestZeroizerVectorHelper();
   TestSecureBufferLifecycle();
+  TestNonceRekeyPolicy();
   std::cout << "nonce test ok\n";
   return 0;
 }
