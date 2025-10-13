@@ -9,6 +9,7 @@ namespace qv::orchestrator {
     ConstantTimeMount ctm_;
 
   public:
+    // TSK032_Backup_Recovery_and_Disaster_Recovery enforce metadata compatibility during lifecycle
     std::optional<ConstantTimeMount::VolumeHandle> Create(const std::filesystem::path& container,
                                                           const std::string& password);
     std::optional<ConstantTimeMount::VolumeHandle> Mount(const std::filesystem::path& container,

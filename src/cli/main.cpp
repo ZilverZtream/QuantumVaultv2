@@ -1,10 +1,13 @@
 #include <algorithm>
-#include <cerrno>  // TSK028_Secure_Deletion_and_Data_Remanence
-#include <cstddef> // TSK028_Secure_Deletion_and_Data_Remanence
+#include <chrono>   // TSK032_Backup_Recovery_and_Disaster_Recovery
+#include <cerrno>   // TSK028_Secure_Deletion_and_Data_Remanence
 #include <charconv> // TSK029
+#include <cstddef>  // TSK028_Secure_Deletion_and_Data_Remanence
+#include <ctime>    // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <filesystem>
 #include <fstream> // TSK028_Secure_Deletion_and_Data_Remanence
 #include <iostream>
+#include <iomanip>  // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional>
 #include <random>  // TSK028_Secure_Deletion_and_Data_Remanence
 #include <span>    // TSK028_Secure_Deletion_and_Data_Remanence
@@ -14,10 +17,12 @@
 #include <system_error>
 #include <vector>
 
+#include "qv/common.h" // TSK029
 #include "qv/core/nonce.h"
-#include "qv/common.h"             // TSK029
+#include "qv/crypto/sha256.h"                       // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/error.h"
 #include "qv/orchestrator/event_bus.h" // TSK027
+#include "qv/orchestrator/constant_time_mount.h"    // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/orchestrator/volume_manager.h"
 
 #ifdef _WIN32
@@ -68,6 +73,8 @@ namespace {
     std::cerr
         << "  qv rekey  [--backup-key=<path>] <container>\n"; // TSK024_Key_Rotation_and_Lifecycle_Management
     std::cerr << "  qv migrate-nonces <container>\n";
+    std::cerr << "  qv backup --output=<dir> <container>\n"; // TSK032_Backup_Recovery_and_Disaster_Recovery
+    std::cerr << "  qv fsck <container>\n";                   // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::cerr << "  qv destroy <container>\n"; // TSK028_Secure_Deletion_and_Data_Remanence
   }
 
@@ -82,6 +89,52 @@ namespace {
 
   std::filesystem::path MetadataNonceLogPath(const std::filesystem::path& container) {
     return MetadataDirFor(container) / "nonce.log";
+  }
+
+  std::string BytesToHexLower(std::span<const uint8_t> bytes) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (auto byte : bytes) {
+      oss << std::setw(2) << static_cast<int>(byte);
+    }
+    return oss.str();
+  }
+
+  std::string ComputeSha256Hex(const std::filesystem::path& path) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+      throw qv::Error{qv::ErrorDomain::IO, errno,
+                      "Failed to open file for hashing: " + SanitizePath(path)};
+    }
+    in.seekg(0, std::ios::end);
+    auto size = static_cast<std::streamoff>(in.tellg());
+    in.seekg(0, std::ios::beg);
+    if (size < 0) {
+      throw qv::Error{qv::ErrorDomain::IO, errno,
+                      "Failed to determine file size for hashing: " + SanitizePath(path)};
+    }
+    std::vector<uint8_t> buffer(static_cast<size_t>(size));
+    in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+    if (!in) {
+      throw qv::Error{qv::ErrorDomain::IO, errno,
+                      "Failed to read file for hashing: " + SanitizePath(path)};
+    }
+    auto digest = qv::crypto::SHA256_Hash(buffer);
+    return BytesToHexLower(std::span<const uint8_t>(digest.data(), digest.size()));
+  }
+
+  std::string CurrentISO8601() { // TSK032_Backup_Recovery_and_Disaster_Recovery
+    auto now = std::chrono::system_clock::now();
+    std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &tt);
+#else
+    gmtime_r(&tt, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return oss.str();
   }
 
   void SecureZero(std::string& s) {
@@ -578,6 +631,119 @@ namespace {
     return kExitOk;
   }
 
+  int HandleBackup(const std::filesystem::path& container,
+                   const std::filesystem::path& output_dir) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+    if (!std::filesystem::exists(container)) {
+      std::cerr << "Container not found." << std::endl;
+      return kExitIO;
+    }
+
+    try {
+      std::filesystem::create_directories(output_dir);
+    } catch (const std::filesystem::filesystem_error& err) {
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                      "Failed to prepare backup directory: " + SanitizePath(output_dir)};
+    }
+
+    auto container_backup = output_dir / container.filename();
+    try {
+      std::filesystem::copy_file(container, container_backup,
+                                 std::filesystem::copy_options::overwrite_existing);
+    } catch (const std::filesystem::filesystem_error& err) {
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                      "Failed to copy container for backup: " + SanitizePath(container_backup)};
+    }
+
+    std::optional<std::filesystem::path> nonce_backup;
+    auto nonce_log_path = MetadataNonceLogPath(container);
+    if (std::filesystem::exists(nonce_log_path)) {
+      nonce_backup = output_dir / "nonce.log";
+      try {
+        std::filesystem::copy_file(nonce_log_path, *nonce_backup,
+                                   std::filesystem::copy_options::overwrite_existing);
+      } catch (const std::filesystem::filesystem_error& err) {
+        throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                        "Failed to copy nonce log for backup: " + SanitizePath(*nonce_backup)};
+      }
+    }
+
+    const auto container_hash = ComputeSha256Hex(container_backup);
+    std::optional<std::string> nonce_hash;
+    if (nonce_backup) {
+      nonce_hash = ComputeSha256Hex(*nonce_backup);
+    }
+
+    auto manifest_path = output_dir / "manifest.json";
+    std::ofstream manifest(manifest_path, std::ios::trunc);
+    if (!manifest.is_open()) {
+      throw qv::Error{qv::ErrorDomain::IO, errno,
+                      "Failed to write manifest: " + SanitizePath(manifest_path)};
+    }
+    manifest << "{\n";
+    manifest << "  \"container_path\": \"" << container_backup.filename().string() << "\",\n";
+    manifest << "  \"container_sha256\": \"" << container_hash << "\",\n";
+    if (nonce_backup && nonce_hash) {
+      manifest << "  \"nonce_log_path\": \"" << nonce_backup->filename().string() << "\",\n";
+      manifest << "  \"nonce_log_sha256\": \"" << *nonce_hash << "\",\n";
+    } else {
+      manifest << "  \"nonce_log_path\": null,\n";
+      manifest << "  \"nonce_log_sha256\": null,\n";
+    }
+    manifest << "  \"created_at\": \"" << CurrentISO8601() << "\"\n";
+    manifest << "}\n";
+    manifest.close();
+
+    std::cout << "Backup created at " << SanitizePath(output_dir) << std::endl;
+    return kExitOk;
+  }
+
+  int HandleFsck(const std::filesystem::path& container) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+    if (!std::filesystem::exists(container)) {
+      std::cerr << "Container not found." << std::endl;
+      return kExitIO;
+    }
+
+    auto password = ReadPassword("Password (for verification): ");
+    qv::orchestrator::ConstantTimeMount ctm;
+    auto handle = ctm.Mount(container, password);
+    SecureZero(password);
+    if (!handle) {
+      std::cerr << "Validation error: Header MAC verification failed." << std::endl;
+      return kExitAuth;
+    }
+
+    bool nonce_ok = true;
+    size_t repaired_entries = 0;
+    auto nonce_path = MetadataNonceLogPath(container);
+    if (std::filesystem::exists(nonce_path)) {
+      try {
+        qv::core::NonceLog log(nonce_path, std::nothrow_t{});
+        repaired_entries = log.Repair();
+        if (!log.VerifyChain()) {
+          nonce_ok = false;
+        }
+      } catch (const qv::Error& err) {
+        std::cerr << "Nonce log error: " << DescribeError(err) << std::endl;
+        nonce_ok = false;
+      }
+    }
+
+    if (!nonce_ok) {
+      std::cerr << "Nonce log integrity check failed." << std::endl;
+      return kExitIO;
+    }
+
+    std::cout << "Header MAC verified." << std::endl;
+    if (repaired_entries > 0) {
+      std::cout << "Nonce log repaired: truncated " << repaired_entries << ' '
+                << (repaired_entries == 1 ? "entry." : "entries.") << std::endl;
+    } else if (std::filesystem::exists(nonce_path)) {
+      std::cout << "Nonce log chain verified." << std::endl;
+    }
+    std::cout << "Integrity check complete." << std::endl;
+    return kExitOk;
+  }
+
   int HandleDestroy(
       const std::filesystem::path& container) { // TSK028_Secure_Deletion_and_Data_Remanence
     if (!std::filesystem::exists(container)) {
@@ -713,7 +879,8 @@ int main(int argc, char** argv) {
         std::string port;
         if (!value.empty() && value.front() == '[') {
           auto closing = value.find(']');
-          if (closing == std::string::npos || closing + 1 >= value.size() || value[closing + 1] != ':') {
+          if (closing == std::string::npos || closing + 1 >= value.size() ||
+              value[closing + 1] != ':') {
             PrintUsage();
             return kExitUsage;
           }
@@ -813,6 +980,40 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       return HandleMigrateNonces(argv[index]);
+    }
+    if (cmd == "backup") { // TSK032_Backup_Recovery_and_Disaster_Recovery
+      std::optional<std::filesystem::path> output_dir;
+      std::optional<std::filesystem::path> container_path;
+      for (int i = index; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg.rfind("--output=", 0) == 0) {
+          auto value = arg.substr(std::string_view("--output=").size());
+          if (value.empty()) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          output_dir = std::filesystem::path(std::string(value));
+          continue;
+        }
+        if (!container_path) {
+          container_path = std::filesystem::path(std::string(arg));
+        } else {
+          PrintUsage();
+          return kExitUsage;
+        }
+      }
+      if (!output_dir || !container_path) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleBackup(*container_path, *output_dir);
+    }
+    if (cmd == "fsck") { // TSK032_Backup_Recovery_and_Disaster_Recovery
+      if (argc - index != 1) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleFsck(argv[index]);
     }
     if (cmd == "destroy") { // TSK028_Secure_Deletion_and_Data_Remanence
       if (argc - index != 1) {

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <new>      // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional> // TSK015
 #include <span>
 #include <string_view> // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -34,9 +35,11 @@ namespace qv::core {
   public:
     NonceLog() = default;
     explicit NonceLog(const std::filesystem::path& path);
+    NonceLog(const std::filesystem::path& path, std::nothrow_t) noexcept; // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::array<uint8_t, 32> Append(uint64_t counter); // TSK014
     std::array<uint8_t, 32> LastMac() const;          // TSK014
     bool VerifyChain();
+    size_t Repair(); // TSK032_Backup_Recovery_and_Disaster_Recovery
     uint64_t GetLastCounter() const;
     size_t EntryCount() const;
 
