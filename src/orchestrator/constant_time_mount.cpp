@@ -253,21 +253,29 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
   parsed.flags = FromLittleEndian32(parsed.header.flags);
   bool version_ok = parsed.version == kHeaderVersion;
 
-  size_t offset = sizeof(VolumeHeader);
-  while (offset + 4 <= bytes.size()) {
-    uint16_t type_le = 0;
-    uint16_t length_le = 0;
-    std::memcpy(&type_le, bytes.data() + offset, sizeof(type_le));
-    std::memcpy(&length_le, bytes.data() + offset + sizeof(type_le), sizeof(length_le));
-    uint16_t type = FromLittleEndian16(type_le);
-    uint16_t length = FromLittleEndian16(length_le);
-    offset += 4;
-    if (offset + length > bytes.size()) {
-      parsed.valid = false;
-      return parsed;
+    size_t offset = sizeof(VolumeHeader);
+    if (offset > bytes.size()) { // TSK030
+      parsed.valid = false;      // TSK030
+      return parsed;             // TSK030
     }
-    auto payload = bytes.subspan(offset, length);
-    switch (type) {
+    while (bytes.size() - offset >= 4) {
+      uint16_t type_le = 0;
+      uint16_t length_le = 0;
+      std::memcpy(&type_le, bytes.data() + offset, sizeof(type_le));
+      std::memcpy(&length_le, bytes.data() + offset + sizeof(type_le), sizeof(length_le));
+      uint16_t type = FromLittleEndian16(type_le);
+      size_t length = static_cast<size_t>(FromLittleEndian16(length_le));
+      offset += 4;
+      if (offset > bytes.size()) {           // TSK030
+        parsed.valid = false;                // TSK030
+        return parsed;                       // TSK030
+      }
+      if (length > bytes.size() || offset > bytes.size() - length) { // TSK030
+        parsed.valid = false;                                         // TSK030
+        return parsed;                                                // TSK030
+      }
+      auto payload = bytes.subspan(offset, length);
+      switch (type) {
       case kTlvTypePbkdf2: {
         if (length != 4 + kPbkdfSaltSize) {
           parsed.have_pbkdf = false;
@@ -297,6 +305,12 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
           std::memcpy(&epoch_le, payload.data(), sizeof(epoch_le));
           parsed.epoch = FromLittleEndian32(epoch_le);
           parsed.have_epoch = true;
+          if (sizeof(qv::core::EpochTLV) > bytes.size() ||               // TSK030
+              offset < 4 ||                                             // TSK030
+              (offset - 4) > bytes.size() - sizeof(qv::core::EpochTLV)) { // TSK030
+            parsed.valid = false;                                       // TSK030
+            return parsed;                                              // TSK030
+          }
           std::memcpy(parsed.epoch_tlv_bytes.data(), bytes.data() + offset - 4,
                       sizeof(qv::core::EpochTLV));
         }
@@ -493,6 +507,13 @@ std::chrono::nanoseconds ComputePadding(std::chrono::nanoseconds actual) {
 }
 
 } // namespace
+
+namespace qv::orchestrator::fuzz {
+bool ParseHeaderHarness(std::span<const uint8_t> bytes) { // TSK030
+  (void)::ParseHeader(bytes);                              // TSK030
+  return true;                                             // TSK030
+}
+} // namespace qv::orchestrator::fuzz
 
 std::optional<ConstantTimeMount::VolumeHandle>
 ConstantTimeMount::Mount(const std::filesystem::path& container,

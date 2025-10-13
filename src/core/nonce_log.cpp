@@ -580,28 +580,47 @@ void NonceLog::ReloadUnlocked() {
 
   const size_t payload_size = committed_size - trailer_size;
   const uint8_t* payload = data.data();
+  const uint8_t* payload_end = data.data() + payload_size;                    // TSK030
   const uint8_t* trailer_ptr = data.data() + payload_size;
+  const uint8_t* committed_end = data.data() + committed_size;                // TSK030
 
+  auto ensure_payload = [&](size_t needed) {                                  // TSK030
+    if (needed > static_cast<size_t>(payload_end - payload)) {                // TSK030
+      throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};        // TSK030
+    }
+  };
+
+  auto ensure_trailer = [&](size_t needed) {                                  // TSK030
+    if (needed > static_cast<size_t>(committed_end - trailer_ptr)) {          // TSK030
+      throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};        // TSK030
+    }
+  };
+
+  ensure_trailer(kTrailerMagic.size());                                       // TSK030
   if (!std::equal(kTrailerMagic.begin(), kTrailerMagic.end(), trailer_ptr)) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log trailer missing"};
   }
   trailer_ptr += kTrailerMagic.size();
 
   uint32_t stored_checksum_le;
+  ensure_trailer(sizeof(stored_checksum_le));                                 // TSK030
   std::memcpy(&stored_checksum_le, trailer_ptr, sizeof(stored_checksum_le));
   trailer_ptr += sizeof(stored_checksum_le);
   uint32_t stored_checksum = qv::ToLittleEndian(stored_checksum_le);
 
   uint32_t stored_count_le;
+  ensure_trailer(sizeof(stored_count_le));                                    // TSK030
   std::memcpy(&stored_count_le, trailer_ptr, sizeof(stored_count_le));
   uint32_t stored_count = qv::ToLittleEndian(stored_count_le);
 
+  ensure_payload(kHeaderMagic.size());                                        // TSK030
   if (!std::equal(kHeaderMagic.begin(), kHeaderMagic.end(), payload)) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log header magic mismatch"};
   }
   payload += kHeaderMagic.size();
 
   uint32_t version_le;
+  ensure_payload(sizeof(version_le));                                         // TSK030
   std::memcpy(&version_le, payload, sizeof(version_le));
   payload += sizeof(version_le);
   uint32_t version = qv::ToLittleEndian(version_le);
@@ -610,10 +629,11 @@ void NonceLog::ReloadUnlocked() {
                 "Nonce log version unsupported"};
   }
 
+  ensure_payload(kMacSize);                                                   // TSK030
   std::copy(payload, payload + kMacSize, key_.begin());
   payload += kMacSize;
 
-  const size_t entries_bytes = payload_size - (kHeaderMagic.size() + 4 + kMacSize);
+  const size_t entries_bytes = static_cast<size_t>(payload_end - payload);    // TSK030
   if (entries_bytes % kEntrySize != 0) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log entry misalignment"};
   }
@@ -635,11 +655,13 @@ void NonceLog::ReloadUnlocked() {
 
   for (uint32_t i = 0; i < computed_count; ++i) {
     uint64_t counter_be;
+    ensure_payload(sizeof(counter_be));                                       // TSK030
     std::memcpy(&counter_be, payload, sizeof(counter_be));
     payload += sizeof(counter_be);
     uint64_t counter = qv::ToBigEndian(counter_be);
 
     std::array<uint8_t, kMacSize> mac{};
+    ensure_payload(kMacSize);                                                 // TSK030
     std::copy(payload, payload + kMacSize, mac.begin());
     payload += kMacSize;
 

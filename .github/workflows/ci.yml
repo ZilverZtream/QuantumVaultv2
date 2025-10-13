@@ -135,3 +135,28 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1
           ASAN_OPTIONS: detect_leaks=1
         run: ctest --test-dir build --build-config RelWithDebInfo
+
+  fuzz:
+    name: Fuzz Harness (libFuzzer) # TSK030
+    runs-on: ubuntu-latest
+    env:
+      LLVM_USE_SANITIZER: Address,Fuzzer # TSK030
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu fuzz) # TSK030
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libssl-dev libsodium-dev clang
+
+      - name: Configure (fuzzers) # TSK030
+        env:
+          CC: clang
+          CXX: clang++
+        run: cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build fuzzers # TSK030
+        run: cmake --build build-fuzz --target fuzz_tests --parallel
+
+      - name: Smoke test fuzzers # TSK030
+        run: ./build-fuzz/bin/qv_fuzz_header -runs=1

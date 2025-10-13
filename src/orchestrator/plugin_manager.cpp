@@ -608,12 +608,44 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   std::error_code ec;
   auto canonical_path = std::filesystem::weakly_canonical(so_path, ec);
   if (ec) {
-    canonical_path = std::filesystem::absolute(so_path, ec);
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,                  // TSK030
+                            "plugin_path_resolution_failure",                       // TSK030
+                            "Unable to resolve plugin path", so_path);             // TSK030
+    return false;                                                                     // TSK030
   }
-  if (ec) {
+
+  bool within_allowed_root = false;                                                  // TSK030
+  for (const auto& root : search_paths_) {                                            // TSK030
+    std::error_code root_ec;                                                          // TSK030
+    auto canonical_root = std::filesystem::weakly_canonical(root, root_ec);           // TSK030
+    if (root_ec) {                                                                    // TSK030
+      canonical_root = std::filesystem::absolute(root, root_ec);                      // TSK030
+    }
+    if (root_ec) {                                                                    // TSK030
+      continue;                                                                       // TSK030
+    }
+    std::error_code rel_ec;                                                           // TSK030
+    auto relative = std::filesystem::relative(canonical_path, canonical_root, rel_ec); // TSK030
+    if (!rel_ec) {                                                                    // TSK030
+      bool escapes = false;                                                           // TSK030
+      for (const auto& part : relative) {                                             // TSK030
+        if (part == "..") {                                                          // TSK030
+          escapes = true;                                                             // TSK030
+          break;                                                                      // TSK030
+        }
+      }
+      if (!escapes) {                                                                 // TSK030
+        within_allowed_root = true;                                                   // TSK030
+        break;                                                                        // TSK030
+      }
+    }
+  }
+
+  if (!within_allowed_root) {                                                         // TSK030
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
-                            "plugin_path_resolution_failure", "Unable to resolve plugin path",
-                            so_path);
+                            "plugin_path_outside_search_path",                      // TSK030
+                            "Plugin path escapes configured search paths",          // TSK030
+                            canonical_path);                                          // TSK030
     return false;
   }
 
