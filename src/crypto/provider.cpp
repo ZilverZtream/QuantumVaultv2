@@ -4,8 +4,28 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
+#if defined(QV_FIPS_MODE) && !defined(_WIN32)
+#include <openssl/crypto.h> // TSK023_Production_Crypto_Provider_Complete_Integration FIPS mode toggle
+#endif
+
+#if QV_HAVE_SODIUM
+#include <sodium.h> // TSK023_Production_Crypto_Provider_Complete_Integration libsodium initialization
+#endif
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
+#endif
+
+#if defined(__linux__) && defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
+
 #include <memory>
 #include <mutex>
+#include <iostream> // TSK023_Production_Crypto_Provider_Complete_Integration runtime logging
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,6 +35,8 @@
 namespace qv::crypto {
 
 namespace {
+
+void ThrowCryptoError(const std::string& message, int code = 0); // TSK023_Production_Crypto_Provider_Complete_Integration forward declare
 
 std::string BuildOpenSSLErrorMessage(const char* context) {
   unsigned long err = ERR_get_error();
@@ -38,6 +60,50 @@ public:
 
 using CipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, EVPContextDeleter>;
 
+struct HardwareCapabilities {
+  bool aesni{false};
+  bool pclmul{false};
+  bool sha{false};
+}; // TSK023_Production_Crypto_Provider_Complete_Integration feature snapshot
+
+HardwareCapabilities DetectHardwareCapabilities() {
+  HardwareCapabilities caps{};
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+  int cpu_info[4] = {0};
+  __cpuid(cpu_info, 1);
+  int ecx = cpu_info[2];
+  caps.aesni = (ecx & (1 << 25)) != 0;  // TSK023_Production_Crypto_Provider_Complete_Integration AES-NI bit
+  caps.pclmul = (ecx & (1 << 1)) != 0;  // TSK023_Production_Crypto_Provider_Complete_Integration PCLMUL bit
+  __cpuidex(cpu_info, 7, 0);
+  int ebx = cpu_info[1];
+  caps.sha = (ebx & (1 << 29)) != 0;    // TSK023_Production_Crypto_Provider_Complete_Integration SHA extensions
+#elif defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+  unsigned int eax = 0;
+  unsigned int ebx = 0;
+  unsigned int ecx = 0;
+  unsigned int edx = 0;
+  unsigned int max_leaf = __get_cpuid_max(0, nullptr);
+  if (max_leaf >= 1) {
+    __cpuid(1, eax, ebx, ecx, edx);
+    caps.aesni = (ecx & (1u << 25)) != 0; // TSK023_Production_Crypto_Provider_Complete_Integration AES flag
+    caps.pclmul = (ecx & (1u << 1)) != 0; // TSK023_Production_Crypto_Provider_Complete_Integration PCLMUL flag
+  }
+  if (max_leaf >= 7) {
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    caps.sha = (ebx & (1u << 29)) != 0;   // TSK023_Production_Crypto_Provider_Complete_Integration SHA flag
+  }
+#elif defined(__linux__) && defined(__aarch64__)
+  unsigned long hwcap = getauxval(AT_HWCAP);
+#ifdef HWCAP_AES
+  caps.aesni = (hwcap & HWCAP_AES) != 0;  // TSK023_Production_Crypto_Provider_Complete_Integration AES (ARM)
+#endif
+#ifdef HWCAP_SHA2
+  caps.sha = (hwcap & HWCAP_SHA2) != 0;   // TSK023_Production_Crypto_Provider_Complete_Integration SHA (ARM)
+#endif
+#endif
+  return caps;
+}
+
 std::mutex& ProviderMutex() {
   static std::mutex mutex;
   return mutex;
@@ -48,8 +114,29 @@ std::shared_ptr<CryptoProvider>& ProviderInstance() {
   return instance;
 }
 
-void ThrowCryptoError(const std::string& message, int code = 0) {
+void ThrowCryptoError(const std::string& message, int code) {
   throw qv::Error(qv::ErrorDomain::Crypto, code, message);
+}
+
+void EnsureCryptoRuntimeConfigured() {
+  static std::once_flag once; // TSK023_Production_Crypto_Provider_Complete_Integration one-time init
+  std::call_once(once, []() {
+#if QV_HAVE_SODIUM
+    if (sodium_init() < 0) {
+      ThrowCryptoError("sodium_init failed");
+    }
+#endif
+#if defined(QV_FIPS_MODE) && !defined(_WIN32)
+    if (FIPS_mode_set(1) != 1) {
+      ThrowCryptoError("Failed to enable FIPS mode", static_cast<int>(ERR_get_error()));
+    }
+    std::clog << "[crypto] OpenSSL FIPS mode enabled" << std::endl; // TSK023_Production_Crypto_Provider_Complete_Integration log FIPS
+#endif
+    HardwareCapabilities caps = DetectHardwareCapabilities();
+    std::clog << "[crypto] AES-NI: " << (caps.aesni ? "yes" : "no")
+              << ", PCLMUL: " << (caps.pclmul ? "yes" : "no")
+              << ", SHA extensions: " << (caps.sha ? "yes" : "no") << std::endl; // TSK023_Production_Crypto_Provider_Complete_Integration log hardware
+  });
 }
 
 }  // namespace
@@ -195,6 +282,7 @@ std::array<uint8_t, 32> OpenSSLCryptoProvider::SHA256(
 }
 
 std::shared_ptr<CryptoProvider> GetCryptoProviderShared() {
+  EnsureCryptoRuntimeConfigured(); // TSK023_Production_Crypto_Provider_Complete_Integration configure runtime once
   std::lock_guard<std::mutex> lock(ProviderMutex());
   auto& provider = ProviderInstance();
   if (!provider) {

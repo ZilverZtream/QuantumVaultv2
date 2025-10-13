@@ -10,6 +10,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(QV_BUILD_TESTS "Build unit tests" ON)
 option(QV_USE_STUB_CRYPTO "Use stub implementations for cryptography" OFF) # TSK008
 option(QV_ENABLE_SANITIZERS "Enable address/undefined sanitizers" OFF) # TSK008
+option(QV_FIPS_MODE "Enable FIPS 140-2/3 compliance mode" OFF) # TSK023_Production_Crypto_Provider_Complete_Integration
+
+if (QV_FIPS_MODE AND QV_USE_STUB_CRYPTO)
+  message(FATAL_ERROR "QV_FIPS_MODE requires production crypto; disable QV_USE_STUB_CRYPTO") # TSK023_Production_Crypto_Provider_Complete_Integration guard
+endif()
 
 if (MSVC)
   add_compile_options(/permissive- /W4 /EHsc /bigobj) # TSK016_Windows_Compatibility_Fixes
@@ -86,6 +91,7 @@ target_compile_definitions(qv_core
       QV_HAVE_OPENSSL=1 # TSK008
       $<$<BOOL:${QV_USE_STUB_CRYPTO}>:QV_USE_STUB_CRYPTO=1> # TSK008
       QV_HAVE_SODIUM=$<BOOL:$<AND:$<BOOL:${qv_have_sodium}>,$<NOT:$<BOOL:${QV_USE_STUB_CRYPTO}>>>> # TSK008
+      $<$<BOOL:${QV_FIPS_MODE}>:QV_FIPS_MODE=1> # TSK023_Production_Crypto_Provider_Complete_Integration propagate FIPS mode
 )
 
 add_library(qv_orchestrator

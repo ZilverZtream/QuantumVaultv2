@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex> // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
 #include <system_error>
 #include <vector>
 
@@ -19,6 +20,10 @@
 #if defined(_MSC_VER)
 #pragma comment(lib, "bcrypt.lib")  // TSK016_Windows_Compatibility_Fixes ensure RNG linkage
 #endif
+#endif
+
+#if QV_HAVE_SODIUM
+#include <sodium.h> // TSK023_Production_Crypto_Provider_Complete_Integration cryptographic RNG
 #endif
 
 using namespace qv;
@@ -55,7 +60,17 @@ std::array<uint8_t, kMacSize> ComputeMac(
   return HMAC_SHA256::Compute(key, qv::AsBytes(input));
 }
 
-#ifdef _WIN32
+#if QV_HAVE_SODIUM
+void GenerateKey(std::array<uint8_t, kMacSize>& key) {
+  static std::once_flag sodium_once;                                      // TSK023_Production_Crypto_Provider_Complete_Integration init guard
+  std::call_once(sodium_once, []() {
+    if (sodium_init() < 0) {
+      throw Error{ErrorDomain::Security, 0, "sodium_init failed"};       // TSK023_Production_Crypto_Provider_Complete_Integration propagate failure
+    }
+  });
+  randombytes_buf(key.data(), key.size());                                // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
+}
+#elif defined(_WIN32)
 void GenerateKey(std::array<uint8_t, kMacSize>& key) {
   const NTSTATUS status = BCryptGenRandom(nullptr,
                                           key.data(),
@@ -70,7 +85,7 @@ void GenerateKey(std::array<uint8_t, kMacSize>& key) {
 void GenerateKey(std::array<uint8_t, kMacSize>& key) {
   if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
     auto err = static_cast<int>(ERR_get_error());
-    throw Error{ErrorDomain::Security, err, "RAND_bytes failed"};
+    throw Error{ErrorDomain::Security, err, "RAND_bytes failed"};        // TSK023_Production_Crypto_Provider_Complete_Integration OpenSSL RNG
   }
 }
 #endif

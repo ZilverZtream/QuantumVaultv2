@@ -18,9 +18,13 @@
 #include "qv/crypto/ct.h"
 #include "qv/orchestrator/plugin_abi.h"
 
+#if QV_HAVE_SODIUM
+#include <sodium.h> // TSK023_Production_Crypto_Provider_Complete_Integration prefer libsodium Ed25519
+#endif
+
 #if __has_include(<openssl/evp.h>)
-#include <openssl/evp.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #endif
 
 #if defined(_WIN32)
@@ -450,10 +454,16 @@ bool Ed25519_Verify(std::span<const uint8_t,32> pubkey,
                     std::span<const uint8_t,32> msg_hash,
                     std::span<const uint8_t,64> signature) {
 #if defined(QV_USE_STUB_CRYPTO)
-  (void)pubkey;
-  (void)msg_hash;
-  (void)signature;
-  return false;
+#error "Ed25519_Verify requires production crypto (compile with -DQV_USE_STUB_CRYPTO=OFF)" // TSK023_Production_Crypto_Provider_Complete_Integration fail-fast on stubs
+#elif QV_HAVE_SODIUM
+  if (pubkey.size() != crypto_sign_PUBLICKEYBYTES || signature.size() != crypto_sign_BYTES) {
+    return false; // TSK023_Production_Crypto_Provider_Complete_Integration enforce key sizes
+  }
+  if (sodium_init() < 0) {
+    return false; // TSK023_Production_Crypto_Provider_Complete_Integration libsodium unavailable
+  }
+  return crypto_sign_verify_detached(signature.data(), msg_hash.data(), msg_hash.size(),
+                                     pubkey.data()) == 0; // TSK023_Production_Crypto_Provider_Complete_Integration use libsodium
 #elif __has_include(<openssl/evp.h>)
   if (pubkey.size() != 32 || signature.size() != 64) {
     return false;
@@ -475,10 +485,7 @@ bool Ed25519_Verify(std::span<const uint8_t,32> pubkey,
   EVP_PKEY_free(key);
   return ok;
 #else
-  (void)pubkey;
-  (void)msg_hash;
-  (void)signature;
-  return false;
+#error "No Ed25519 implementation available" // TSK023_Production_Crypto_Provider_Complete_Integration require crypto wiring
 #endif
 }
 
