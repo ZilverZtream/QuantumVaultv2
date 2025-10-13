@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm> // TSK031 chunk sizing
 #include <cstddef>
 #include <cstdlib>
 #include <cstdint>
@@ -6,6 +7,8 @@
 #include <new>
 #include <span>
 #include <iostream> // TSK012
+#include <stdexcept> // TSK031 strict locking enforcement
+#include <vector> // TSK031 per-chunk lock tracking
 #if defined(_WIN32)
 #include <malloc.h>
 #endif
@@ -21,6 +24,12 @@ class SecureBuffer {
   size_t allocation_size_{0}; // TSK012 track padded allocation size for wiping/locking
   bool locked_{false};
   bool lock_capable_{false}; // TSK012 remember platform locking capability
+  struct LockRegion { // TSK031 per-chunk bookkeeping
+    uint8_t* begin{nullptr};
+    size_t length{0};
+    bool locked{false};
+  };
+  std::vector<LockRegion> lock_regions_; // TSK031 chunk statuses
 
   void Release() noexcept { // TSK012 release and zeroize contents deterministically
     if (!ptr_) {
@@ -28,14 +37,18 @@ class SecureBuffer {
       allocation_size_ = 0;
       locked_ = false;
       lock_capable_ = false;
+      lock_regions_.clear(); // TSK031
       return;
     }
 
     if (allocation_size_ > 0) {
       auto bytes_span = std::span<uint8_t>(reinterpret_cast<uint8_t*>(ptr_), allocation_size_); // TSK012
       Zeroizer::Wipe(bytes_span);
-      if (locked_) {
-        Zeroizer::UnlockMemory(bytes_span);
+      for (auto& region : lock_regions_) { // TSK031 unlock only locked chunks
+        if (region.locked) {
+          auto chunk_span = std::span<uint8_t>(region.begin, region.length); // TSK031
+          Zeroizer::UnlockMemory(chunk_span);
+        }
       }
     }
 
@@ -50,6 +63,7 @@ class SecureBuffer {
     allocation_size_ = 0;
     locked_ = false;
     lock_capable_ = false;
+    lock_regions_.clear(); // TSK031
   }
 
   static size_t RoundUpToAlignment(size_t value) { // TSK012
@@ -83,14 +97,28 @@ public:
 #else
     ptr_ = static_cast<T*>(std::aligned_alloc(alignof(T), allocation_size_));
 #endif
-    if (!ptr_) throw std::bad_alloc{};
+    if (!ptr_)
+      throw std::bad_alloc{};
     auto bytes_span = std::span<uint8_t>(reinterpret_cast<uint8_t*>(ptr_), allocation_size_); // TSK012
     Zeroizer::Wipe(bytes_span);
     lock_capable_ = Zeroizer::MemoryLockingSupported();
     if (lock_capable_) {
-      locked_ = Zeroizer::TryLockMemory(bytes_span);
+      auto* raw = reinterpret_cast<uint8_t*>(ptr_); // TSK031
+      const size_t chunk_target = 64U * 1024U; // 64 KiB // TSK031
+      size_t offset = 0;
+      bool all_chunks_locked = true; // TSK031
+      while (offset < allocation_size_) {
+        const size_t remaining = allocation_size_ - offset;
+        const size_t chunk_size = std::min(chunk_target, remaining);
+        auto chunk_span = std::span<uint8_t>(raw + offset, chunk_size);
+        const bool chunk_locked = Zeroizer::TryLockMemory(chunk_span);
+        lock_regions_.push_back(LockRegion{raw + offset, chunk_size, chunk_locked});
+        all_chunks_locked = all_chunks_locked && chunk_locked;
+        offset += chunk_size;
+      }
+      locked_ = all_chunks_locked;
       if (!locked_) {
-        std::cerr << "SecureBuffer warning: unable to lock sensitive memory; data may page to disk.\n"; // TSK012
+        std::cerr << "SecureBuffer warning: unable to lock all sensitive memory chunks; data may page to disk.\n"; // TSK012, TSK031
       }
     }
   }
@@ -101,12 +129,13 @@ public:
   SecureBuffer& operator=(const SecureBuffer&) = delete;
   SecureBuffer(SecureBuffer&& o) noexcept
       : ptr_(o.ptr_), size_(o.size_), allocation_size_(o.allocation_size_), locked_(o.locked_),
-        lock_capable_(o.lock_capable_) { // TSK012 move state safely
+        lock_capable_(o.lock_capable_), lock_regions_(std::move(o.lock_regions_)) { // TSK012 move state safely
     o.ptr_ = nullptr;
     o.size_ = 0;
     o.allocation_size_ = 0;
     o.locked_ = false;
     o.lock_capable_ = false;
+    o.lock_regions_.clear(); // TSK031
   }
   SecureBuffer& operator=(SecureBuffer&& o) noexcept {
     if (this != &o) {
@@ -116,11 +145,13 @@ public:
       allocation_size_ = o.allocation_size_;
       locked_ = o.locked_;
       lock_capable_ = o.lock_capable_;
+      lock_regions_ = std::move(o.lock_regions_); // TSK031
       o.ptr_ = nullptr;
       o.size_ = 0;
       o.allocation_size_ = 0;
       o.locked_ = false;
       o.lock_capable_ = false;
+      o.lock_regions_.clear(); // TSK031
     }
     return *this;
   }
@@ -137,6 +168,16 @@ public:
   }
   bool IsLocked() const noexcept { return locked_; } // TSK012
   bool LockingSupported() const noexcept { return lock_capable_; } // TSK012
+
+  void RequireLocking() const { // TSK031 enforce strict locking mode
+    if (!lock_capable_) {
+      throw std::runtime_error("SecureBuffer: memory locking not supported on this platform");
+    }
+    if (!locked_) {
+      throw std::runtime_error(
+          "SecureBuffer: memory locking required but one or more chunks are unlocked");
+    }
+  }
 };
 
 } // namespace qv::security
