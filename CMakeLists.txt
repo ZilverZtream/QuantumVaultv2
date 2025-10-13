@@ -59,3 +59,14 @@ if(QV_BUILD_TESTS)
   target_link_libraries(qv_tests PRIVATE qv_core)
   add_test(NAME qv_nonce_test COMMAND qv_tests)
 endif()
+
+# --- Wiring check gate ---
+set(EXCLUDED_SOURCES "")
+# Example whitelist:
+# EXCLUDED_SOURCES += src/experimental/example.cpp
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_target(wiring-check
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wiring.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME wiring-check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wiring.py)
