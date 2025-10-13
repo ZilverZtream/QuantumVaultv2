@@ -706,6 +706,22 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   if (info.version)
     stored->version = info.version;
   loaded_.push_back(std::move(stored));
+  qv::orchestrator::Event plugin_loaded{};       // TSK029
+  plugin_loaded.category = EventCategory::kLifecycle;
+  plugin_loaded.severity = EventSeverity::kInfo;
+  plugin_loaded.event_id = "plugin_loaded";
+  plugin_loaded.message = "Plugin loaded";
+  plugin_loaded.fields.emplace_back("plugin_path", canonical_path.generic_string(),
+                                    qv::orchestrator::FieldPrivacy::kHash);
+  if (info.name) {
+    plugin_loaded.fields.emplace_back("plugin_name", info.name,
+                                      qv::orchestrator::FieldPrivacy::kHash);
+  }
+  if (info.version) {
+    plugin_loaded.fields.emplace_back("plugin_version", info.version,
+                                      qv::orchestrator::FieldPrivacy::kPublic);
+  }
+  qv::orchestrator::EventBus::Instance().Publish(plugin_loaded);
   return true;
 #else
   int sockets[2];
@@ -842,6 +858,22 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   stored->pid = pid;
   stored->channel = sockets[0];
   loaded_.push_back(std::move(stored));
+  qv::orchestrator::Event plugin_loaded{};       // TSK029
+  plugin_loaded.category = EventCategory::kLifecycle;
+  plugin_loaded.severity = EventSeverity::kInfo;
+  plugin_loaded.event_id = "plugin_loaded";
+  plugin_loaded.message = "Plugin loaded";
+  plugin_loaded.fields.emplace_back("plugin_path", canonical_path.generic_string(),
+                                    qv::orchestrator::FieldPrivacy::kHash);
+  if (!loaded_.back()->name.empty()) {
+    plugin_loaded.fields.emplace_back("plugin_name", loaded_.back()->name,
+                                      qv::orchestrator::FieldPrivacy::kHash);
+  }
+  if (!loaded_.back()->version.empty()) {
+    plugin_loaded.fields.emplace_back("plugin_version", loaded_.back()->version,
+                                      qv::orchestrator::FieldPrivacy::kPublic);
+  }
+  qv::orchestrator::EventBus::Instance().Publish(plugin_loaded);
   return true;
 #endif
 }

@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <iomanip>  // TSK029
 #include <iterator> // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <limits>  // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <random>
@@ -88,6 +89,18 @@ namespace {
     uuid[6] = static_cast<uint8_t>((uuid[6] & 0x0F) | 0x40);
     uuid[8] = static_cast<uint8_t>((uuid[8] & 0x3F) | 0x80);
     return uuid;
+  }
+
+  std::string FormatUuid(const std::array<uint8_t, 16>& uuid) { // TSK029
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < uuid.size(); ++i) {
+      oss << std::setw(2) << static_cast<int>(uuid[i]);
+      if (i == 3 || i == 5 || i == 7 || i == 9) {
+        oss << '-';
+      }
+    }
+    return oss.str();
   }
 
   std::array<uint8_t, 32> DerivePasswordKey(std::span<const uint8_t> password,
@@ -494,12 +507,34 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
                     "Failed to write container header: " + container.string()};
   }
 
+  qv::orchestrator::Event created{}; // TSK029
+  created.category = EventCategory::kLifecycle;
+  created.severity = EventSeverity::kInfo;
+  created.event_id = "volume_created";
+  created.message = "New encrypted volume created";
+  created.fields.emplace_back("container", qv::PathToUtf8String(container),
+                              FieldPrivacy::kRedact);
+  created.fields.emplace_back("uuid", FormatUuid(header.uuid), FieldPrivacy::kPublic);
+  created.fields.emplace_back("pbkdf_iterations", std::to_string(kDefaultPbkdfIterations),
+                              FieldPrivacy::kPublic, true);
+  qv::orchestrator::EventBus::Instance().Publish(created);
+
   return ConstantTimeMount::VolumeHandle{1};
 }
 
 std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Mount(const std::filesystem::path& container, const std::string& password) {
-  return ctm_.Mount(container, password);
+  auto handle = ctm_.Mount(container, password); // TSK029
+  if (handle) {
+    qv::orchestrator::Event mounted{}; // TSK029
+    mounted.category = EventCategory::kLifecycle;
+    mounted.severity = EventSeverity::kInfo;
+    mounted.event_id = "volume_mounted";
+    mounted.message = "Encrypted volume mounted";
+    mounted.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+    qv::orchestrator::EventBus::Instance().Publish(mounted);
+  }
+  return handle;
 }
 
 std::optional<ConstantTimeMount::VolumeHandle> VolumeManager::Rekey(
@@ -509,6 +544,14 @@ std::optional<ConstantTimeMount::VolumeHandle> VolumeManager::Rekey(
     throw qv::Error{qv::ErrorDomain::IO, qv::errors::io::kContainerMissing,
                     "Container not found: " + container.string()};
   }
+
+  qv::orchestrator::Event initiated{}; // TSK029
+  initiated.category = EventCategory::kLifecycle;
+  initiated.severity = EventSeverity::kInfo;
+  initiated.event_id = "rekey_initiated";
+  initiated.message = "Volume rekey operation started";
+  initiated.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+  qv::orchestrator::EventBus::Instance().Publish(initiated);
 
   std::ifstream in(container, std::ios::binary);                                   // TSK024_Key_Rotation_and_Lifecycle_Management
   if (!in) {                                                                       // TSK024_Key_Rotation_and_Lifecycle_Management
