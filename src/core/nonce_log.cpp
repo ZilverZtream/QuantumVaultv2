@@ -174,6 +174,54 @@ namespace {
     return wal;
   }
 
+  class TempFileGuard { // TSK028_Secure_Deletion_and_Data_Remanence
+  public:
+    explicit TempFileGuard(std::filesystem::path path) noexcept : path_(std::move(path)) {}
+    TempFileGuard(const TempFileGuard&) = delete;
+    TempFileGuard& operator=(const TempFileGuard&) = delete;
+    ~TempFileGuard() noexcept {
+      try {
+        Cleanup();
+      } catch (...) {
+      }
+    }
+
+    void Release() noexcept { path_.clear(); }
+
+  private:
+    void Cleanup() {
+      if (path_.empty()) {
+        return;
+      }
+      std::error_code exists_ec;
+      if (!std::filesystem::exists(path_, exists_ec) || exists_ec) {
+        path_.clear();
+        return;
+      }
+      std::error_code size_ec;
+      const std::uintmax_t size = std::filesystem::file_size(path_, size_ec);
+      if (!size_ec) {
+        std::fstream out(path_, std::ios::binary | std::ios::in | std::ios::out);
+        if (out) {
+          std::vector<uint8_t> zeros(4096, 0);
+          out.seekp(0, std::ios::beg);
+          std::uintmax_t remaining = size;
+          while (remaining > 0) {
+            const size_t chunk = static_cast<size_t>(std::min<std::uintmax_t>(remaining, zeros.size()));
+            out.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(chunk));
+            remaining -= chunk;
+          }
+          out.flush();
+        }
+      }
+      std::error_code remove_ec;
+      std::filesystem::remove(path_, remove_ec);
+      path_.clear();
+    }
+
+    std::filesystem::path path_;
+  };
+
   void WriteWalRecord(const std::filesystem::path& wal_path, WalRecordType type,
                       std::span<const uint8_t> payload) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
     int flags = 0;
@@ -219,6 +267,7 @@ namespace {
                          std::span<const uint8_t> bytes) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
     auto temp_path = path;
     temp_path += ".tmp";
+    TempFileGuard temp_guard(temp_path); // TSK028_Secure_Deletion_and_Data_Remanence
     auto dir = ResolveDirectory(path);
     if (!dir.empty()) {
       std::filesystem::create_directories(dir);
@@ -255,6 +304,9 @@ namespace {
                     "Failed to replace nonce log " + qv::PathToUtf8String(path)};
       }
       std::filesystem::rename(temp_path, path);
+      temp_guard.Release();
+    } else {
+      temp_guard.Release();
     }
 #ifndef _WIN32
     SyncDirectory(ResolveDirectory(path));
