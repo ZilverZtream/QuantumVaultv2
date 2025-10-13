@@ -38,6 +38,50 @@ Dependencies: a modern compiler with C++20. Crypto primitives are **stubbed** to
 keep the skeleton buildable without extra libraries; swap them with OpenSSL/libsodium
 or your preferred provider when moving beyond stubs.
 
+<!-- TSK020 -->
+### Production crypto backends
+
+QuantumVault links against OpenSSL for classical primitives and can consume
+libsodium/liboqs when the stubs are disabled. Use the following platform notes to
+wire in real providers:
+
+#### Linux
+
+```bash
+sudo apt update
+sudo apt install build-essential cmake ninja-build pkg-config \
+    libssl-dev libsodium-dev liboqs-dev
+
+# Configure with real crypto
+cmake -S . -B build -GNinja -DQV_USE_STUB_CRYPTO=OFF
+cmake --build build
+```
+
+#### macOS
+
+```bash
+brew install cmake ninja openssl libsodium liboqs
+
+# Homebrew installs OpenSSL into /opt/homebrew/opt/openssl@3
+cmake -S . -B build -GNinja -DQV_USE_STUB_CRYPTO=OFF \
+      -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build build
+```
+
+#### Windows (MSVC + vcpkg)
+
+```powershell
+vcpkg install openssl:x64-windows-static-md libsodium:x64-windows liboqs:x64-windows
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+      -DQV_USE_STUB_CRYPTO=OFF `
+      -DCMAKE_TOOLCHAIN_FILE="${env:VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+cmake --build build --config Release
+```
+
+> liboqs is optional for now; when unavailable the build will continue with
+> PQC stubs. The README's security notes call out the locations that must be
+> revisited when swapping to production crypto providers.
+
 ## Project Layout
 
 ```text
