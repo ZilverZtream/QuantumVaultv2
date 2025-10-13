@@ -405,25 +405,16 @@ namespace {
   }
 
 #if QV_HAVE_SODIUM
-void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-  static std::once_flag sodium_once;                                      // TSK023_Production_Crypto_Provider_Complete_Integration init guard
-  std::call_once(sodium_once, []() {
-    if (sodium_init() < 0) {
-      throw Error{ErrorDomain::Security, 0, "sodium_init failed"};       // TSK023_Production_Crypto_Provider_Complete_Integration propagate failure
-    }
-  });
-  randombytes_buf(key.data(), key.size());                                // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
-}
+  void GenerateKey(std::array<uint8_t, kMacSize>& key) {
+    static std::once_flag sodium_once; // TSK023_Production_Crypto_Provider_Complete_Integration init guard
+    std::call_once(sodium_once, []() {
+      if (sodium_init() < 0) {
+        throw Error{ErrorDomain::Security, 0, "sodium_init failed"}; // TSK023_Production_Crypto_Provider_Complete_Integration propagate failure
+      }
+    });
+    randombytes_buf(key.data(), key.size()); // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
+  }
 #elif defined(_WIN32)
-void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-  const NTSTATUS status = BCryptGenRandom(nullptr,
-                                          key.data(),
-                                          static_cast<ULONG>(key.size()),
-                                          BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-  if (!BCRYPT_SUCCESS(status)) {
-    throw Error{ErrorDomain::Security, static_cast<int>(status),
-                "BCryptGenRandom failed"};  // TSK016_Windows_Compatibility_Fixes
-#ifdef _WIN32
   void GenerateKey(std::array<uint8_t, kMacSize>& key) {
     const NTSTATUS status = BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()),
                                             BCRYPT_USE_SYSTEM_PREFERRED_RNG);
@@ -433,14 +424,10 @@ void GenerateKey(std::array<uint8_t, kMacSize>& key) {
     }
   }
 #else
-void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-  if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
-    auto err = static_cast<int>(ERR_get_error());
-    throw Error{ErrorDomain::Security, err, "RAND_bytes failed"};        // TSK023_Production_Crypto_Provider_Complete_Integration OpenSSL RNG
   void GenerateKey(std::array<uint8_t, kMacSize>& key) {
     if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
       auto err = static_cast<int>(ERR_get_error());
-      throw Error{ErrorDomain::Security, err, "RAND_bytes failed"};
+      throw Error{ErrorDomain::Security, err, "RAND_bytes failed"}; // TSK023_Production_Crypto_Provider_Complete_Integration OpenSSL RNG
     }
   }
 #endif
@@ -489,6 +476,14 @@ NonceLog::NonceLog(const std::filesystem::path& path) : path_(path) {
   } else {
     InitializeNewLog();
   }
+}
+
+NonceLog::NonceLog(const std::filesystem::path& path, std::nothrow_t) noexcept
+    : path_(path) { // TSK032_Backup_Recovery_and_Disaster_Recovery
+  key_.fill(0);
+  last_mac_.fill(0);
+  entries_.clear();
+  loaded_ = false;
 }
 
 void NonceLog::InitializeNewLog() {
@@ -722,6 +717,146 @@ bool NonceLog::VerifyChain() {
     return false;
   }
   return true;
+}
+
+size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
+  std::lock_guard<std::mutex> lock(mu_);
+  loaded_ = false;
+  RecoverWalUnlocked();
+
+  if (!std::filesystem::exists(path_)) {
+    entries_.clear();
+    last_mac_.fill(0);
+    key_.fill(0);
+    loaded_ = true;
+    return 0;
+  }
+
+  std::ifstream in(path_, std::ios::binary);
+  if (!in.is_open()) {
+    throw Error{ErrorDomain::IO, 0,
+                "Failed to open nonce log " + qv::PathToUtf8String(path_)};
+  }
+  in.seekg(0, std::ios::end);
+  auto size = static_cast<std::streamoff>(in.tellg());
+  in.seekg(0, std::ios::beg);
+  if (size <= 0) {
+    entries_.clear();
+    last_mac_.fill(0);
+    key_.fill(0);
+    loaded_ = true;
+    return 0;
+  }
+
+  std::vector<uint8_t> data(static_cast<size_t>(size));
+  in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  if (!in) {
+    throw Error{ErrorDomain::IO, 0,
+                "Failed to read nonce log " + qv::PathToUtf8String(path_)};
+  }
+
+  EnsureIntegrityMarker(data);
+
+  const size_t committed_size = data.size() - kCommitMagic.size();
+  const size_t trailer_size = kTrailerMagic.size() + 8;
+  if (committed_size < trailer_size + kHeaderMagic.size() + 4 + kMacSize) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log too small"};
+  }
+
+  const size_t payload_size = committed_size - trailer_size;
+  const uint8_t* payload = data.data();
+  const uint8_t* payload_end = data.data() + payload_size;
+  const uint8_t* trailer_ptr = data.data() + payload_size;
+
+  if (!std::equal(kHeaderMagic.begin(), kHeaderMagic.end(), payload)) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log header magic mismatch"};
+  }
+  payload += kHeaderMagic.size();
+
+  uint32_t version_le = 0;
+  std::memcpy(&version_le, payload, sizeof(version_le));
+  payload += sizeof(version_le);
+  uint32_t version = qv::ToLittleEndian(version_le);
+  if (version != kLogVersion) {
+    throw Error{ErrorDomain::Validation, static_cast<int>(version),
+                "Nonce log version unsupported"};
+  }
+
+  if (static_cast<size_t>(payload_end - payload) < kMacSize) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};
+  }
+  std::copy(payload, payload + kMacSize, key_.begin());
+  payload += kMacSize;
+
+  if (!std::equal(kTrailerMagic.begin(), kTrailerMagic.end(), trailer_ptr)) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log trailer missing"};
+  }
+  trailer_ptr += kTrailerMagic.size();
+
+  uint32_t stored_checksum_le = 0;
+  std::memcpy(&stored_checksum_le, trailer_ptr, sizeof(stored_checksum_le));
+  trailer_ptr += sizeof(stored_checksum_le);
+  uint32_t stored_checksum = qv::ToLittleEndian(stored_checksum_le);
+
+  uint32_t stored_count_le = 0;
+  std::memcpy(&stored_count_le, trailer_ptr, sizeof(stored_count_le));
+  uint32_t stored_count = qv::ToLittleEndian(stored_count_le);
+
+  const size_t entries_bytes = static_cast<size_t>(payload_end - payload);
+  const size_t entry_slots = entries_bytes / kEntrySize;
+  const size_t trailing_bytes = entries_bytes % kEntrySize;
+
+  std::vector<LogEntry> valid_entries;
+  valid_entries.reserve(entry_slots);
+  std::array<uint8_t, kMacSize> prev{};
+
+  for (size_t i = 0; i < entry_slots; ++i) {
+    uint64_t counter_be = 0;
+    std::memcpy(&counter_be, payload, sizeof(counter_be));
+    payload += sizeof(counter_be);
+    uint64_t counter = qv::ToBigEndian(counter_be);
+
+    std::array<uint8_t, kMacSize> mac{};
+    std::copy(payload, payload + kMacSize, mac.begin());
+    payload += kMacSize;
+
+    if (!valid_entries.empty() && counter <= valid_entries.back().counter) {
+      break;
+    }
+
+    auto expected = ComputeMac(prev, counter, key_);
+    if (!std::equal(expected.begin(), expected.end(), mac.begin())) {
+      break;
+    }
+
+    valid_entries.push_back(LogEntry{counter, mac});
+    prev = mac;
+  }
+
+  const uint32_t computed_checksum =
+      ComputeFNV1a(std::span<const uint8_t>(data.data(), payload_size));
+
+  entries_ = std::move(valid_entries);
+  last_mac_ = entries_.empty() ? std::array<uint8_t, kMacSize>{} : entries_.back().mac;
+
+  size_t truncated = 0;
+  if (stored_count > entries_.size()) {
+    truncated = stored_count - entries_.size();
+  }
+  if (entry_slots > entries_.size()) {
+    truncated = std::max(truncated, entry_slots - entries_.size());
+  }
+  if (trailing_bytes != 0) {
+    truncated = std::max<size_t>(truncated, 1);
+  }
+
+  bool needs_rewrite = truncated > 0 || stored_checksum != computed_checksum;
+  if (needs_rewrite) {
+    PersistUnlocked();
+  } else {
+    loaded_ = true;
+  }
+  return truncated;
 }
 
 uint64_t NonceLog::GetLastCounter() const {
