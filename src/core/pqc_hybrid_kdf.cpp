@@ -3,6 +3,7 @@
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/crypto/sha256.h"
 #include <random>
+#include <string>
 
 using namespace qv;
 using namespace qv::core;
@@ -54,9 +55,9 @@ PQCHybridKDF::Create(std::span<const uint8_t,32> classical_key,
   auto enc = kem.Encapsulate(kp.pk);
 
   std::array<uint8_t,12> sk_nonce{}; RandomBytes({sk_nonce.data(), sk_nonce.size()});
-  std::array<uint8_t,16> sk_tag{};
-  std::vector<uint8_t> sk_enc_vec;
-  AES256_GCM_Encrypt(kp.sk.AsSpan(), {}, sk_nonce, classical_key, sk_enc_vec, sk_tag);
+  auto enc_result = AES256_GCM_Encrypt(kp.sk.AsSpan(), {}, sk_nonce, classical_key);
+  std::array<uint8_t, AES256_GCM::TAG_SIZE> sk_tag = enc_result.tag;
+  const auto& sk_enc_vec = enc_result.ciphertext;
   std::array<uint8_t, PQC::SECRET_KEY_SIZE> sk_encrypted{};
   std::memcpy(sk_encrypted.data(), sk_enc_vec.data(),
               std::min(sk_encrypted.size(), sk_enc_vec.size()));
@@ -85,16 +86,21 @@ PQCHybridKDF::Mount(std::span<const uint8_t,32> classical_key,
                     std::span<const uint8_t> salt) {
   // 1) Decrypt secret key
   std::vector<uint8_t> sk_plain;
-  if (!AES256_GCM_Decrypt(sk_enc, {}, sk_nonce, sk_tag, classical_key, sk_plain)) {
-    throw AuthenticationFailureError("Failed to decrypt PQC secret key");
+  try {
+    sk_plain = AES256_GCM_Decrypt(sk_enc, {}, sk_nonce, sk_tag, classical_key);
+  } catch (const AuthenticationFailureError&) {
+    throw;
+  } catch (const std::exception& ex) {
+    throw AuthenticationFailureError(std::string("Failed to decrypt PQC secret key: ") + ex.what());
   }
   if (sk_plain.size() < PQC::SECRET_KEY_SIZE) {
     sk_plain.resize(PQC::SECRET_KEY_SIZE);
   }
   // 2) Decapsulate
   PQCKeyEncapsulation kem;
-  auto ss = kem.Decapsulate({sk_plain.data(), PQC::SECRET_KEY_SIZE},
-                            {kem_ct.data(), PQC::CIPHERTEXT_SIZE});
+  auto ss = kem.Decapsulate(
+      std::span<const uint8_t, PQC::SECRET_KEY_SIZE>(sk_plain.data(), PQC::SECRET_KEY_SIZE),
+      std::span<const uint8_t, PQC::CIPHERTEXT_SIZE>(kem_ct.data(), PQC::CIPHERTEXT_SIZE));
   // 3) HKDF-like combo (placeholder using HMAC over concatenation + salt)
   auto hybrid = DeriveHybridKey(classical_key, ss, salt);
   // wipe
