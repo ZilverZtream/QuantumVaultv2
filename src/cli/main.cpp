@@ -1,7 +1,13 @@
 #include <algorithm>
+#include <cstddef>   // TSK028_Secure_Deletion_and_Data_Remanence
+#include <cerrno>    // TSK028_Secure_Deletion_and_Data_Remanence
 #include <filesystem>
+#include <fstream>  // TSK028_Secure_Deletion_and_Data_Remanence
 #include <iostream>
 #include <optional>
+#include <random>   // TSK028_Secure_Deletion_and_Data_Remanence
+#include <span>     // TSK028_Secure_Deletion_and_Data_Remanence
+#include <sstream>  // TSK028_Secure_Deletion_and_Data_Remanence
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -13,9 +19,14 @@
 #include "qv/orchestrator/volume_manager.h"
 
 #ifdef _WIN32
+#include <fcntl.h> // TSK028_Secure_Deletion_and_Data_Remanence
+#include <io.h>    // TSK028_Secure_Deletion_and_Data_Remanence
 #include <windows.h>
 #else // _WIN32
 #include <cerrno>
+#include <fcntl.h>   // TSK028_Secure_Deletion_and_Data_Remanence
+#include <sys/stat.h> // TSK028_Secure_Deletion_and_Data_Remanence
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 #endif // _WIN32
@@ -52,8 +63,10 @@ namespace {
     std::cerr << "Usage:\n";
     std::cerr << "  qv create <container>\n";
     std::cerr << "  qv mount  <container>\n";
-    std::cerr << "  qv rekey  [--backup-key=<path>] <container>\n"; // TSK024_Key_Rotation_and_Lifecycle_Management
+    std::cerr
+        << "  qv rekey  [--backup-key=<path>] <container>\n"; // TSK024_Key_Rotation_and_Lifecycle_Management
     std::cerr << "  qv migrate-nonces <container>\n";
+    std::cerr << "  qv destroy <container>\n"; // TSK028_Secure_Deletion_and_Data_Remanence
   }
 
   std::filesystem::path MetadataDirFor(const std::filesystem::path& container) {
@@ -73,6 +86,98 @@ namespace {
     std::fill(s.begin(), s.end(), '\0');
     s.clear();
   }
+
+#ifdef _WIN32
+  int NativeOpen(const std::filesystem::path& path) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return _wopen(path.c_str(), _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+  }
+
+  int NativeClose(int fd) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return _close(fd);
+  }
+
+  int NativeFsync(int fd) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return _commit(fd);
+  }
+
+  bool NativeSeek(int fd, std::uintmax_t offset) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return _lseeki64(fd, static_cast<__int64>(offset), SEEK_SET) != -1;
+  }
+
+  std::ptrdiff_t NativeWrite(int fd, const uint8_t* data,
+                             size_t size) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return _write(fd, data, static_cast<unsigned int>(size));
+  }
+#else
+  int NativeOpen(const std::filesystem::path& path) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  }
+
+  int NativeClose(int fd) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return ::close(fd);
+  }
+
+  int NativeFsync(int fd) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return ::fsync(fd);
+  }
+
+  bool NativeSeek(int fd, std::uintmax_t offset) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return ::lseek(fd, static_cast<off_t>(offset), SEEK_SET) != static_cast<off_t>(-1);
+  }
+
+  std::ptrdiff_t NativeWrite(int fd, const uint8_t* data,
+                             size_t size) { // TSK028_Secure_Deletion_and_Data_Remanence
+    return ::write(fd, data, size);
+  }
+#endif
+
+  void FillRandomBuffer(std::span<uint8_t> out,
+                        std::mt19937_64& gen) { // TSK028_Secure_Deletion_and_Data_Remanence
+    size_t idx = 0;
+    while (idx < out.size()) {
+      auto value = gen();
+      for (size_t j = 0; j < sizeof(value) && idx < out.size(); ++j, ++idx) {
+        out[idx] = static_cast<uint8_t>((value >> (j * 8)) & 0xFF);
+      }
+    }
+  }
+
+#if defined(__linux__)
+  void WarnIfSwapUnencrypted() { // TSK028_Secure_Deletion_and_Data_Remanence
+    std::ifstream swaps("/proc/swaps");
+    if (!swaps) {
+      return;
+    }
+    std::string header;
+    std::getline(swaps, header);
+    std::string line;
+    bool found_swap = false;
+    bool encrypted = true;
+    while (std::getline(swaps, line)) {
+      if (line.empty()) {
+        continue;
+      }
+      found_swap = true;
+      std::istringstream iss(line);
+      std::string device;
+      iss >> device;
+      if (device.empty()) {
+        continue;
+      }
+      if (device.find("crypt") == std::string::npos && device.find("/dev/dm-") == std::string::npos &&
+          device.find("/dev/mapper/") == std::string::npos) {
+        encrypted = false;
+      }
+    }
+    if (found_swap && !encrypted) {
+      std::cerr <<
+          "WARNING: Swap appears to be unencrypted; plaintext keys may persist. Configure dm-crypt swap." // TSK028_Secure_Deletion_and_Data_Remanence
+          << std::endl;
+    }
+  }
+#else
+  void WarnIfSwapUnencrypted() {} // TSK028_Secure_Deletion_and_Data_Remanence
+#endif
 
 #ifdef _WIN32
   class ConsoleModeGuard {
@@ -330,7 +435,7 @@ namespace {
 #endif
     std::cerr << DomainPrefix(err.domain) << ": " << user << '\n';
 
-    qv::orchestrator::Event event;             // TSK027
+    qv::orchestrator::Event event; // TSK027
     event.category = qv::orchestrator::EventCategory::kDiagnostics;
     event.severity = qv::orchestrator::EventSeverity::kError;
     event.event_id = "cli_error";
@@ -414,9 +519,9 @@ namespace {
     return kExitOk;
   }
 
-  int HandleRekey(const std::filesystem::path& container,
-                  std::optional<std::filesystem::path> backup_key,
-                  qv::orchestrator::VolumeManager& vm) { // TSK024_Key_Rotation_and_Lifecycle_Management
+  int HandleRekey(
+      const std::filesystem::path& container, std::optional<std::filesystem::path> backup_key,
+      qv::orchestrator::VolumeManager& vm) { // TSK024_Key_Rotation_and_Lifecycle_Management
     auto current = ReadPassword("Current password: ");
     auto next = ReadPassword("New password: ");
     auto confirm = ReadPassword("Confirm new password: ");
@@ -470,6 +575,105 @@ namespace {
     return kExitOk;
   }
 
+  int HandleDestroy(const std::filesystem::path& container) { // TSK028_Secure_Deletion_and_Data_Remanence
+    if (!std::filesystem::exists(container)) {
+      std::cerr << "Container not found." << std::endl;
+      return kExitIO;
+    }
+
+    std::cout << "WARNING: This will irrecoverably destroy " << SanitizePath(container)
+              << ". Continue? (yes/no): " << std::flush;
+    std::string confirm;
+    if (!std::getline(std::cin, confirm)) {
+      return kExitIO;
+    }
+    const bool approved = (confirm == "yes");
+    SecureZero(confirm);
+    if (!approved) {
+      std::cout << "Aborted." << std::endl;
+      return kExitOk;
+    }
+
+    WarnIfSwapUnencrypted();
+
+    std::uintmax_t size = 0;
+    try {
+      size = std::filesystem::file_size(container);
+    } catch (const std::filesystem::filesystem_error& err) {
+      throw qv::Error{qv::ErrorDomain::IO, err.code().value(),
+                      "Failed to query container size: " + SanitizePath(container)};
+    }
+
+    int fd = NativeOpen(container);
+    if (fd < 0) {
+      throw qv::Error{qv::ErrorDomain::IO, errno,
+                      "Failed to open container for destruction: " + SanitizePath(container)};
+    }
+    struct FileGuard { // TSK028_Secure_Deletion_and_Data_Remanence
+      int fd;
+      ~FileGuard() {
+        if (fd >= 0) {
+          NativeClose(fd);
+        }
+      }
+    } guard{fd};
+
+    std::vector<uint8_t> buffer(4096);
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    constexpr int kOverwritePasses = 7;
+
+    for (int pass = 0; pass < kOverwritePasses; ++pass) {
+      if (!NativeSeek(fd, 0)) {
+        throw qv::Error{qv::ErrorDomain::IO, errno,
+                        "Failed to seek during destruction: " + SanitizePath(container)};
+      }
+      std::uintmax_t remaining = size;
+      while (remaining > 0) {
+        const size_t chunk = static_cast<size_t>(std::min<std::uintmax_t>(remaining, buffer.size()));
+        FillRandomBuffer(std::span<uint8_t>(buffer.data(), chunk), gen);
+        size_t written_total = 0;
+        while (written_total < chunk) {
+          const std::ptrdiff_t wrote = NativeWrite(fd, buffer.data() + written_total, chunk - written_total);
+          if (wrote <= 0) {
+            throw qv::Error{qv::ErrorDomain::IO, errno,
+                            "Failed to overwrite container: " + SanitizePath(container)};
+          }
+          written_total += static_cast<size_t>(wrote);
+        }
+        remaining -= chunk;
+      }
+      if (NativeFsync(fd) != 0) {
+        throw qv::Error{qv::ErrorDomain::IO, errno,
+                        "Failed to flush overwrite pass: " + SanitizePath(container)};
+      }
+    }
+
+    if (NativeClose(fd) != 0) {
+      throw qv::Error{qv::ErrorDomain::IO, errno,
+                      "Failed to close container after overwrite: " + SanitizePath(container)};
+    }
+    guard.fd = -1;
+
+    std::error_code remove_ec;
+    if (!std::filesystem::remove(container, remove_ec) || remove_ec) {
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(remove_ec.value()),
+                      "Failed to remove container after overwrite: " + SanitizePath(container)};
+    }
+
+    std::cout << "Destroyed." << std::endl;
+#if defined(__linux__)
+    std::cout
+        << "NOTE: Complete secure deletion requires SSD TRIM support and running blkdiscard on freed space." // TSK028_Secure_Deletion_and_Data_Remanence
+        << std::endl;
+#else
+    std::cout
+        << "NOTE: SSD wear-leveling can retain remnants; ensure drive secure erase/TRIM procedures are followed." // TSK028_Secure_Deletion_and_Data_Remanence
+        << std::endl;
+#endif
+    return kExitOk;
+  }
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -501,7 +705,8 @@ int main(int argc, char** argv) {
         PrintUsage();
         return kExitUsage;
       }
-      std::optional<std::filesystem::path> backup_path; // TSK024_Key_Rotation_and_Lifecycle_Management
+      std::optional<std::filesystem::path>
+          backup_path; // TSK024_Key_Rotation_and_Lifecycle_Management
       std::filesystem::path container_path;
       for (int i = 2; i < argc; ++i) {
         std::string_view arg = argv[i];
@@ -533,6 +738,13 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       return HandleMigrateNonces(argv[2]);
+    }
+    if (cmd == "destroy") { // TSK028_Secure_Deletion_and_Data_Remanence
+      if (argc != 3) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleDestroy(argv[2]);
     }
 
     PrintUsage();

@@ -349,6 +349,7 @@ namespace {
                       "Failed to open backup key: " + backup_public_key.string()};
     }
     std::vector<uint8_t> pk_bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    VectorWipeGuard pk_guard(pk_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
     if (pk_bytes.size() != qv::core::PQC::PUBLIC_KEY_SIZE) {                       // TSK024_Key_Rotation_and_Lifecycle_Management
       throw qv::Error{qv::ErrorDomain::Validation, 0, "Backup key size mismatch"};
     }
@@ -357,12 +358,14 @@ namespace {
 
     qv::core::PQCKeyEncapsulation kem;                                            // TSK024_Key_Rotation_and_Lifecycle_Management
     auto enc = kem.Encapsulate(pk);                                                // TSK024_Key_Rotation_and_Lifecycle_Management
+    qv::security::Zeroizer::ScopeWiper secret_guard(enc.shared_secret.data(), enc.shared_secret.size());
 
     std::array<uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE> nonce{};               // TSK024_Key_Rotation_and_Lifecycle_Management
     FillRandom(nonce);                                                             // TSK024_Key_Rotation_and_Lifecycle_Management
 
     static constexpr std::string_view kBackupContext{"QV-BACKUP/v1"};             // TSK024_Key_Rotation_and_Lifecycle_Management
     std::vector<uint8_t> aad;                                                      // TSK024_Key_Rotation_and_Lifecycle_Management
+    VectorWipeGuard aad_guard(aad);                                                // TSK028_Secure_Deletion_and_Data_Remanence
     aad.insert(aad.end(), kBackupContext.begin(), kBackupContext.end());           // TSK024_Key_Rotation_and_Lifecycle_Management
     aad.insert(aad.end(), uuid.begin(), uuid.end());                               // TSK024_Key_Rotation_and_Lifecycle_Management
     const uint32_t epoch_le = qv::ToLittleEndian(epoch);                           // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -375,6 +378,8 @@ namespace {
         std::span<const uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE>(nonce.data(), nonce.size()),
         std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE>(enc.shared_secret.data(),
                                                                    enc.shared_secret.size()));
+    VectorWipeGuard ciphertext_guard(enc_result.ciphertext);                       // TSK028_Secure_Deletion_and_Data_Remanence
+    qv::security::Zeroizer::ScopeWiper tag_guard(enc_result.tag.data(), enc_result.tag.size());
     if (enc_result.ciphertext.size() != sizeof(DerivedKeyset)) {                   // TSK024_Key_Rotation_and_Lifecycle_Management
       throw qv::Error{qv::ErrorDomain::Crypto, 0, "Unexpected backup ciphertext length"};
     }
@@ -436,8 +441,10 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   FillRandom(hybrid_salt);
 
   std::vector<uint8_t> password_bytes(password.begin(), password.end());
+  VectorWipeGuard password_guard(password_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
   auto classical_key = DerivePasswordKey({password_bytes.data(), password_bytes.size()}, pbkdf_salt,
                                          kDefaultPbkdfIterations);
+  qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
   if (!password_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(password_bytes.data(), password_bytes.size()));
   }
@@ -452,10 +459,12 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
       std::span<const uint8_t, 32>(classical_key),
       std::span<const uint8_t>(hybrid_salt.data(), hybrid_salt.size()),
       std::span<const uint8_t, 16>(header.uuid), kHeaderVersion, epoch_bytes);
+  qv::security::Zeroizer::ScopeWiper creation_guard(creation.hybrid_key.data(), creation.hybrid_key.size());
 
   auto mac_key = DeriveHeaderMacKey(
       std::span<const uint8_t, 32>(creation.hybrid_key.data(), creation.hybrid_key.size()),
       header.uuid); // TSK024_Key_Rotation_and_Lifecycle_Management
+  qv::security::Zeroizer::ScopeWiper mac_guard(mac_key.data(), mac_key.size()); // TSK028_Secure_Deletion_and_Data_Remanence
 
   ReservedV2Tlv reserved_v2{};
   auto payload = SerializeHeaderPayload(header, kDefaultPbkdfIterations, pbkdf_salt, hybrid_salt,
@@ -512,8 +521,10 @@ std::optional<ConstantTimeMount::VolumeHandle> VolumeManager::Rekey(
   auto parsed = ParseHeader(blob);                                                 // TSK024_Key_Rotation_and_Lifecycle_Management
 
   std::vector<uint8_t> current_bytes(current_password.begin(), current_password.end());
+  VectorWipeGuard current_guard(current_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
   auto classical_key = DerivePasswordKey(
       {current_bytes.data(), current_bytes.size()}, parsed.pbkdf_salt, parsed.pbkdf_iterations);
+  qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
   if (!current_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(current_bytes.data(), current_bytes.size()));
   }
@@ -523,9 +534,11 @@ std::optional<ConstantTimeMount::VolumeHandle> VolumeManager::Rekey(
       std::span<const uint8_t>(parsed.hybrid_salt.data(), parsed.hybrid_salt.size()),
       std::span<const uint8_t, 16>(parsed.header.uuid), parsed.header_version,
       qv::AsBytesConst(parsed.epoch_tlv)); // TSK024_Key_Rotation_and_Lifecycle_Management
+  qv::security::Zeroizer::ScopeWiper hybrid_guard(hybrid_key.data(), hybrid_key.size());
 
   auto mac_key = DeriveHeaderMacKey(
       std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid);
+  qv::security::Zeroizer::ScopeWiper mac_guard(mac_key.data(), mac_key.size());
 
   auto expected_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(mac_key.data(), mac_key.size()),
@@ -555,8 +568,10 @@ std::optional<ConstantTimeMount::VolumeHandle> VolumeManager::Rekey(
   FillRandom(new_hybrid_salt);
 
   std::vector<uint8_t> new_bytes(new_password.begin(), new_password.end());
+  VectorWipeGuard new_guard(new_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
   auto new_classical_key = DerivePasswordKey(
       {new_bytes.data(), new_bytes.size()}, new_pbkdf_salt, kDefaultPbkdfIterations);
+  qv::security::Zeroizer::ScopeWiper new_classical_guard(new_classical_key.data(), new_classical_key.size());
   if (!new_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(new_bytes.data(), new_bytes.size()));
   }
@@ -567,13 +582,20 @@ std::optional<ConstantTimeMount::VolumeHandle> VolumeManager::Rekey(
       std::span<const uint8_t>(new_hybrid_salt.data(), new_hybrid_salt.size()),
       std::span<const uint8_t, 16>(parsed.header.uuid), parsed.header_version,
       qv::AsBytesConst(new_epoch_tlv));
+  qv::security::Zeroizer::ScopeWiper creation_guard(creation.hybrid_key.data(), creation.hybrid_key.size());
 
   auto new_mac_key = DeriveHeaderMacKey(
       std::span<const uint8_t, 32>(creation.hybrid_key.data(), creation.hybrid_key.size()),
       parsed.header.uuid);
+  qv::security::Zeroizer::ScopeWiper new_mac_guard(new_mac_key.data(), new_mac_key.size());
 
   auto derived_keys = MakeDerivedKeyset(
       std::span<const uint8_t, 32>(creation.hybrid_key.data(), creation.hybrid_key.size()));
+  qv::security::Zeroizer::ScopeWiper derived_data_guard(derived_keys.data.data(), derived_keys.data.size());
+  qv::security::Zeroizer::ScopeWiper derived_metadata_guard(derived_keys.metadata.data(),
+                                                            derived_keys.metadata.size());
+  qv::security::Zeroizer::ScopeWiper derived_index_guard(derived_keys.index.data(),
+                                                         derived_keys.index.size());
 
   auto payload = SerializeHeaderPayload(parsed.header, kDefaultPbkdfIterations, new_pbkdf_salt,
                                         new_hybrid_salt, new_epoch_tlv, creation.kem_blob,
