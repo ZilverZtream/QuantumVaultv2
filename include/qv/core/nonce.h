@@ -39,6 +39,7 @@ private:
   void ReloadUnlocked();
   void PersistUnlocked();
   void InitializeNewLog();
+  void RecoverWalUnlocked(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
 };
 
 class NonceGenerator {
