@@ -11,9 +11,12 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
+#include <charconv>
 
 #include "qv/crypto/ct.h"
+#include "qv/orchestrator/plugin_abi.h"
 
 #if __has_include(<openssl/evp.h>)
 #include <openssl/evp.h>
@@ -25,7 +28,11 @@
 #include <wincrypt.h>
 #include <softpub.h>
 #include <wintrust.h>
-#elif defined(__APPLE__)
+#else
+#include <dlfcn.h>
+#endif
+
+#if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
 #elif defined(__linux__)
@@ -46,6 +53,8 @@ using namespace qv::crypto;
 using qv::crypto::ct::CompareEqual;
 
 namespace {
+std::string_view Trim(std::string_view in);
+
 // TSK005 default trust anchors for plugin verification. Replace with real keys
 // when provisioning signing infrastructure.
 constexpr std::array<uint8_t, 32> kEmbeddedRoot0{
@@ -58,6 +67,99 @@ constexpr std::array<uint8_t, 32> kEmbeddedRoot1{
     0x6D, 0xA1, 0xFF, 0x33, 0x2B, 0x5E, 0xDA, 0x7A,
     0x05, 0x7B, 0x88, 0xEF, 0x90, 0x34, 0x67, 0x22,
     0x9D, 0x11, 0x75, 0x46, 0xC0, 0x8C, 0x5B, 0x3F};
+
+// TSK011 helper to read ABI compatibility ranges from textual policy entries.
+std::optional<uint32_t> ParseUint32(std::string_view text) {
+  uint32_t value = 0;
+  auto begin = text.data();
+  auto end = text.data() + text.size();
+  auto result = std::from_chars(begin, end, value, 10);
+  if (result.ec != std::errc() || result.ptr != end) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::optional<PluginCompatibilityRange> ParseAbiRange(std::string_view text) {
+  text = Trim(text);
+  if (text.empty()) return std::nullopt;
+  PluginCompatibilityRange range{};
+  auto dash = text.find('-');
+  if (dash == std::string_view::npos) {
+    if (auto value = ParseUint32(text)) {
+      range.min_version = *value;
+      range.max_version = *value;
+      return range;
+    }
+    return std::nullopt;
+  }
+  auto min_part = text.substr(0, dash);
+  auto max_part = text.substr(dash + 1);
+  auto min_val = ParseUint32(Trim(min_part));
+  auto max_val = ParseUint32(Trim(max_part));
+  if (!min_val || !max_val) return std::nullopt;
+  range.min_version = *min_val;
+  range.max_version = *max_val;
+  if (range.min_version > range.max_version) {
+    std::swap(range.min_version, range.max_version);
+  }
+  return range;
+}
+
+struct ScopedLibrary {
+#if defined(_WIN32)
+  using handle_type = HMODULE;
+#else
+  using handle_type = void*;
+#endif
+
+  ScopedLibrary() = default;
+  ScopedLibrary(const ScopedLibrary&) = delete;
+  ScopedLibrary& operator=(const ScopedLibrary&) = delete;
+  ScopedLibrary(ScopedLibrary&& other) noexcept { *this = std::move(other); }
+  ScopedLibrary& operator=(ScopedLibrary&& other) noexcept {
+    if (this != &other) {
+      Close();
+      handle_ = other.handle_;
+      other.handle_ = nullptr;
+    }
+    return *this;
+  }
+  ~ScopedLibrary() { Close(); }
+
+  bool Open(const std::filesystem::path& path) {
+    Close();
+#if defined(_WIN32)
+    std::wstring wide = path.wstring();
+    handle_ = ::LoadLibraryW(wide.c_str());
+#else
+    std::string utf8 = path.string();
+    handle_ = ::dlopen(utf8.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+    return handle_ != nullptr;
+  }
+
+  void* Symbol(const char* name) const {
+    if (!handle_) return nullptr;
+#if defined(_WIN32)
+    return reinterpret_cast<void*>(::GetProcAddress(handle_, name));
+#else
+    return ::dlsym(handle_, name);
+#endif
+  }
+
+  void Close() {
+    if (!handle_) return;
+#if defined(_WIN32)
+    ::FreeLibrary(handle_);
+#else
+    ::dlclose(handle_);
+#endif
+    handle_ = nullptr;
+  }
+
+  handle_type handle_{nullptr};
+};
 
 bool IsAllZero(std::span<const uint8_t> buffer) {
   for (auto b : buffer) {
@@ -141,6 +243,8 @@ const PluginTrustPolicy& DefaultPluginTrustPolicy() {
     InsertUnique(defaults.root_public_keys, kEmbeddedRoot1);
     defaults.pinned_public_keys.emplace("qv_example_crypto", kEmbeddedRoot0);
     defaults.pinned_public_keys.emplace("qv_pqc_mlkem", kEmbeddedRoot1);
+    defaults.default_abi_range.min_version = QV_PLUGIN_ABI_VERSION;
+    defaults.default_abi_range.max_version = QV_PLUGIN_ABI_VERSION;
     return defaults;
   }();
   return policy;
@@ -185,6 +289,27 @@ PluginTrustPolicy LoadPluginTrustPolicy(const std::filesystem::path& policy_path
     }
     if (view == "require_signature=false") {
       policy.require_signature = false;
+      continue;
+    }
+    if (view.rfind("abi:", 0) == 0) {
+      auto content = view.substr(4);
+      auto separator = content.find('=');
+      if (separator == std::string_view::npos) continue;
+      std::string key(Trim(content.substr(0, separator)));
+      if (auto range = ParseAbiRange(content.substr(separator + 1))) {
+        if (key == "*" || key == "default") {
+          policy.default_abi_range = *range;
+        } else {
+          policy.plugin_abi_ranges[key] = *range;
+        }
+      }
+      continue;
+    }
+    if (view.rfind("capability_schema=", 0) == 0) {
+      auto schema_text = view.substr(std::strlen("capability_schema="));
+      if (auto value = ParseUint32(schema_text)) {
+        policy.capability_schema_version = *value;
+      }
       continue;
     }
   }
@@ -244,7 +369,29 @@ bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& e
   }
 
   auto abi = QueryPluginABI(path);
-  if (abi < expected.min_abi_version || abi > expected.max_abi_version) return false;
+  if (!abi) {
+    return false;
+  }
+
+  PluginCompatibilityRange allowed{expected.min_abi_version, expected.max_abi_version};
+  allowed.min_version = std::max(allowed.min_version, policy.default_abi_range.min_version);
+  allowed.max_version = std::min(allowed.max_version, policy.default_abi_range.max_version);
+  if (auto override = policy.plugin_abi_ranges.find(plugin_id); override != policy.plugin_abi_ranges.end()) {
+    allowed.min_version = std::max(allowed.min_version, override->second.min_version);
+    allowed.max_version = std::min(allowed.max_version, override->second.max_version);
+  }
+
+  if (allowed.min_version > allowed.max_version) {
+    return false;
+  }
+
+  if (abi->plugin_min > allowed.max_version || abi->plugin_max < allowed.min_version) {
+    return false;
+  }
+
+  if (abi->has_selftest && !abi->selftest_passed) {
+    return false;
+  }
   if (!HasSecurityFlags(path)) return false;
   return true;
 }
@@ -266,9 +413,37 @@ bool HasSecurityFlags(const std::filesystem::path& path) {
 #endif
 }
 
-uint32_t QueryPluginABI(const std::filesystem::path& path) {
-  (void)path;
-  return 1;
+std::optional<PluginAbiQueryResult> QueryPluginABI(const std::filesystem::path& path) {
+  ScopedLibrary library;
+  if (!library.Open(path)) {
+    return std::nullopt;
+  }
+
+  auto get_abi = reinterpret_cast<QV_Plugin_GetAbi>(library.Symbol("qv_plugin_get_abi"));
+  if (!get_abi) {
+    return std::nullopt;
+  }
+
+  QV_PluginAbiNegotiation negotiation = get_abi();
+  PluginAbiQueryResult result{};
+  result.plugin_min = negotiation.min_supported;
+  result.plugin_max = negotiation.max_supported;
+  if (result.plugin_min == 0 || result.plugin_max == 0) {
+    return std::nullopt;
+  }
+  if (result.plugin_min > result.plugin_max) {
+    std::swap(result.plugin_min, result.plugin_max);
+  }
+
+  auto selftest = reinterpret_cast<QV_Plugin_SelfTest>(library.Symbol("qv_plugin_selftest"));
+  if (selftest) {
+    result.has_selftest = true;
+    result.selftest_passed = (selftest() == 0);
+  } else {
+    result.selftest_passed = true;
+  }
+
+  return result;
 }
 
 bool Ed25519_Verify(std::span<const uint8_t,32> pubkey,
