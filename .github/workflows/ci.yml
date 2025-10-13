@@ -1,16 +1,123 @@
-name: CI
-on: [push, pull_request]
+name: CI # TSK018_CI_and_Toolchain_Improvements
+
+on:
+  push:
+  pull_request:
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: 1 # TSK018
+
 jobs:
   build:
+    name: Build & Test (${{ matrix.os }} | ${{ matrix.build_type }}) # TSK018
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        build_type: [Debug, RelWithDebInfo]
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-      - name: Build
-        run: cmake --build build -j
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+
+      - name: Install dependencies (Ubuntu) # TSK018
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libssl-dev libsodium-dev
+          sudo apt-get install -y liboqs-dev || echo "liboqs-dev package not available on default channel" # TSK018
+
+      - name: Install dependencies (macOS) # TSK018
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install cmake ninja openssl libsodium liboqs || true
+
+      - name: Install dependencies (Windows) # TSK018
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress
+          choco install openssl.light -y --no-progress
+          if ((choco search libsodium --exact | Select-String "^libsodium")) {
+            choco install libsodium -y --no-progress
+          } else {
+            Write-Host "libsodium package not available"
+          }
+          if ((choco search liboqs --exact | Select-String "^liboqs")) {
+            choco install liboqs -y --no-progress
+          } else {
+            Write-Host "liboqs package not available"
+          }
+
+      - name: Configure # TSK018
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build # TSK018
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Test # TSK018
+        run: ctest --test-dir build --build-config ${{ matrix.build_type }}
+
+      - name: Verify Windows Authenticode status # TSK018
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "build/bin/qv.exe"
+          if (-not (Test-Path $binary)) { throw "Missing binary: $binary" }
+          $signature = Get-AuthenticodeSignature $binary
+          Write-Host "Authenticode status: $($signature.Status)"
+          if ($signature.Status -eq 'Invalid') { throw "Windows binary failed Authenticode verification" }
+
+      - name: Verify macOS code signature # TSK018
+        if: runner.os == 'macOS'
+        run: |
+          binary="build/bin/qv"
+          if [ ! -f "$binary" ]; then
+            echo "Missing binary: $binary" >&2
+            exit 1
+          fi
+          if ! codesign --verify --deep --strict "$binary"; then
+            echo "Unsigned development build detected (expected for CI until release certificates are provisioned)." >&2
+          fi
+
+      - name: Upload build artifacts # TSK018
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qv-${{ matrix.os }}-${{ matrix.build_type }}
+          path: |
+            build/bin/**
+            build/lib/**
+
+  sanitizers:
+    name: Sanitizers (ASan + UBSan) # TSK018
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu) # TSK018
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libssl-dev libsodium-dev
+          sudo apt-get install -y liboqs-dev || echo "liboqs-dev package not available on default channel" # TSK018
+
+      - name: Verify ASLR configuration # TSK018
+        run: |
+          state=$(cat /proc/sys/kernel/randomize_va_space)
+          echo "ASLR randomize_va_space=$state"
+          if [ "$state" -eq 0 ]; then
+            echo "ASLR is disabled" >&2
+            exit 1
+          fi
+
+      - name: Configure (sanitizers) # TSK018
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DQV_ENABLE_SANITIZERS=ON
+
+      - name: Build (sanitizers) # TSK018
+        run: cmake --build build --config RelWithDebInfo --parallel
+
+      - name: Test (sanitizers) # TSK018
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+          ASAN_OPTIONS: detect_leaks=1
+        run: ctest --test-dir build --build-config RelWithDebInfo
