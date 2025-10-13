@@ -1,11 +1,15 @@
 #pragma once
 #include <cstddef>
 #include <cstdlib>
-#include <cstring>
-#include <span>
+#include <cstdint>
+#include <limits>
 #include <new>
-#include <memory>
+#include <span>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include "qv/common.h"
+#include "qv/security/zeroizer.h"
 
 namespace qv::security {
 
@@ -15,19 +19,36 @@ class SecureBuffer {
   size_t size_{0};
   bool locked_{false};
 public:
-  explicit SecureBuffer(size_t n) : size_(n) {
+  explicit SecureBuffer(size_t n) : size_(n) { // TSK006
+    if (n > 0 && n > (std::numeric_limits<size_t>::max() / sizeof(T))) {
+      throw std::bad_array_new_length{};
+    }
+    const size_t bytes = n * sizeof(T);
+    if (bytes == 0) {
+      return;
+    }
 #if defined(_WIN32)
-    ptr_ = static_cast<T*>(_aligned_malloc(n * sizeof(T), alignof(T)));
+    ptr_ = static_cast<T*>(_aligned_malloc(bytes, alignof(T)));
 #else
-    ptr_ = static_cast<T*>(std::aligned_alloc(alignof(T), n * sizeof(T)));
+    ptr_ = static_cast<T*>(std::aligned_alloc(alignof(T), bytes));
 #endif
     if (!ptr_) throw std::bad_alloc{};
-    std::memset(ptr_, 0, n * sizeof(T));
-    // TODO: mlock/VirtualLock (omitted in skeleton to avoid perms)
+    auto bytes_span = std::span<uint8_t>(reinterpret_cast<uint8_t*>(ptr_), bytes);
+    Zeroizer::Wipe(bytes_span);
+    if (Zeroizer::MemoryLockingSupported()) {
+      locked_ = Zeroizer::TryLockMemory(bytes_span);
+    }
   }
   ~SecureBuffer() {
     if (ptr_) {
-      explicit_bzero(ptr_, size_ * sizeof(T));
+      if (size_ > 0) {
+        const size_t bytes = size_ * sizeof(T);
+        auto bytes_span = std::span<uint8_t>(reinterpret_cast<uint8_t*>(ptr_), bytes); // TSK006
+        Zeroizer::Wipe(bytes_span);
+        if (locked_) {
+          Zeroizer::UnlockMemory(bytes_span);
+        }
+      }
 #if defined(_WIN32)
       _aligned_free(ptr_);
 #else

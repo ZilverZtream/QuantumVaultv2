@@ -57,6 +57,13 @@ if(QV_BUILD_TESTS)
   add_executable(qv_tests tests/test_nonce.cpp)
   target_include_directories(qv_tests PUBLIC include)
   target_link_libraries(qv_tests PRIVATE qv_core)
+  if (MSVC)
+    target_compile_options(qv_tests PRIVATE /O2 /GL) # TSK006
+    target_link_options(qv_tests PRIVATE /LTCG) # TSK006
+  else()
+    target_compile_options(qv_tests PRIVATE -O3 -flto) # TSK006
+    target_link_options(qv_tests PRIVATE -flto) # TSK006
+  endif()
   add_test(NAME qv_nonce_test COMMAND qv_tests)
 endif()
 
