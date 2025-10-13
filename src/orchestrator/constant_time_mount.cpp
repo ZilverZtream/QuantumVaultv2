@@ -7,13 +7,17 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <mutex>
 #include <thread>
 #include <vector>
 #include <span>
+#include <string>
 #include <string_view>
+#include <system_error>
+#include <unordered_map>
 
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
@@ -30,6 +34,127 @@
 using namespace qv::orchestrator;
 
 namespace {
+
+std::filesystem::path LockFilePath(const std::filesystem::path& container) { // TSK026
+  auto lock_path = container;
+  lock_path += ".locked";
+  return lock_path;
+}
+
+class FailureTracker { // TSK026
+public:
+  struct FailureState {
+    int failures{0};
+    bool locked{false};
+    std::chrono::seconds enforced_delay{std::chrono::seconds::zero()};
+  };
+
+  static FailureTracker& Instance() {
+    static FailureTracker tracker;
+    return tracker;
+  }
+
+  void EnforceDelay(const std::filesystem::path& container) {
+    auto lock_path = LockFilePath(container);
+    std::error_code ec;
+    if (std::filesystem::exists(lock_path, ec)) {
+      throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                      "Volume locked due to repeated authentication failures"}; // TSK026
+    }
+
+    auto key = qv::PathToUtf8String(container);
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto it = attempts_.find(key);
+    if (it == attempts_.end()) {
+      return;
+    }
+
+    if (it->second.locked) {
+      std::error_code locked_ec;
+      if (std::filesystem::exists(lock_path, locked_ec)) {
+        lock.unlock();
+        throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                        "Volume locked due to repeated authentication failures"}; // TSK026
+      }
+      it->second.locked = false;
+      it->second.failures = 0;
+      return;
+    }
+
+    auto required = RequiredDelay(it->second.failures);
+    auto now = Clock::now();
+    auto elapsed = now - it->second.last_attempt;
+    if (elapsed >= required) {
+      return;
+    }
+
+    auto sleep_for = required - elapsed;
+    lock.unlock();
+    std::this_thread::sleep_for(sleep_for);
+  }
+
+  FailureState RecordAttempt(const std::filesystem::path& container, bool success) {
+    auto key = qv::PathToUtf8String(container);
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto& entry = attempts_[key];
+    entry.last_attempt = Clock::now();
+
+    if (success) {
+      entry.failures = 0;
+      entry.locked = false;
+      attempts_.erase(key);
+      return {};
+    }
+
+    entry.failures += 1;
+    FailureState state;
+    state.failures = entry.failures;
+    state.enforced_delay = std::chrono::duration_cast<std::chrono::seconds>(
+        RequiredDelay(entry.failures));
+
+    if (entry.failures >= kMaxAttempts) {
+      entry.locked = true;
+      state.locked = true;
+      lock.unlock();
+      auto lock_path = LockFilePath(container);
+      std::ofstream lock_file(lock_path, std::ios::out | std::ios::trunc);
+      if (!lock_file) {
+        throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                        "Failed to persist lock file for protected volume"}; // TSK026
+      }
+      lock_file << "locked";
+      lock_file.close();
+      return state;
+    }
+
+    return state;
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+
+  struct AttemptState {
+    int failures{0};
+    Clock::time_point last_attempt{Clock::now()};
+    bool locked{false};
+  };
+
+  static constexpr auto kMinDelay = std::chrono::seconds(3);
+  static constexpr auto kMaxDelay = std::chrono::seconds(60);
+  static constexpr int kMaxAttempts = 5;
+
+  std::chrono::seconds RequiredDelay(int failures) const {
+    if (failures <= 0) {
+      return kMinDelay;
+    }
+    auto multiplier = static_cast<int>(1u << std::min(failures, 10));
+    auto delay = kMinDelay * multiplier;
+    return delay > kMaxDelay ? kMaxDelay : delay;
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<std::string, AttemptState> attempts_;
+};
 
 // TSK004, TSK013
 constexpr std::array<uint8_t, 8> kHeaderMagic = {'Q','V','A','U','L','T','\0','\0'};
@@ -372,6 +497,9 @@ std::chrono::nanoseconds ComputePadding(std::chrono::nanoseconds actual) {
 std::optional<ConstantTimeMount::VolumeHandle>
 ConstantTimeMount::Mount(const std::filesystem::path& container,
                          const std::string& password) {
+  auto& tracker = FailureTracker::Instance();                     // TSK026
+  tracker.EnforceDelay(container);                                // TSK026
+
   Attempt a, b;
   auto start = std::chrono::steady_clock::now();
   a.start = start;
@@ -397,6 +525,25 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   uint32_t h1 = r1_ok ? static_cast<uint32_t>(r1->dummy) : 0;
   uint32_t h2 = r2_ok ? static_cast<uint32_t>(r2->dummy) : 0;
   uint32_t selected = qv::crypto::ct::Select<uint32_t>(h1, h2, (!r1_ok && r2_ok));
+
+  auto state = tracker.RecordAttempt(container, any_success);     // TSK026
+  if (!any_success) {
+    Event event{};                                                // TSK026
+    event.category = EventCategory::kSecurity;                    // TSK026
+    event.severity = EventSeverity::kWarning;                     // TSK026
+    event.event_id = state.locked ? "volume_mount_locked" : "volume_mount_failure"; // TSK026
+    event.message = state.locked ? "Volume locked after repeated authentication failures"
+                                 : "Volume mount authentication failed"; // TSK026
+    event.fields.emplace_back("container_hash",                                     // TSK026
+                              HashForTelemetry(qv::PathToUtf8String(container)),
+                              FieldPrivacy::kHash);
+    event.fields.emplace_back("consecutive_failures", std::to_string(state.failures),
+                              FieldPrivacy::kPublic, true); // TSK026
+    event.fields.emplace_back("cooldown_seconds", std::to_string(state.enforced_delay.count()),
+                              FieldPrivacy::kPublic, true); // TSK026
+    event.fields.emplace_back("locked", state.locked ? "true" : "false", FieldPrivacy::kPublic);
+    EventBus::Instance().Publish(event); // TSK026
+  }
 
   if (any_success) {
     return VolumeHandle{static_cast<int>(selected)};
