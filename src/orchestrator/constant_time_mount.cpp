@@ -340,6 +340,7 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         break;
       }
       default:
+        // TSK033: Skip unknown TLVs to maintain forward compatibility
         break;
     }
     offset += length;
