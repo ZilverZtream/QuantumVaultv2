@@ -9,6 +9,7 @@
 
 #include "qv/core/nonce.h"
 #include "qv/error.h"
+#include "qv/orchestrator/event_bus.h" // TSK027
 #include "qv/orchestrator/volume_manager.h"
 
 #ifdef _WIN32
@@ -20,6 +21,25 @@
 #endif // _WIN32
 
 namespace {
+
+  std::string SanitizePath(const std::filesystem::path& path) { // TSK027
+#ifdef NDEBUG
+    auto normalized = path;
+    if (normalized.empty()) {
+      return std::string{"[path]"};
+    }
+    if (!normalized.has_filename()) {
+      normalized = normalized.lexically_normal();
+    }
+    if (normalized.has_filename()) {
+      return normalized.filename().string();
+    }
+    auto fallback = normalized.string();
+    return fallback.empty() ? std::string{"[path]"} : fallback;
+#else
+    return path.string();
+#endif
+  }
 
   // TSK009
   constexpr int kExitOk = 0;
@@ -80,23 +100,20 @@ namespace {
     if (h_in == INVALID_HANDLE_VALUE || h_out == INVALID_HANDLE_VALUE) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kConsoleUnavailable, // TSK020
-                      std::string("Console unavailable for password entry (Win32 error ") +
-                          std::to_string(GetLastError()) + ")"};
+                      "Console unavailable for password entry.", GetLastError()};
     }
     DWORD mode = 0;
     if (!GetConsoleMode(h_in, &mode)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kConsoleModeQueryFailed, // TSK020
-                      std::string("Failed to query console mode (Win32 error ") +
-                          std::to_string(GetLastError()) + ")"};
+                      "Failed to query console mode.", GetLastError()};
     }
     ConsoleModeGuard guard(h_in, mode);
     DWORD silent_mode = mode & ~ENABLE_ECHO_INPUT;
     if (!SetConsoleMode(h_in, silent_mode)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kConsoleEchoDisableFailed, // TSK020
-                      std::string("Failed to disable console echo (Win32 error ") +
-                          std::to_string(GetLastError()) + ")"};
+                      "Failed to disable console echo.", GetLastError()};
     }
 
     DWORD written = 0;
@@ -110,8 +127,7 @@ namespace {
       if (!ReadConsoleW(h_in, &ch, 1, &read, nullptr)) {
         throw qv::Error{qv::ErrorDomain::IO,
                         qv::errors::io::kPasswordReadFailed, // TSK020
-                        std::string("Failed to read password (Win32 error ") +
-                            std::to_string(GetLastError()) + ")"};
+                        "Failed to read password input.", GetLastError()};
       }
       if (read == 0) {
         continue;
@@ -143,8 +159,7 @@ namespace {
     if (needed <= 0) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kPasswordReadFailed, // TSK020
-                      std::string("Failed to convert password encoding (Win32 error ") +
-                          std::to_string(GetLastError()) + ")"};
+                      "Failed to convert password encoding.", GetLastError()};
     }
     std::string password(static_cast<size_t>(needed), '\0');
     WideCharToMultiByte(CP_UTF8, 0, buffer.data(), static_cast<int>(buffer.size()), password.data(),
@@ -183,8 +198,7 @@ namespace {
       const int err = errno;
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kConsoleModeQueryFailed, // TSK020
-                      std::string("Failed to query terminal attributes (errno ") +
-                          std::to_string(err) + ")"};
+                      "Failed to query terminal attributes.", err};
     }
     TermiosGuard guard(STDIN_FILENO, original);
     termios silent = original;
@@ -193,8 +207,7 @@ namespace {
       const int err = errno;
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kConsoleEchoDisableFailed, // TSK020
-                      std::string("Failed to disable terminal echo (errno ") + std::to_string(err) +
-                          ")"};
+                      "Failed to disable terminal echo.", err};
     }
 
     std::cout << prompt << std::flush;
@@ -203,7 +216,7 @@ namespace {
       const int err = errno;
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kPasswordReadFailed, // TSK020
-                      std::string("Failed to read password (errno ") + std::to_string(err) + ")"};
+                      "Failed to read password input.", err};
     }
     guard.Restore();
     std::cout << std::endl;
@@ -286,8 +299,50 @@ namespace {
     return std::string(err.what());
   }
 
+  std::string UserFacingMessage(const qv::Error& err) { // TSK027
+#ifdef NDEBUG
+    switch (err.domain) {
+    case qv::ErrorDomain::Security:
+      return "Authentication failed or volume unavailable.";
+    case qv::ErrorDomain::Validation:
+      return "Request could not be processed.";
+    case qv::ErrorDomain::IO:
+      return "I/O operation failed.";
+    case qv::ErrorDomain::Config:
+    case qv::ErrorDomain::Dependency:
+    case qv::ErrorDomain::State:
+    case qv::ErrorDomain::Internal:
+    case qv::ErrorDomain::Crypto:
+    default:
+      return "Operation failed.";
+    }
+#else
+    return DescribeError(err);
+#endif
+  }
+
   void ReportError(const qv::Error& err) {
-    std::cerr << DomainPrefix(err.domain) << ": " << DescribeError(err) << '\n';
+    const std::string detail = DescribeError(err);
+#ifdef NDEBUG
+    const std::string user = UserFacingMessage(err);
+#else
+    const std::string user = detail;
+#endif
+    std::cerr << DomainPrefix(err.domain) << ": " << user << '\n';
+
+    qv::orchestrator::Event event;             // TSK027
+    event.category = qv::orchestrator::EventCategory::kDiagnostics;
+    event.severity = qv::orchestrator::EventSeverity::kError;
+    event.event_id = "cli_error";
+    event.message = detail;
+    event.fields.emplace_back("domain", std::string(DomainPrefix(err.domain)));
+    event.fields.emplace_back("code", std::to_string(err.code),
+                              qv::orchestrator::FieldPrivacy::kPublic, true);
+    if (err.native_code.has_value()) {
+      event.fields.emplace_back("native_code", std::to_string(*err.native_code),
+                                qv::orchestrator::FieldPrivacy::kHash, true);
+    }
+    qv::orchestrator::EventBus::Instance().Publish(event);
   }
 
   int ExitCodeFor(const qv::Error& err) {
@@ -333,7 +388,7 @@ namespace {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing, // TSK020
-                      "Container not found: " + container.string()};
+                      "Container not found: " + SanitizePath(container)};
     }
     auto lock_path = container;
     lock_path += ".locked"; // TSK026
@@ -346,7 +401,13 @@ namespace {
     auto handle = vm.Mount(container, password);
     SecureZero(password);
     if (!handle) {
-      std::cerr << "Authentication failed." << std::endl;
+      const char* message =
+#ifdef NDEBUG
+          "Authentication failed or volume unavailable.";
+#else
+          "Authentication failed.";
+#endif
+      std::cerr << message << std::endl;
       return kExitAuth;
     }
     std::cout << "Mounted." << std::endl;
@@ -383,7 +444,7 @@ namespace {
     if (!std::filesystem::exists(legacy)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kLegacyNonceMissing, // TSK020
-                      "Legacy nonce log not found at " + legacy.string()};
+                      "Legacy nonce log not found at " + SanitizePath(legacy)};
     }
 
     qv::core::NonceLog legacy_log(legacy);
@@ -399,14 +460,13 @@ namespace {
     if (ec) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kLegacyNonceWriteFailed, // TSK020
-                      "Failed to write nonce log to " + target.string() + " (errno " +
-                          std::to_string(ec.value()) + ")"};
+                      "Failed to write nonce log to " + SanitizePath(target), ec.value()};
     }
 
     qv::core::NonceLog migrated(target);
     (void)migrated;
 
-    std::cout << "Nonce log migrated to " << target << "." << std::endl;
+    std::cout << "Nonce log migrated to " << SanitizePath(target) << "." << std::endl;
     return kExitOk;
   }
 
@@ -478,13 +538,22 @@ int main(int argc, char** argv) {
     PrintUsage();
     return kExitUsage;
   } catch (const qv::AuthenticationFailureError& err) {
+    (void)err;
+#ifdef NDEBUG
+    std::cerr << "Authentication failed or volume unavailable." << std::endl;
+#else
     std::cerr << "Authentication failed: " << err.what() << std::endl;
+#endif
     return kExitAuth;
   } catch (const qv::Error& err) {
     ReportError(err);
     return ExitCodeFor(err);
   } catch (const std::exception& err) {
+#ifdef NDEBUG
+    std::cerr << "I/O error: Operation failed." << std::endl;
+#else
     std::cerr << "I/O error: " << err.what() << std::endl;
+#endif
     return kExitIO;
   }
 }
