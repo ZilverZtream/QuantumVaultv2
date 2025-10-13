@@ -335,6 +335,13 @@ namespace {
                       qv::errors::io::kContainerMissing, // TSK020
                       "Container not found: " + container.string()};
     }
+    auto lock_path = container;
+    lock_path += ".locked"; // TSK026
+    std::error_code lock_ec;
+    if (std::filesystem::exists(lock_path, lock_ec)) {
+      throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                      "Volume is locked due to repeated authentication failures"}; // TSK026
+    }
     auto password = ReadPassword("Password: ");
     auto handle = vm.Mount(container, password);
     SecureZero(password);
