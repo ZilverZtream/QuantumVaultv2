@@ -2,9 +2,9 @@
 
 #include <cstdlib>
 #include <filesystem>
-#include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -15,6 +15,7 @@
 #  include <dlfcn.h>
 #endif
 
+#include "qv/orchestrator/event_bus.h"  // TSK019
 #include "qv/orchestrator/plugin_abi.h"
 
 using namespace qv::orchestrator;
@@ -155,6 +156,26 @@ bool ShouldVerify(const PluginVerification& verification) {
   return false;
 }
 
+void PublishPluginDiagnostic(
+    qv::orchestrator::EventSeverity severity, std::string_view event_id,
+    std::string_view message, const std::filesystem::path& path,
+    std::vector<qv::orchestrator::EventField> extra_fields = {}) { // TSK019
+  qv::orchestrator::Event event;
+  event.category = qv::orchestrator::EventCategory::kLifecycle;
+  event.severity = severity;
+  event.event_id = std::string(event_id);
+  event.message = std::string(message);
+  auto normalized = path.generic_string();
+  if (!normalized.empty()) {
+    event.fields.emplace_back("plugin_path_hash", normalized,
+                              qv::orchestrator::FieldPrivacy::kHash);
+  }
+  for (auto& field : extra_fields) {
+    event.fields.push_back(std::move(field));
+  }
+  qv::orchestrator::EventBus::Instance().Publish(event);
+}
+
 } // namespace
 
 struct PluginManager::LoadedPlugin {
@@ -212,32 +233,42 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
     canonical_path = std::filesystem::absolute(so_path, ec);
   }
   if (ec) {
-    std::cerr << "[PluginManager] Unable to resolve path for " << so_path << "\n";
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                            "plugin_path_resolution_failure",
+                            "Unable to resolve plugin path", so_path);
     return false;
   }
 
   for (const auto& plugin : loaded_) {
     if (plugin->path == canonical_path) {
-      std::cerr << "[PluginManager] Plugin already loaded: " << canonical_path << "\n";
+      PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kWarning,
+                              "plugin_already_loaded",
+                              "Plugin already loaded", canonical_path);
       return false;
     }
   }
 
   if (!std::filesystem::is_regular_file(canonical_path, ec)) {
-    std::cerr << "[PluginManager] Not a regular file: " << canonical_path << "\n";
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                            "plugin_not_regular_file",
+                            "Plugin candidate is not a regular file", canonical_path);
     return false;
   }
 
   if (ShouldVerify(policy)) {
     if (!VerifyPlugin(canonical_path, policy)) {
-      std::cerr << "[PluginManager] Verification failed for " << canonical_path << "\n";
+      PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                              "plugin_verification_failed",
+                              "Plugin verification failed", canonical_path);
       return false;
     }
   }
 
   DynLib library;
   if (!library.Open(canonical_path)) {
-    std::cerr << "[PluginManager] Failed to load library: " << canonical_path << "\n";
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                            "plugin_library_load_failure",
+                            "Failed to load plugin library", canonical_path);
     return false;
   }
 
@@ -247,8 +278,9 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   auto get_info = reinterpret_cast<QV_Plugin_GetInfo>(library.Symbol("qv_plugin_get_info"));
 
   if (!init || !shutdown || !get_info) {
-    std::cerr << "[PluginManager] Missing required entry points in " << canonical_path
-              << "\n";
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                            "plugin_missing_entry_points",
+                            "Plugin missing required entry points", canonical_path);
     return false;
   }
 
@@ -256,19 +288,37 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   if (info.abi_version < policy.min_abi_version ||
       info.abi_version > policy.max_abi_version ||
       info.abi_version != QV_PLUGIN_ABI_VERSION) {
-    std::cerr << "[PluginManager] ABI mismatch for " << canonical_path << " (got "
-              << info.abi_version << ")\n";
+    PublishPluginDiagnostic(
+        qv::orchestrator::EventSeverity::kError, "plugin_abi_mismatch",
+        "Plugin ABI version outside allowed range", canonical_path,
+        {qv::orchestrator::EventField("reported_abi_version",
+                                      std::to_string(info.abi_version),
+                                      qv::orchestrator::FieldPrivacy::kPublic, true)});
     return false;
   }
 
   if (!policy.plugin_id.empty() && info.name &&
       policy.plugin_id != std::string(info.name)) {
-    std::cerr << "[PluginManager] Plugin identity mismatch for " << canonical_path << "\n";
+    std::vector<qv::orchestrator::EventField> identity_fields;
+    if (!policy.plugin_id.empty()) {
+      identity_fields.emplace_back("expected_plugin_id_hash", policy.plugin_id,
+                                   qv::orchestrator::FieldPrivacy::kHash);
+    }
+    if (info.name && *info.name) {
+      identity_fields.emplace_back("reported_plugin_id_hash", std::string(info.name),
+                                   qv::orchestrator::FieldPrivacy::kHash);
+    }
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kWarning,
+                            "plugin_identity_mismatch",
+                            "Plugin identifier does not match verification policy",
+                            canonical_path, std::move(identity_fields));
     return false;
   }
 
   if (init() != 0) {
-    std::cerr << "[PluginManager] Initialization failed for " << canonical_path << "\n";
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                            "plugin_initialization_failed",
+                            "Plugin initialization routine failed", canonical_path);
     return false;
   }
 

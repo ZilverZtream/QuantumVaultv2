@@ -24,6 +24,7 @@
 #include "qv/common.h"
 #include "qv/crypto/ct.h"
 #include "qv/crypto/hmac_sha256.h"
+#include "qv/orchestrator/event_bus.h"  // TSK019
 #include "qv/security/zeroizer.h"
 
 using namespace qv::orchestrator;
@@ -470,11 +471,28 @@ void ConstantTimeMount::LogTiming(const Attempt& a, const Attempt& b) {
   }
 
   auto snap = SnapshotTiming();
-  std::clog << "{\"event\":\"ct_mount_timing\",";
-  std::clog << "\"durations_ns\":[" << a.duration.count() << ',' << b.duration.count() << "],";
-  std::clog << "\"padding_ns\":[" << a.pad.count() << ',' << b.pad.count() << "],";
-  std::clog << "\"target_ns\":" << snap.target_ns << ',';
-  std::clog << "\"p95_ns\":" << snap.p95_ns << ',';
-  std::clog << "\"p99_ns\":" << snap.p99_ns << ',';
-  std::clog << "\"samples\":" << snap.samples << "}" << std::endl;
+
+  qv::orchestrator::Event event;  // TSK019
+  event.category = qv::orchestrator::EventCategory::kTelemetry;
+  event.severity = qv::orchestrator::EventSeverity::kInfo;
+  event.event_id = "ct_mount_timing";
+  event.message = "Constant-time mount timing sample";
+  event.fields.emplace_back("attempt_a_duration_ns", std::to_string(a.duration.count()),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.fields.emplace_back("attempt_b_duration_ns", std::to_string(b.duration.count()),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.fields.emplace_back("attempt_a_padding_ns", std::to_string(a.pad.count()),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.fields.emplace_back("attempt_b_padding_ns", std::to_string(b.pad.count()),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.fields.emplace_back("target_ns", std::to_string(snap.target_ns),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.fields.emplace_back("p95_ns", std::to_string(snap.p95_ns),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.fields.emplace_back("p99_ns", std::to_string(snap.p99_ns),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.fields.emplace_back("samples", std::to_string(snap.samples),
+                            qv::orchestrator::FieldPrivacy::kPublic, true);
+
+  qv::orchestrator::EventBus::Instance().Publish(event);
 }
