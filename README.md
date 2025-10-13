@@ -36,7 +36,10 @@ cmake --build build --config Release
 
 Dependencies: a modern compiler with C++20. Crypto primitives are **stubbed** to
 keep the skeleton buildable without extra libraries; swap them with OpenSSL/libsodium
-or your preferred provider when moving beyond stubs.
+or your preferred provider when moving beyond stubs. Platform credential storage hooks
+depend on native SDKs (`libsecret-1` on Linux, macOS Keychain, Windows DPAPI) and the
+optional TPM sealing path uses `tpm2-tss`. These are detected automatically when the
+development headers are present. <!-- TSK035_Platform_Specific_Security_Integration -->
 
 ## Production Deployment
 
@@ -79,7 +82,7 @@ wire in real providers:
 ```bash
 sudo apt update
 sudo apt install build-essential cmake ninja-build pkg-config \
-    libssl-dev libsodium-dev liboqs-dev
+    libssl-dev libsodium-dev liboqs-dev libsecret-1-dev tpm2-tss-dev
 
 # Configure with real crypto
 cmake -S . -B build -GNinja -DQV_USE_STUB_CRYPTO=OFF
@@ -91,6 +94,9 @@ cmake --build build
 ```bash
 brew install cmake ninja openssl libsodium liboqs
 
+# Optional: TPM and libsecret bindings for credential persistence <!-- TSK035_Platform_Specific_Security_Integration -->
+brew install tpm2-tss libsecret
+
 # Homebrew installs OpenSSL into /opt/homebrew/opt/openssl@3
 cmake -S . -B build -GNinja -DQV_USE_STUB_CRYPTO=OFF \
       -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
@@ -101,6 +107,7 @@ cmake --build build
 
 ```powershell
 vcpkg install openssl:x64-windows-static-md libsodium:x64-windows liboqs:x64-windows
+vcpkg install tpm2-tss:x64-windows # optional TPM sealing support <!-- TSK035_Platform_Specific_Security_Integration -->
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
       -DQV_USE_STUB_CRYPTO=OFF `
       -DCMAKE_TOOLCHAIN_FILE="${env:VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
@@ -110,6 +117,25 @@ cmake --build build --config Release
 > liboqs is optional for now; when unavailable the build will continue with
 > PQC stubs. The README's security notes call out the locations that must be
 > revisited when swapping to production crypto providers.
+
+<!-- TSK035_Platform_Specific_Security_Integration -->
+### Platform credential integration
+
+`qv` can persist derived credentials into the host's secure storage to avoid
+writing plaintext secrets to disk:
+
+- `--keychain` stores volume secrets in the OS store (Windows DPAPI, macOS
+  Keychain, or the Linux Secret Service via libsecret).
+- `--tpm-seal` seals credentials to TPM PCR 7 using `tpm2-tss`, writing the
+  sealed blob into the container metadata directory.
+
+When both flags are present the TPM output is written alongside the OS
+credential. The TPM flow requires a functional resource manager; on systems
+without a TPM the command exits with a security error.
+
+For SELinux deployments the policy stub at `contrib/selinux/qv.te` grants the
+minimal capabilities needed for TPM access and credential caching inside user
+directories.
 
 ## Project Layout
 

@@ -234,13 +234,29 @@ std::string DetectHostname() { // TSK029
   return "quantumvault";
 }
 
-std::string DetectProcessId() { // TSK029
+    std::string DetectProcessId() { // TSK029
 #if defined(_WIN32)
-  return std::to_string(_getpid());
+      return std::to_string(_getpid());
 #else
-  return std::to_string(static_cast<long long>(::getpid()));
+      return std::to_string(static_cast<long long>(::getpid()));
 #endif
-}
+    }
+
+    std::string FormatSyslogTimestamp(std::chrono::system_clock::time_point tp) { // TSK035_Platform_Specific_Security_Integration
+      auto tt = std::chrono::system_clock::to_time_t(tp);
+      std::tm tm{};
+#if defined(_WIN32)
+      gmtime_s(&tm, &tt);
+#else
+      gmtime_r(&tt, &tm);
+#endif
+      auto fractional = std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()) %
+                        std::chrono::seconds(1);
+      std::ostringstream oss;
+      oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
+      oss << '.' << std::setw(6) << std::setfill('0') << fractional.count() << 'Z';
+      return oss.str();
+    }
 
 } // namespace
 
@@ -619,7 +635,7 @@ void SyslogPublisher::Publish(const Event& event) { // TSK029
   if (!configured_) {
     return;
   }
-  const auto timestamp = JsonLineLogger::FormatTimestamp(std::chrono::system_clock::now());
+    const auto timestamp = FormatSyslogTimestamp(std::chrono::system_clock::now()); // TSK035_Platform_Specific_Security_Integration
   const auto payload = BuildEventJson(event, timestamp);
   const int pri = kSyslogFacility * 8 + SeverityToSyslog(event.severity);
   std::ostringstream oss;

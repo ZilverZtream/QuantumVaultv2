@@ -54,6 +54,20 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE) # TSK008
 
 find_package(OpenSSL REQUIRED)
 find_package(sodium QUIET) # TSK008
+find_package(PkgConfig QUIET) # TSK035_Platform_Specific_Security_Integration
+set(qv_have_libsecret OFF) # TSK035_Platform_Specific_Security_Integration
+set(qv_have_tpm OFF)       # TSK035_Platform_Specific_Security_Integration
+if (UNIX AND NOT APPLE AND PkgConfig_FOUND)
+  pkg_check_modules(LIBSECRET QUIET libsecret-1)
+  if (LIBSECRET_FOUND)
+    set(qv_have_libsecret ON)
+  endif()
+  pkg_check_modules(TSS2 QUIET tss2-esys)
+  if (TSS2_FOUND)
+    set(qv_have_tpm ON)
+  endif()
+endif()
+
 set(qv_have_sodium OFF)
 set(qv_sodium_target "")
 if (TARGET sodium::sodium)
@@ -121,6 +135,23 @@ target_include_directories(qv
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 ) # TSK008
 target_link_libraries(qv PRIVATE qv_core qv_orchestrator)
+if (WIN32)
+  target_link_libraries(qv PRIVATE Crypt32) # TSK035_Platform_Specific_Security_Integration
+elseif(APPLE)
+  target_link_libraries(qv PRIVATE "-framework Security") # TSK035_Platform_Specific_Security_Integration
+endif()
+if (qv_have_libsecret)
+  target_include_directories(qv PRIVATE ${LIBSECRET_INCLUDE_DIRS}) # TSK035_Platform_Specific_Security_Integration
+  target_link_libraries(qv PRIVATE ${LIBSECRET_LIBRARIES})         # TSK035_Platform_Specific_Security_Integration
+endif()
+if (qv_have_tpm)
+  target_include_directories(qv PRIVATE ${TSS2_INCLUDE_DIRS}) # TSK035_Platform_Specific_Security_Integration
+  target_link_libraries(qv PRIVATE ${TSS2_LIBRARIES})         # TSK035_Platform_Specific_Security_Integration
+endif()
+target_compile_definitions(qv PRIVATE
+    QV_HAVE_LIBSECRET=$<BOOL:${qv_have_libsecret}> # TSK035_Platform_Specific_Security_Integration
+    QV_ENABLE_TPM_SEALING=$<BOOL:${qv_have_tpm}>   # TSK035_Platform_Specific_Security_Integration
+)
 
 # Plugins (examples)
 add_library(qv_example_crypto MODULE plugins/example_crypto/example_crypto.cpp)
