@@ -60,15 +60,36 @@ set_target_properties(qv_pqc_mlkem PROPERTIES
 # Tests
 if(QV_BUILD_TESTS)
   enable_testing()
-  add_executable(qv_nonce_test_bin tests/test_nonce.cpp)
-  target_include_directories(qv_nonce_test_bin PUBLIC include)
-  target_link_libraries(qv_nonce_test_bin PRIVATE qv_core)
-  add_test(NAME qv_nonce_test COMMAND qv_nonce_test_bin)
+# ---------- Tests ----------
+enable_testing()
 
+# Common test flags (TSK006)
+function(qv_apply_test_opts tgt)
+  if (MSVC)
+    target_compile_options(${tgt} PRIVATE /O2 /GL)  # TSK006
+    target_link_options(${tgt} PRIVATE /LTCG)       # TSK006
+  else()
+    target_compile_options(${tgt} PRIVATE -O3 -flto)  # TSK006
+    target_link_options(${tgt} PRIVATE -flto)         # TSK006
+  endif()
+endfunction()
+
+# Nonce test
+add_executable(qv_nonce_test_bin tests/test_nonce.cpp)
+target_include_directories(qv_nonce_test_bin PUBLIC include)
+target_link_libraries(qv_nonce_test_bin PRIVATE qv_core)
+qv_apply_test_opts(qv_nonce_test_bin)
+add_test(NAME qv_nonce_test COMMAND qv_nonce_test_bin)
+
+# Constant-time mount test (only if the source exists)
+if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_constant_time_mount.cpp")
   add_executable(qv_constant_time_mount_test tests/test_constant_time_mount.cpp)
   target_include_directories(qv_constant_time_mount_test PUBLIC include)
   target_link_libraries(qv_constant_time_mount_test PRIVATE qv_core qv_orchestrator)
+  qv_apply_test_opts(qv_constant_time_mount_test)
   add_test(NAME qv_constant_time_mount COMMAND qv_constant_time_mount_test)
+endif()
+
 endif()
 
 # --- Wiring check gate ---
