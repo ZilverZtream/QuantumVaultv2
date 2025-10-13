@@ -1,11 +1,21 @@
 #include "qv/core/nonce.h"
 
+#include <algorithm>
+
 using namespace qv;
 using namespace qv::core;
 
 NonceGenerator::NonceGenerator(uint32_t epoch, uint64_t start_counter)
   : epoch_(epoch), counter_(start_counter), log_(std::filesystem::path("qv_nonce.log")) {
-  if (start_counter > (UINT64_MAX - 1'000'000'000ULL)) {
+  if (!log_.VerifyChain()) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log verification failed"};
+  }
+  uint64_t persisted = log_.GetLastCounter();
+  bool has_entries = log_.EntryCount() > 0;
+  uint64_t persisted_next = (persisted == UINT64_MAX) ? UINT64_MAX : persisted + 1;
+  uint64_t initial = has_entries ? std::max(start_counter, persisted_next) : start_counter;
+  counter_.store(initial, std::memory_order_release);
+  if (initial > (UINT64_MAX - 1'000'000'000ULL)) {
     throw Error{ErrorDomain::Security, 1, "Counter near overflow. Rekey required."};
   }
 }
