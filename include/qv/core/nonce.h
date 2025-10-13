@@ -1,9 +1,11 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <chrono> // TSK015
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <optional> // TSK015
 #include <span>
 #include <vector>
 #include <algorithm>
@@ -40,22 +42,50 @@ private:
 };
 
 class NonceGenerator {
-  uint32_t epoch_;
-  std::atomic<uint64_t> counter_;
-  NonceLog log_;
 public:
+  enum class RekeyReason : uint8_t { // TSK015
+    kNone = 0,
+    kNonceBudget,
+    kEpochExpired,
+    kCounterLimit,
+  };
   struct NonceRecord { // TSK014
     std::array<uint8_t, 12> nonce;
     uint64_t counter;
     std::array<uint8_t, 32> mac;
   };
+  struct Status { // TSK015
+    uint64_t counter{0};
+    uint64_t nonces_emitted{0};
+    uint64_t remaining_nonce_budget{0};
+    std::chrono::system_clock::time_point epoch_started{};
+    std::chrono::system_clock::time_point now{};
+    RekeyReason reason{RekeyReason::kNone};
+  };
   explicit NonceGenerator(uint32_t epoch, uint64_t start_counter = 0);
   NonceRecord NextAuthenticated(); // TSK014
   std::array<uint8_t, 12> Next();
   uint64_t CurrentCounter() const { return counter_.load(std::memory_order_acquire); }
-  bool NeedsRekey() const {
-    return counter_.load(std::memory_order_acquire) > (UINT64_MAX - 100'000'000ULL);
-  }
+  bool NeedsRekey() const; // TSK015
+  Status GetStatus() const; // TSK015
+  Status EvaluateStatus(std::chrono::system_clock::time_point now) const; // TSK015
+  void SetEpochStart(std::chrono::system_clock::time_point start); // TSK015
+  void SetPolicy(uint64_t max_nonces, std::chrono::hours max_age); // TSK015
+  std::optional<NonceRecord> LastPersisted() const; // TSK015
+private:
+  uint32_t epoch_;
+  std::atomic<uint64_t> counter_;
+  NonceLog log_;
+  struct RekeyPolicy { // TSK015
+    uint64_t max_nonces = 50'000'000ULL;
+    std::chrono::hours max_age = std::chrono::hours{24 * 30};
+  };
+  RekeyPolicy policy_{}; // TSK015
+  std::chrono::system_clock::time_point epoch_started_{}; // TSK015
+  uint64_t base_counter_{0}; // TSK015
+  RekeyReason DetermineRekeyReason(uint64_t candidate,
+                                   std::chrono::system_clock::time_point now) const; // TSK015
+  static std::array<uint8_t, 12> MakeNonceBytes(uint32_t epoch, uint64_t counter); // TSK015
 };
 
 struct EpochTLV {
@@ -63,6 +93,38 @@ struct EpochTLV {
   uint16_t length = 4;
   uint32_t epoch;
 } __attribute__((packed));
+
+inline constexpr const char* RekeyReasonToString(NonceGenerator::RekeyReason reason) { // TSK015
+  switch (reason) {
+    case NonceGenerator::RekeyReason::kNone:
+      return "none";
+    case NonceGenerator::RekeyReason::kNonceBudget:
+      return "nonce-budget";
+    case NonceGenerator::RekeyReason::kEpochExpired:
+      return "epoch-expired";
+    case NonceGenerator::RekeyReason::kCounterLimit:
+      return "counter-limit";
+  }
+  return "unknown";
+}
+
+inline EpochTLV MakeEpochTlv(uint32_t epoch) { // TSK015
+  EpochTLV tlv{};
+  tlv.type = qv::ToLittleEndian(static_cast<uint16_t>(0x4E4F));
+  tlv.length = qv::ToLittleEndian(static_cast<uint16_t>(sizeof(tlv.epoch)));
+  tlv.epoch = qv::ToLittleEndian(epoch);
+  return tlv;
+}
+
+inline bool ValidateEpochTlv(const EpochTLV& tlv, uint32_t expected_epoch) { // TSK015
+  if (qv::ToLittleEndian(tlv.type) != 0x4E4F) {
+    return false;
+  }
+  if (qv::ToLittleEndian(tlv.length) != sizeof(tlv.epoch)) {
+    return false;
+  }
+  return qv::ToLittleEndian(tlv.epoch) == expected_epoch;
+}
 
 inline constexpr std::array<uint8_t, 8> kAADContextChunkData = {'Q','V','C','H','U','N','K','D'}; // TSK014
 inline constexpr std::array<uint8_t, 8> kAADContextMetadata = {'Q','V','M','E','T','A','D','T'}; // TSK014
