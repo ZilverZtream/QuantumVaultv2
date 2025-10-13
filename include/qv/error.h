@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -81,8 +82,10 @@ namespace qv {
   struct Error : public std::runtime_error {
     ErrorDomain domain;
     int code;
-    explicit Error(ErrorDomain d, int c, const std::string& msg)
-        : std::runtime_error(msg), domain(d), code(c) {}
+    std::optional<int> native_code; // TSK027
+    explicit Error(ErrorDomain d, int c, const std::string& msg,
+                   std::optional<int> native = std::nullopt)
+        : std::runtime_error(msg), domain(d), code(c), native_code(native) {}
   };
   struct AuthenticationFailureError : public std::runtime_error {
     explicit AuthenticationFailureError(const std::string& msg) : std::runtime_error(msg) {}
