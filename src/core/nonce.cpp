@@ -1,6 +1,7 @@
 #include "qv/core/nonce.h"
 
 #include <algorithm>
+#include <cstring> // TSK014
 
 using namespace qv;
 using namespace qv::core;
@@ -20,17 +21,25 @@ NonceGenerator::NonceGenerator(uint32_t epoch, uint64_t start_counter)
   }
 }
 
-std::array<uint8_t, 12> NonceGenerator::Next() {
+NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated() {
   uint64_t next = counter_.fetch_add(1, std::memory_order_seq_cst);
   if (next >= UINT64_MAX - 1'000'000ULL) {
     counter_.store(UINT64_MAX, std::memory_order_seq_cst);
     throw Error{ErrorDomain::Security, 2, "Counter overflow imminent! Rekey."};
   }
-  log_.Append(next);
+  auto mac = log_.Append(next); // TSK014
+  NonceRecord record{}; // TSK014
+  record.counter = next; // TSK014
+  record.mac = mac; // TSK014
   std::array<uint8_t,12> nonce{};
   uint32_t epoch_le = qv::ToLittleEndian(epoch_);
   uint64_t counter_be = qv::ToBigEndian(next);
   std::memcpy(nonce.data()+0, &epoch_le, 4);
   std::memcpy(nonce.data()+4, &counter_be, 8);
-  return nonce;
+  record.nonce = nonce; // TSK014
+  return record; // TSK014
+}
+
+std::array<uint8_t, 12> NonceGenerator::Next() {
+  return NextAuthenticated().nonce; // TSK014
 }
