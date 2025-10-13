@@ -58,11 +58,13 @@ public:
   }
 };
 
+// TSK016_Windows_Compatibility_Fixes ensure portable packed layout without compiler-specific attributes.
+#pragma pack(push, 1)
 struct EpochTLV {
   uint16_t type = 0x4E4F; // 'NO'
   uint16_t length = 4;
   uint32_t epoch;
-} __attribute__((packed));
+};
 
 inline constexpr std::array<uint8_t, 8> kAADContextChunkData = {'Q','V','C','H','U','N','K','D'}; // TSK014
 inline constexpr std::array<uint8_t, 8> kAADContextMetadata = {'Q','V','M','E','T','A','D','T'}; // TSK014
@@ -74,12 +76,17 @@ struct AADData { // TSK014
   uint64_t logical_offset;
   uint32_t chunk_size;
   uint8_t  context[8];
-} __attribute__((packed));
+};
 
 struct AADEnvelope { // TSK014
   AADData data;
   std::array<uint8_t, 32> nonce_chain_mac;
-} __attribute__((packed));
+};
+#pragma pack(pop)
+
+static_assert(sizeof(EpochTLV) == 8, "EpochTLV packing mismatch"); // TSK016_Windows_Compatibility_Fixes
+static_assert(sizeof(AADData) == 32, "AADData packing mismatch");   // TSK016_Windows_Compatibility_Fixes
+static_assert(sizeof(AADEnvelope) == 64, "AADEnvelope packing mismatch"); // TSK016_Windows_Compatibility_Fixes
 
 inline constexpr uint64_t ToLittleEndian64(uint64_t value) { // TSK014
   return qv::kIsLittleEndian ? value : qv::detail::ByteSwap64(value);

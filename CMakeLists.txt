@@ -12,7 +12,7 @@ option(QV_USE_STUB_CRYPTO "Use stub implementations for cryptography" OFF) # TSK
 option(QV_ENABLE_SANITIZERS "Enable address/undefined sanitizers" OFF) # TSK008
 
 if (MSVC)
-  add_compile_options(/permissive- /W4) # TSK008
+  add_compile_options(/permissive- /W4 /EHsc /bigobj) # TSK016_Windows_Compatibility_Fixes
 else()
   add_compile_options(-Wall -Wextra -Wpedantic) # TSK008
 endif()
@@ -75,6 +75,9 @@ target_include_directories(qv_core
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 ) # TSK008
 target_link_libraries(qv_core PUBLIC OpenSSL::Crypto)
+if (WIN32)
+  target_link_libraries(qv_core PRIVATE bcrypt) # TSK016_Windows_Compatibility_Fixes
+endif()
 if (NOT QV_USE_STUB_CRYPTO AND qv_have_sodium)
   target_link_libraries(qv_core PRIVATE ${qv_sodium_target}) # TSK008
 endif()
@@ -120,6 +123,7 @@ target_include_directories(qv_example_crypto
       $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 ) # TSK008
+target_compile_definitions(qv_example_crypto PRIVATE QV_PLUGIN_IMPLEMENTATION) # TSK016_Windows_Compatibility_Fixes
 set_target_properties(qv_example_crypto PROPERTIES
     PREFIX ""  # cross-platform friendlier
     OUTPUT_NAME "qv_example_crypto"
@@ -131,6 +135,7 @@ target_include_directories(qv_pqc_mlkem
       $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 ) # TSK008
+target_compile_definitions(qv_pqc_mlkem PRIVATE QV_PLUGIN_IMPLEMENTATION) # TSK016_Windows_Compatibility_Fixes
 set_target_properties(qv_pqc_mlkem PROPERTIES
     PREFIX ""
     OUTPUT_NAME "qv_pqc_mlkem"

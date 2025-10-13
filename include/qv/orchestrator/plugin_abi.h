@@ -6,7 +6,11 @@
 
 // TSK010 cross-platform plugin ABI definitions.
 #if defined(_WIN32)
-#  define QV_PLUGIN_EXPORT __declspec(dllexport)
+#  if defined(QV_PLUGIN_IMPLEMENTATION)
+#    define QV_PLUGIN_EXPORT __declspec(dllexport)  // TSK016_Windows_Compatibility_Fixes
+#  else
+#    define QV_PLUGIN_EXPORT
+#  endif
 #else
 #  define QV_PLUGIN_EXPORT
 #endif
