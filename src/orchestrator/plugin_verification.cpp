@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstring>
@@ -55,6 +56,7 @@
 using namespace qv::orchestrator;
 using namespace qv::crypto;
 using qv::crypto::ct::CompareEqual;
+using qv::crypto::ct::StringCompare; // TSK037
 
 namespace {
 std::string_view Trim(std::string_view in);
@@ -214,24 +216,38 @@ void InsertUnique(std::vector<std::array<uint8_t, 32>>& roots,
 
 std::optional<std::array<uint8_t, 32>> ResolvePin(const PluginTrustPolicy& policy,
                                                   const std::string& plugin_id) {
-  if (plugin_id.empty()) return std::nullopt;
-  auto it = policy.pinned_public_keys.find(plugin_id);
-  if (it == policy.pinned_public_keys.end()) return std::nullopt;
-  return it->second;
+  std::array<uint8_t, 32> resolved{};
+  uint8_t found_mask = 0;
+  const bool plugin_present = !plugin_id.empty();
+  for (const auto& entry : policy.pinned_public_keys) {                 // TSK037
+    bool id_match = plugin_present & StringCompare(entry.first, plugin_id); // TSK037
+    for (size_t i = 0; i < resolved.size(); ++i) {                      // TSK037
+      resolved[i] = qv::crypto::ct::Select<uint8_t>(resolved[i], entry.second[i], id_match);
+    }
+    found_mask |= static_cast<uint8_t>(id_match);
+  }
+  std::atomic_signal_fence(std::memory_order_seq_cst); // TSK037
+  if (found_mask != 0) {
+    return resolved;
+  }
+  return std::nullopt;
 }
 
 bool IsKeyTrusted(const PluginTrustPolicy& policy, const std::string& plugin_id,
                   const std::array<uint8_t, 32>& key) {
-  if (!plugin_id.empty()) {
-    auto it = policy.pinned_public_keys.find(plugin_id);
-    if (it != policy.pinned_public_keys.end()) {
-      return CompareEqual<32>(it->second, key);
-    }
+  uint8_t trusted_mask = 0;
+  const bool plugin_present = !plugin_id.empty();
+  for (const auto& entry : policy.pinned_public_keys) {                        // TSK037
+    bool id_match = plugin_present & StringCompare(entry.first, plugin_id);    // TSK037
+    bool key_match = CompareEqual<32>(entry.second, key);                      // TSK037
+    trusted_mask |= static_cast<uint8_t>(id_match & key_match);                // TSK037
   }
-  for (const auto& root : policy.root_public_keys) {
-    if (CompareEqual<32>(root, key)) return true;
+  for (const auto& root : policy.root_public_keys) {                           // TSK037
+    bool root_match = CompareEqual<32>(root, key);
+    trusted_mask |= static_cast<uint8_t>(root_match);
   }
-  return false;
+  std::atomic_signal_fence(std::memory_order_seq_cst); // TSK037
+  return trusted_mask != 0;
 }
 } // namespace
 
@@ -279,19 +295,19 @@ PluginTrustPolicy LoadPluginTrustPolicy(const std::filesystem::path& policy_path
       }
       continue;
     }
-    if (view == "allow_hash_fallback=true") {
+    if (StringCompare(view, std::string_view("allow_hash_fallback=true"))) { // TSK037
       policy.allow_hash_fallback = true;
       continue;
     }
-    if (view == "allow_hash_fallback=false") {
+    if (StringCompare(view, std::string_view("allow_hash_fallback=false"))) { // TSK037
       policy.allow_hash_fallback = false;
       continue;
     }
-    if (view == "require_signature=true") {
+    if (StringCompare(view, std::string_view("require_signature=true"))) { // TSK037
       policy.require_signature = true;
       continue;
     }
-    if (view == "require_signature=false") {
+    if (StringCompare(view, std::string_view("require_signature=false"))) { // TSK037
       policy.require_signature = false;
       continue;
     }
@@ -301,7 +317,9 @@ PluginTrustPolicy LoadPluginTrustPolicy(const std::filesystem::path& policy_path
       if (separator == std::string_view::npos) continue;
       std::string key(Trim(content.substr(0, separator)));
       if (auto range = ParseAbiRange(content.substr(separator + 1))) {
-        if (key == "*" || key == "default") {
+        bool wildcard = StringCompare(key, std::string_view("*"));            // TSK037
+        bool named_default = StringCompare(key, std::string_view("default"));  // TSK037
+        if (wildcard | named_default) {                                        // TSK037
           policy.default_abi_range = *range;
         } else {
           policy.plugin_abi_ranges[key] = *range;
@@ -361,15 +379,16 @@ bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& e
 
   const bool require_signature = expected.enforce_signature || policy.require_signature;
   const bool allow_hash = expected.allow_hash_fallback || policy.allow_hash_fallback;
+  bool fallback_hash_match = CompareEqual<32>(hash, expected.expected_hash);        // TSK037
+  bool fallback_ok = allow_hash & hash_present & fallback_hash_match;              // TSK037
+  std::atomic_signal_fence(std::memory_order_seq_cst);                              // TSK037
 
   if (require_signature && !signature_valid) {
     return false;
   }
 
-  if (!signature_valid) {
-    if (!(allow_hash && hash_present && CompareEqual<32>(hash, expected.expected_hash))) {
-      return false;
-    }
+  if (!signature_valid && !fallback_ok) {
+    return false;
   }
 
   auto abi = QueryPluginABI(path);
