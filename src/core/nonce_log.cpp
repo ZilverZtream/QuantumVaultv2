@@ -11,16 +11,14 @@
 #include <vector>
 
 #ifndef _WIN32
-#include <cerrno>
-#include <fcntl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 #else
 #include <windows.h>
 #include <bcrypt.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "bcrypt.lib")  // TSK016_Windows_Compatibility_Fixes ensure RNG linkage
+#endif
 #endif
 
 using namespace qv;
@@ -58,78 +56,17 @@ std::array<uint8_t, kMacSize> ComputeMac(
 }
 
 #ifdef _WIN32
-std::wstring ToWide(const std::filesystem::path& path) {
-  return path.wstring();
-}
-
-void FlushHandle(HANDLE handle, const std::filesystem::path& path) {
-  if (!FlushFileBuffers(handle)) {
-    auto err = static_cast<int>(GetLastError());
-    CloseHandle(handle);
-    throw Error{ErrorDomain::IO, err, "FlushFileBuffers failed for " + path.string()};
-  }
-  CloseHandle(handle);
-}
-
-void FlushFile(const std::filesystem::path& path) {
-  auto wide = ToWide(path);
-  HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (handle == INVALID_HANDLE_VALUE) {
-    auto err = static_cast<int>(GetLastError());
-    throw Error{ErrorDomain::IO, err, "CreateFileW failed for " + path.string()};
-  }
-  FlushHandle(handle, path);
-}
-
-void FlushDirectory(const std::filesystem::path& path) {
-  auto wide = ToWide(path);
-  HANDLE handle = CreateFileW(wide.c_str(), GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING,
-                              FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-  if (handle == INVALID_HANDLE_VALUE) {
-    auto err = static_cast<int>(GetLastError());
-    throw Error{ErrorDomain::IO, err, "CreateFileW (dir) failed for " + path.string()};
-  }
-  FlushHandle(handle, path);
-}
-
 void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-  if (BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()),
-                      BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-    throw Error{ErrorDomain::Security, static_cast<int>(GetLastError()),
-                "BCryptGenRandom failed"};
+  const NTSTATUS status = BCryptGenRandom(nullptr,
+                                          key.data(),
+                                          static_cast<ULONG>(key.size()),
+                                          BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (!BCRYPT_SUCCESS(status)) {
+    throw Error{ErrorDomain::Security, static_cast<int>(status),
+                "BCryptGenRandom failed"};  // TSK016_Windows_Compatibility_Fixes
   }
 }
 #else
-void FlushFd(int fd, const std::filesystem::path& path) {
-  if (::fsync(fd) != 0) {
-    auto err = errno;
-    ::close(fd);
-    throw Error{ErrorDomain::IO, err, "fsync failed for " + path.string()};
-  }
-  ::close(fd);
-}
-
-void FlushFile(const std::filesystem::path& path) {
-  int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) {
-    throw Error{ErrorDomain::IO, errno, "open failed for " + path.string()};
-  }
-  FlushFd(fd, path);
-}
-
-void FlushDirectory(const std::filesystem::path& path) {
-  int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
-  if (fd < 0) {
-    throw Error{ErrorDomain::IO, errno, "open dir failed for " + path.string()};
-  }
-  FlushFd(fd, path);
-}
-
 void GenerateKey(std::array<uint8_t, kMacSize>& key) {
   if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
     auto err = static_cast<int>(ERR_get_error());
@@ -203,7 +140,8 @@ void NonceLog::EnsureLoadedUnlocked() {
     return;
   }
   if (!std::filesystem::exists(path_)) {
-    throw Error{ErrorDomain::IO, 0, "Nonce log missing at " + path_.string()};
+    throw Error{ErrorDomain::IO, 0,
+                "Nonce log missing at " + qv::PathToUtf8String(path_)};  // TSK016_Windows_Compatibility_Fixes
   }
   ReloadUnlocked();
 }
@@ -211,7 +149,8 @@ void NonceLog::EnsureLoadedUnlocked() {
 void NonceLog::ReloadUnlocked() {
   std::ifstream in(path_, std::ios::binary);
   if (!in.is_open()) {
-    throw Error{ErrorDomain::IO, 0, "Failed to open nonce log " + path_.string()};
+    throw Error{ErrorDomain::IO, 0,
+                "Failed to open nonce log " + qv::PathToUtf8String(path_)};  // TSK016_Windows_Compatibility_Fixes
   }
   in.seekg(0, std::ios::end);
   auto size = static_cast<std::streamoff>(in.tellg());
@@ -222,7 +161,8 @@ void NonceLog::ReloadUnlocked() {
   std::vector<uint8_t> data(static_cast<size_t>(size));
   in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
   if (!in) {
-    throw Error{ErrorDomain::IO, 0, "Failed to read nonce log " + path_.string()};
+    throw Error{ErrorDomain::IO, 0,
+                "Failed to read nonce log " + qv::PathToUtf8String(path_)};  // TSK016_Windows_Compatibility_Fixes
   }
 
   const size_t trailer_size = kTrailerMagic.size() + 8;
@@ -323,20 +263,22 @@ void NonceLog::PersistUnlocked() {
   {
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
-      throw Error{ErrorDomain::IO, 0, "Failed to open temp nonce log " + temp_path.string()};
+      throw Error{ErrorDomain::IO, 0,
+                  "Failed to open temp nonce log " + qv::PathToUtf8String(temp_path)};  // TSK016_Windows_Compatibility_Fixes
     }
     out.write(reinterpret_cast<const char*>(file_bytes.data()),
               static_cast<std::streamsize>(file_bytes.size()));
     if (!out) {
-      throw Error{ErrorDomain::IO, 0, "Failed to write temp nonce log " + temp_path.string()};
+      throw Error{ErrorDomain::IO, 0,
+                  "Failed to write temp nonce log " + qv::PathToUtf8String(temp_path)};  // TSK016_Windows_Compatibility_Fixes
     }
     out.flush();
     if (!out) {
-      throw Error{ErrorDomain::IO, 0, "Failed to flush temp nonce log " + temp_path.string()};
+      throw Error{ErrorDomain::IO, 0,
+                  "Failed to flush temp nonce log " + qv::PathToUtf8String(temp_path)};  // TSK016_Windows_Compatibility_Fixes
     }
   }
 
-  FlushFile(temp_path);
   std::error_code rename_ec;
   std::filesystem::rename(temp_path, path_, rename_ec);
   if (rename_ec) {
@@ -344,13 +286,9 @@ void NonceLog::PersistUnlocked() {
     std::filesystem::remove(path_, remove_ec);
     if (remove_ec) {
       throw Error{ErrorDomain::IO, remove_ec.value(),
-                  "Failed to replace nonce log " + path_.string()};
+                  "Failed to replace nonce log " + qv::PathToUtf8String(path_)};  // TSK016_Windows_Compatibility_Fixes
     }
     std::filesystem::rename(temp_path, path_);
-  }
-  FlushFile(path_);
-  if (!path_.parent_path().empty()) {
-    FlushDirectory(path_.parent_path());
   }
   loaded_ = true;
 }

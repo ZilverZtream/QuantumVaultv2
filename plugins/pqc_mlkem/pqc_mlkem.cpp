@@ -7,3 +7,8 @@ QV_PLUGIN_API QV_PluginInfo qv_plugin_get_info(void) {
   // Capability bits are purely illustrative here.
   return QV_PluginInfo{QV_PLUGIN_ABI_VERSION, "pqc-mlkem-768", "0.1.0", 1ULL << 12};
 }
+QV_PLUGIN_API QV_PluginAbiNegotiation qv_plugin_get_abi(void) {  // TSK016_Windows_Compatibility_Fixes
+  return QV_PluginAbiNegotiation{QV_PLUGIN_ABI_VERSION, QV_PLUGIN_ABI_VERSION};
+}
+
+QV_PLUGIN_API int qv_plugin_selftest(void) { return 0; }  // TSK016_Windows_Compatibility_Fixes

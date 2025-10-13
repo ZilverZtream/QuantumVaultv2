@@ -89,4 +89,18 @@ inline std::span<const std::uint8_t> AsBytesConst(const T& object) noexcept {  /
   const auto* data = reinterpret_cast<const std::uint8_t*>(std::addressof(object));
   return {data, sizeof(T)};
 }
+
+inline std::string PathToUtf8String(const std::filesystem::path& path) {  // TSK016_Windows_Compatibility_Fixes
+#if defined(_WIN32)
+  const std::u8string u8 = path.u8string();
+  std::string result;
+  result.reserve(u8.size());
+  for (auto ch : u8) {
+    result.push_back(static_cast<char>(ch));
+  }
+  return result;
+#else
+  return path.string();
+#endif
+}
 } // namespace qv
