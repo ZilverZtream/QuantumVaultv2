@@ -7,16 +7,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(QV_BUILD_TESTS "Build unit tests" ON)
 
+find_package(OpenSSL REQUIRED)
+
 add_library(qv_core
     src/core/nonce.cpp
     src/core/nonce_log.cpp
     src/core/pqc_hybrid_kdf.cpp
     src/crypto/aes_gcm.cpp
     src/crypto/hmac_sha256.cpp
+    src/crypto/provider.cpp
     src/crypto/sha256.cpp
     src/security/zeroizer.cpp
 )
 target_include_directories(qv_core PUBLIC include)
+target_link_libraries(qv_core PUBLIC OpenSSL::Crypto)
 
 add_library(qv_orchestrator
     src/orchestrator/plugin_verification.cpp
