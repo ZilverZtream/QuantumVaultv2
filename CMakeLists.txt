@@ -153,6 +153,8 @@ if(QV_BUILD_TESTS)
 # ---------- Tests ----------
 enable_testing()
 
+  find_package(Threads REQUIRED) # TSK034
+
 # Common test flags (TSK006)
 function(qv_apply_test_opts tgt)
   if (MSVC)
@@ -176,6 +178,21 @@ endfunction()
   target_link_libraries(qv_aad_test PRIVATE qv_core) # TSK014
   qv_apply_test_opts(qv_aad_test) # TSK014
   add_test(NAME qv_aad_authentication COMMAND qv_aad_test) # TSK014
+
+  add_executable(qv_error_handling_test tests/test_error_handling.cpp) # TSK034
+  target_include_directories(qv_error_handling_test PUBLIC include) # TSK034
+  target_link_libraries(qv_error_handling_test PRIVATE qv_core Threads::Threads) # TSK034
+  if (UNIX AND NOT APPLE)
+    target_link_libraries(qv_error_handling_test PRIVATE dl) # TSK034
+  endif()
+  qv_apply_test_opts(qv_error_handling_test) # TSK034
+  add_test(NAME qv_error_handling COMMAND qv_error_handling_test) # TSK034
+
+  add_executable(qv_concurrent_test tests/test_concurrent_mount.cpp) # TSK034
+  target_include_directories(qv_concurrent_test PUBLIC include) # TSK034
+  target_link_libraries(qv_concurrent_test PRIVATE qv_core Threads::Threads) # TSK034
+  qv_apply_test_opts(qv_concurrent_test) # TSK034
+  add_test(NAME qv_concurrent COMMAND qv_concurrent_test --threads=8) # TSK034
 
 # Constant-time mount test (only if the source exists)
 if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_constant_time_mount.cpp")
