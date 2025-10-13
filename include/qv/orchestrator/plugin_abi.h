@@ -6,13 +6,13 @@
 
 // TSK010 cross-platform plugin ABI definitions.
 #if defined(_WIN32)
-#  if defined(QV_PLUGIN_IMPLEMENTATION)
-#    define QV_PLUGIN_EXPORT __declspec(dllexport)  // TSK016_Windows_Compatibility_Fixes
-#  else
-#    define QV_PLUGIN_EXPORT
-#  endif
+#if defined(QV_PLUGIN_IMPLEMENTATION)
+#define QV_PLUGIN_EXPORT __declspec(dllexport) // TSK016_Windows_Compatibility_Fixes
 #else
-#  define QV_PLUGIN_EXPORT
+#define QV_PLUGIN_EXPORT
+#endif
+#else
+#define QV_PLUGIN_EXPORT
 #endif
 
 #define QV_PLUGIN_ABI_VERSION 1u
@@ -33,10 +33,16 @@
 #define QV_PLUGIN_CAP_EXPERIMENTAL_MASK 0x0000FFFF00000000ull
 #define QV_PLUGIN_CAP_VENDOR_MASK 0xFFFF000000000000ull
 
+// TSK025_Plugin_Sandboxing_and_Resource_Limits: orchestrator only recognises the
+// union of core + experimental capability namespaces when enforcing sandbox
+// policies. Vendor ranges require explicit trust policy opt-in.
+#define QV_PLUGIN_CAP_KNOWN_MASK                                                     \
+  (QV_PLUGIN_CAP_CORE_MASK | QV_PLUGIN_CAP_EXPERIMENTAL_MASK)
+
 #if defined(__cplusplus)
-#  define QV_PLUGIN_EXTERN extern "C"
+#define QV_PLUGIN_EXTERN extern "C"
 #else
-#  define QV_PLUGIN_EXTERN
+#define QV_PLUGIN_EXTERN
 #endif
 
 #define QV_PLUGIN_API QV_PLUGIN_EXTERN QV_PLUGIN_EXPORT
