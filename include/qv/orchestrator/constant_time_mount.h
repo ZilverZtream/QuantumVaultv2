@@ -1,7 +1,8 @@
 #pragma once
-#include <optional>
+#include <array>
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <vector>
 #include "qv/error.h"
 
@@ -13,9 +14,11 @@ public:
   std::optional<VolumeHandle> Mount(const std::filesystem::path& container,
                                     const std::string& password);
 private:
+  // TSK004
   struct Attempt {
     std::chrono::steady_clock::time_point start;
     std::chrono::nanoseconds duration{};
+    std::chrono::nanoseconds pad{};
   };
   void ConstantTimePadding(std::chrono::nanoseconds duration);
   std::optional<VolumeHandle> AttemptMount(const std::filesystem::path& container,

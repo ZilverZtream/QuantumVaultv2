@@ -54,10 +54,15 @@ set_target_properties(qv_pqc_mlkem PROPERTIES
 # Tests
 if(QV_BUILD_TESTS)
   enable_testing()
-  add_executable(qv_tests tests/test_nonce.cpp)
-  target_include_directories(qv_tests PUBLIC include)
-  target_link_libraries(qv_tests PRIVATE qv_core)
-  add_test(NAME qv_nonce_test COMMAND qv_tests)
+  add_executable(qv_nonce_test_bin tests/test_nonce.cpp)
+  target_include_directories(qv_nonce_test_bin PUBLIC include)
+  target_link_libraries(qv_nonce_test_bin PRIVATE qv_core)
+  add_test(NAME qv_nonce_test COMMAND qv_nonce_test_bin)
+
+  add_executable(qv_constant_time_mount_test tests/test_constant_time_mount.cpp)
+  target_include_directories(qv_constant_time_mount_test PUBLIC include)
+  target_link_libraries(qv_constant_time_mount_test PRIVATE qv_core qv_orchestrator)
+  add_test(NAME qv_constant_time_mount COMMAND qv_constant_time_mount_test)
 endif()
 
 # --- Wiring check gate ---

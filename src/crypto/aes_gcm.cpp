@@ -2,13 +2,14 @@
 
 #include "qv/crypto/provider.h"
 
-using namespace qv::crypto;
+namespace qv::crypto {
 
 AES256_GCM::EncryptionResult AES256_GCM_Encrypt(
     std::span<const uint8_t> plaintext,
     std::span<const uint8_t> aad,
     std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
     std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) {
+  // TSK004
   auto provider = GetCryptoProviderShared();
   return provider->EncryptAES256GCM(plaintext, aad, nonce, key);
 }
@@ -22,3 +23,5 @@ std::vector<uint8_t> AES256_GCM_Decrypt(
   auto provider = GetCryptoProviderShared();
   return provider->DecryptAES256GCM(ciphertext, aad, nonce, tag, key);
 }
+
+} // namespace qv::crypto
