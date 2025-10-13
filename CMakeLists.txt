@@ -31,6 +31,12 @@ add_library(qv_orchestrator
 )
 target_include_directories(qv_orchestrator PUBLIC include)
 target_link_libraries(qv_orchestrator PUBLIC qv_core)
+# TSK005 platform signature verification dependencies
+if (WIN32)
+  target_link_libraries(qv_orchestrator PRIVATE Wintrust Crypt32)
+elseif(APPLE)
+  target_link_libraries(qv_orchestrator PRIVATE "-framework Security" "-framework CoreFoundation")
+endif()
 
 add_executable(qv src/cli/main.cpp)
 target_include_directories(qv PUBLIC include)
