@@ -1,0 +1,10 @@
+# TSK035_Platform_Specific_Security_Integration
+policy_module(qv, 1.0.0)
+
+type qv_t;
+type qv_exec_t;
+init_daemon_domain(qv_t, qv_exec_t)
+
+allow qv_t self:capability { ipc_lock };
+allow qv_t self:process { setrlimit };
+allow qv_t user_home_t:file { read write create };
