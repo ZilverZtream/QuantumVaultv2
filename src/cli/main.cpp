@@ -32,6 +32,7 @@ namespace {
     std::cerr << "Usage:\n";
     std::cerr << "  qv create <container>\n";
     std::cerr << "  qv mount  <container>\n";
+    std::cerr << "  qv rekey  [--backup-key=<path>] <container>\n"; // TSK024_Key_Rotation_and_Lifecycle_Management
     std::cerr << "  qv migrate-nonces <container>\n";
   }
 
@@ -345,6 +346,31 @@ namespace {
     return kExitOk;
   }
 
+  int HandleRekey(const std::filesystem::path& container,
+                  std::optional<std::filesystem::path> backup_key,
+                  qv::orchestrator::VolumeManager& vm) { // TSK024_Key_Rotation_and_Lifecycle_Management
+    auto current = ReadPassword("Current password: ");
+    auto next = ReadPassword("New password: ");
+    auto confirm = ReadPassword("Confirm new password: ");
+    if (next != confirm) {
+      SecureZero(current);
+      SecureZero(next);
+      SecureZero(confirm);
+      std::cerr << "Validation error: Passwords do not match." << std::endl;
+      return kExitUsage;
+    }
+    auto handle = vm.Rekey(container, current, next, std::move(backup_key));
+    SecureZero(current);
+    SecureZero(next);
+    SecureZero(confirm);
+    if (!handle) {
+      std::cerr << "I/O error: Failed to rekey volume." << std::endl;
+      return kExitIO;
+    }
+    std::cout << "Rekeyed." << std::endl;
+    return kExitOk;
+  }
+
   int HandleMigrateNonces(const std::filesystem::path& container) {
     auto legacy = std::filesystem::current_path() / "qv_nonce.log";
     if (!std::filesystem::exists(legacy)) {
@@ -402,6 +428,37 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       return HandleMount(argv[2], vm);
+    }
+    if (cmd == "rekey") {
+      if (argc < 3 || argc > 4) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      std::optional<std::filesystem::path> backup_path; // TSK024_Key_Rotation_and_Lifecycle_Management
+      std::filesystem::path container_path;
+      for (int i = 2; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg.rfind("--backup-key=", 0) == 0) {
+          auto value = arg.substr(std::string_view("--backup-key=").size());
+          if (value.empty()) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          backup_path = std::filesystem::path(std::string(value));
+          continue;
+        }
+        if (container_path.empty()) {
+          container_path = argv[i];
+        } else {
+          PrintUsage();
+          return kExitUsage;
+        }
+      }
+      if (container_path.empty()) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleRekey(container_path, backup_path, vm);
     }
     if (cmd == "migrate-nonces") {
       if (argc != 3) {
