@@ -2,6 +2,7 @@
 #include "qv/crypto/aes_gcm.h"
 #include "qv/error.h"
 #include <algorithm>
+#include <array> // TSK014
 #include <cstring>
 #include <iomanip>
 #include <memory>
@@ -31,6 +32,7 @@ using qv::crypto::AES256_GCM_Encrypt;
 namespace {
 
 static constexpr uint16_t kKemIdMlKem768 = 0x0300; // TSK003
+static constexpr std::array<uint8_t, 8> kPqcSkAadContext{'Q','V','P','Q','C','S','K','1'}; // TSK014
 
 class ScopeWiper { // TSK003
 public:
@@ -105,7 +107,8 @@ std::vector<uint8_t> MakeStableAad(std::span<const uint8_t, 16> volume_uuid,
                                    uint32_t header_version,
                                    std::span<const uint8_t> epoch_tlv) {
   std::vector<uint8_t> aad;
-  aad.reserve(volume_uuid.size() + sizeof(header_version) + epoch_tlv.size());
+  aad.reserve(kPqcSkAadContext.size() + volume_uuid.size() + sizeof(header_version) + epoch_tlv.size()); // TSK014
+  aad.insert(aad.end(), kPqcSkAadContext.begin(), kPqcSkAadContext.end()); // TSK014
   aad.insert(aad.end(), volume_uuid.begin(), volume_uuid.end());
   const uint32_t version_le = ToLittleEndian(header_version);
   const uint8_t* version_bytes = reinterpret_cast<const uint8_t*>(&version_le);

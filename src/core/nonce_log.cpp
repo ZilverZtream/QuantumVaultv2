@@ -355,7 +355,7 @@ void NonceLog::PersistUnlocked() {
   loaded_ = true;
 }
 
-void NonceLog::Append(uint64_t counter) {
+std::array<uint8_t, 32> NonceLog::Append(uint64_t counter) {
   std::lock_guard<std::mutex> lock(mu_);
   EnsureLoadedUnlocked();
   if (!entries_.empty() && counter <= entries_.back().counter) {
@@ -365,6 +365,7 @@ void NonceLog::Append(uint64_t counter) {
   entries_.push_back(LogEntry{counter, mac});
   last_mac_ = mac;
   PersistUnlocked();
+  return mac; // TSK014
 }
 
 bool NonceLog::VerifyChain() {
@@ -391,4 +392,10 @@ size_t NonceLog::EntryCount() const {
   std::lock_guard<std::mutex> lock(mu_);
   const_cast<NonceLog*>(this)->EnsureLoadedUnlocked();
   return entries_.size();
+}
+
+std::array<uint8_t, 32> NonceLog::LastMac() const { // TSK014
+  std::lock_guard<std::mutex> lock(mu_);
+  const_cast<NonceLog*>(this)->EnsureLoadedUnlocked();
+  return last_mac_;
 }

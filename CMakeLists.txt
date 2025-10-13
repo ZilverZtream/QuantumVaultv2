@@ -154,11 +154,17 @@ function(qv_apply_test_opts tgt)
 endfunction()
 
 # Nonce test
-add_executable(qv_nonce_test_bin tests/test_nonce.cpp)
-target_include_directories(qv_nonce_test_bin PUBLIC include)
-target_link_libraries(qv_nonce_test_bin PRIVATE qv_core)
-qv_apply_test_opts(qv_nonce_test_bin)
-add_test(NAME qv_nonce_test COMMAND qv_nonce_test_bin)
+  add_executable(qv_nonce_test_bin tests/test_nonce.cpp)
+  target_include_directories(qv_nonce_test_bin PUBLIC include)
+  target_link_libraries(qv_nonce_test_bin PRIVATE qv_core)
+  qv_apply_test_opts(qv_nonce_test_bin)
+  add_test(NAME qv_nonce_test COMMAND qv_nonce_test_bin)
+
+  add_executable(qv_aad_test tests/test_aad.cpp) # TSK014
+  target_include_directories(qv_aad_test PUBLIC include) # TSK014
+  target_link_libraries(qv_aad_test PRIVATE qv_core) # TSK014
+  qv_apply_test_opts(qv_aad_test) # TSK014
+  add_test(NAME qv_aad_authentication COMMAND qv_aad_test) # TSK014
 
 # Constant-time mount test (only if the source exists)
 if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_constant_time_mount.cpp")
