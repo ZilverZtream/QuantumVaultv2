@@ -38,6 +38,35 @@ Dependencies: a modern compiler with C++20. Crypto primitives are **stubbed** to
 keep the skeleton buildable without extra libraries; swap them with OpenSSL/libsodium
 or your preferred provider when moving beyond stubs.
 
+## Production Deployment
+
+<!-- // TSK031 -->
+### Memory Locking
+
+QuantumVault hardens in-memory key material by calling `mlock()` (or `VirtualLock` on
+Windows) through `SecureBuffer`. Production deployments should ensure the process is
+permitted to lock at least **128 MiB** of RAM and, when possible, pin all current and
+future allocations:
+
+```bash
+# Allow 128 MiB of locked memory for the current shell
+ulimit -l 131072
+
+# Or grant the binary CAP_IPC_LOCK so it can raise RLIMIT_MEMLOCK itself
+sudo setcap cap_ipc_lock=+ep /path/to/qv
+
+# Optional: pin the entire address space once at startup
+QV_USE_MLOCKALL=1 ./qv --args
+```
+
+At runtime, `SecureBuffer` emits warnings if per-chunk `mlock()` calls fail. Use
+`SecureBuffer::RequireLocking()` to enforce that buffers throw on initialization if any
+chunk cannot be pinned. You can confirm the amount of locked memory via:
+
+```bash
+cat /proc/$(pidof qv)/status | grep VmLck
+```
+
 <!-- TSK020 -->
 ### Production crypto backends
 
