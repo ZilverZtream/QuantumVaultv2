@@ -1,5 +1,6 @@
 #include "qv/core/nonce.h"
 #include "qv/crypto/hmac_sha256.h"
+#include "qv/crypto/provider.h" // TSK072_CryptoProvider_Init_and_KAT reuse provider runtime init
 #include "qv/error.h"
 
 #include <algorithm>
@@ -406,13 +407,8 @@ namespace {
 
 #if QV_HAVE_SODIUM
   void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-    static std::once_flag sodium_once; // TSK023_Production_Crypto_Provider_Complete_Integration init guard
-    std::call_once(sodium_once, []() {
-      if (sodium_init() < 0) {
-        throw Error{ErrorDomain::Security, 0, "sodium_init failed"}; // TSK023_Production_Crypto_Provider_Complete_Integration propagate failure
-      }
-    });
-    randombytes_buf(key.data(), key.size()); // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
+    qv::crypto::EnsureCryptoProviderInitialized(); // TSK072_CryptoProvider_Init_and_KAT single runtime init
+    randombytes_buf(key.data(), key.size());       // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
   }
 #elif defined(_WIN32)
   void GenerateKey(std::array<uint8_t, kMacSize>& key) {
