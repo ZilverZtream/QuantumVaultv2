@@ -8,6 +8,7 @@
 #include <charconv>
 #include <cctype>
 #include <chrono>
+#include <cstddef> // TSK081_EventBus_Throughput_and_Batching iterator math
 #include <cstdlib>
 #include <cstdio> // TSK069_DoS_Resource_Exhaustion_Guards bounded escaping helpers
 #include <cstring>
@@ -56,6 +57,7 @@ constexpr auto kSyslogBackoffMax = std::chrono::seconds(30);        // TSK069_Do
 constexpr uint32_t kStateVersion = 1;                               // TSK079_Audit_Log_Integrity_Chain
 constexpr uint32_t kDerivedKeyVersion = 1;                           // TSK079_Audit_Log_Integrity_Chain
 constexpr size_t kDerivedSaltSize = 32;                              // TSK079_Audit_Log_Integrity_Chain
+constexpr size_t kMaxSyslogDatagramBytes = 8 * 1024;                 // TSK081_EventBus_Throughput_and_Batching UDP safety margin
 
 uint32_t ToBigEndian32(uint32_t value) { // TSK079_Audit_Log_Integrity_Chain portable state encoding
   if (qv::kIsLittleEndian) {
@@ -1131,8 +1133,16 @@ class SyslogPublisher { // TSK029
 
   bool Configure(const std::string& host, uint16_t port, std::string* error);
   void Publish(const Event& event);
+  struct PublishStats { // TSK081_EventBus_Throughput_and_Batching batching result
+    size_t sent{0};
+    std::vector<size_t> unsent_indices; // indices of events needing retry
+  };
+  PublishStats PublishBatch(std::span<const Event> events); // TSK081_EventBus_Throughput_and_Batching batched sends
 
  private:
+  std::optional<std::string> BuildMessage(const Event& event); // TSK081_EventBus_Throughput_and_Batching serialization helper
+  bool SendDatagram(const std::string& payload,
+                    std::chrono::steady_clock::time_point attempt_time); // TSK081_EventBus_Throughput_and_Batching IO helper
 #if defined(_WIN32)
   SOCKET socket_{INVALID_SOCKET};
 #else
@@ -1242,8 +1252,13 @@ bool SyslogPublisher::Configure(const std::string& host, uint16_t port, std::str
 }
 
 void SyslogPublisher::Publish(const Event& event) { // TSK029
+  std::array<Event, 1> single{event}; // TSK081_EventBus_Throughput_and_Batching reuse batching path
+  PublishBatch(std::span<const Event>(single.data(), single.size()));
+}
+
+std::optional<std::string> SyslogPublisher::BuildMessage(const Event& event) { // TSK081_EventBus_Throughput_and_Batching
   if (!configured_) {
-    return;
+    return std::nullopt;
   }
   const auto timestamp = FormatSyslogTimestamp(std::chrono::system_clock::now()); // TSK035_Platform_Specific_Security_Integration
   auto payload = BuildEventJson(event, timestamp, kMaxEventBytes);                // TSK069_DoS_Resource_Exhaustion_Guards
@@ -1251,51 +1266,182 @@ void SyslogPublisher::Publish(const Event& event) { // TSK029
     auto replacement = BuildOversizeEvent(event); // TSK069_DoS_Resource_Exhaustion_Guards
     payload = BuildEventJson(replacement, timestamp, kMaxEventBytes);
     if (!payload) {
-      return;
+      return std::nullopt;
     }
-  }
-  auto now = std::chrono::steady_clock::now();
-  if (now < next_allowed_send_) { // TSK069_DoS_Resource_Exhaustion_Guards
-    return;
   }
   const int pri = kSyslogFacility * 8 + SeverityToSyslog(event.severity);
   std::ostringstream oss;
   oss << '<' << pri << ">1 " << timestamp << ' ' << hostname_ << ' ' << app_name_ << ' '
       << procid_ << ' ' << (event.event_id.empty() ? "-" : event.event_id) << " - " << *payload;
-  auto message = oss.str();
+  return oss.str();
+}
+
+bool SyslogPublisher::SendDatagram(const std::string& payload,
+                                   std::chrono::steady_clock::time_point attempt_time) { // TSK081_EventBus_Throughput_and_Batching
 #if defined(_WIN32)
   if (socket_ == INVALID_SOCKET) {
-    return;
+    return false;
   }
-  int sent = ::sendto(socket_, message.c_str(), static_cast<int>(message.size()), 0,
+  int sent = ::sendto(socket_, payload.c_str(), static_cast<int>(payload.size()), 0,
                       reinterpret_cast<const sockaddr*>(&remote_), remote_len_);
   if (sent == SOCKET_ERROR) {
     std::clog << "{\"event\":\"syslog_error\",\"message\":\"sendto failed\"}" << std::endl;
-    next_allowed_send_ = now + ComputeBackoff(backoff_exp_);
+    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
     backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
-  } else {
-    backoff_exp_ = 0;
-    next_allowed_send_ = now;
+    return false;
   }
 #else
   if (socket_ < 0) {
-    return;
+    return false;
   }
-  auto sent = ::sendto(socket_, message.c_str(), message.size(), 0,
+  auto sent = ::sendto(socket_, payload.c_str(), payload.size(), 0,
                        reinterpret_cast<const sockaddr*>(&remote_), remote_len_);
   if (sent < 0) {
     std::clog << "{\"event\":\"syslog_error\",\"message\":\"sendto failed\"}" << std::endl;
-    next_allowed_send_ = now + ComputeBackoff(backoff_exp_);
+    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
     backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
-  } else {
-    backoff_exp_ = 0;
-    next_allowed_send_ = now;
+    return false;
   }
 #endif
+  backoff_exp_ = 0;
+  next_allowed_send_ = attempt_time;
+  return true;
+}
+
+SyslogPublisher::PublishStats SyslogPublisher::PublishBatch(std::span<const Event> events) { // TSK081_EventBus_Throughput_and_Batching
+  PublishStats stats;
+  if (!configured_ || events.empty()) {
+    return stats;
+  }
+
+  struct Datagram { // TSK081_EventBus_Throughput_and_Batching buffered packet
+    std::string payload;
+    std::vector<size_t> indices;
+  };
+
+  std::vector<Datagram> datagrams;
+  datagrams.reserve(events.size());
+  Datagram current;
+
+  for (size_t idx = 0; idx < events.size(); ++idx) {
+    auto message = BuildMessage(events[idx]);
+    if (!message || message->empty()) {
+      continue;
+    }
+    if (message->size() >= kMaxSyslogDatagramBytes) {
+      if (!current.payload.empty()) {
+        datagrams.push_back(std::move(current));
+        current = Datagram{};
+      }
+      Datagram single;
+      single.payload = std::move(*message);
+      single.indices.push_back(idx);
+      datagrams.push_back(std::move(single));
+      continue;
+    }
+    if (!current.payload.empty() && current.payload.size() + 1 + message->size() > kMaxSyslogDatagramBytes) {
+      datagrams.push_back(std::move(current));
+      current = Datagram{};
+    }
+    if (current.payload.empty()) {
+      current.payload = std::move(*message);
+    } else {
+      current.payload.push_back('\n');
+      current.payload.append(*message);
+    }
+    current.indices.push_back(idx);
+  }
+
+  if (!current.payload.empty()) {
+    datagrams.push_back(std::move(current));
+  }
+
+  if (datagrams.empty()) {
+    return stats;
+  }
+
+  size_t i = 0;
+  for (; i < datagrams.size(); ++i) {
+    auto now = std::chrono::steady_clock::now();
+    if (now < next_allowed_send_) { // TSK069_DoS_Resource_Exhaustion_Guards reuse backoff
+      break;
+    }
+    if (!SendDatagram(datagrams[i].payload, now)) {
+      break;
+    }
+    stats.sent += datagrams[i].indices.size();
+  }
+
+  for (; i < datagrams.size(); ++i) {
+    stats.unsent_indices.insert(stats.unsent_indices.end(), datagrams[i].indices.begin(), datagrams[i].indices.end());
+  }
+
+  return stats;
 }
 
 EventBus::EventBus() { // TSK029
   subs_.push_back([](const Event& e) { DefaultJsonLogger().Log(e); });
+  StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching begin async handling
+}
+
+EventBus::~EventBus() { // TSK081_EventBus_Throughput_and_Batching
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    stop_dispatcher_ = true;
+  }
+  syslog_cv_.notify_all();
+  if (dispatcher_thread_.joinable()) {
+    dispatcher_thread_.join();
+  }
+}
+
+void EventBus::StartDispatcher() { // TSK081_EventBus_Throughput_and_Batching
+  std::lock_guard<std::mutex> guard(mutex_);
+  if (dispatcher_thread_.joinable()) {
+    return;
+  }
+  stop_dispatcher_ = false;
+  dispatcher_thread_ = std::thread([this]() { DispatchLoop(); });
+}
+
+void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (;;) {
+    syslog_cv_.wait(lock, [this]() {
+      return stop_dispatcher_ || (!pending_syslog_.empty() && syslog_client_);
+    });
+    if (stop_dispatcher_) {
+      break;
+    }
+
+    auto client = syslog_client_;
+    std::vector<Event> batch;
+    batch.reserve(kMaxSyslogBatchSize);
+    while (!pending_syslog_.empty() && batch.size() < kMaxSyslogBatchSize) {
+      batch.push_back(pending_syslog_.front());
+      pending_syslog_.pop_front();
+    }
+
+    lock.unlock();
+    SyslogPublisher::PublishStats stats;
+    if (client && !batch.empty()) {
+      stats = client->PublishBatch(std::span<const Event>(batch.data(), batch.size()));
+    }
+
+    if (!stats.unsent_indices.empty()) {
+      std::lock_guard<std::mutex> requeue_lock(mutex_);
+      for (auto it = stats.unsent_indices.rbegin(); it != stats.unsent_indices.rend(); ++it) {
+        if (*it < batch.size()) {
+          pending_syslog_.push_front(batch[*it]);
+        }
+      }
+      if (!stop_dispatcher_) {
+        syslog_cv_.notify_one();
+      }
+    }
+
+    lock.lock();
+  }
 }
 
 EventBus& EventBus::Instance() { // TSK029
@@ -1305,19 +1451,35 @@ EventBus& EventBus::Instance() { // TSK029
 
 void EventBus::Publish(const Event& event) { // TSK029
   std::vector<Subscriber> targets;
-  std::shared_ptr<SyslogPublisher> syslog_client;
+  bool notify_dispatcher = false;                       // TSK081_EventBus_Throughput_and_Batching
   {
     std::lock_guard<std::mutex> guard(mutex_);
     targets = subs_;
-    syslog_client = syslog_client_;
+    if (syslog_client_) { // TSK081_EventBus_Throughput_and_Batching enqueue for async dispatch
+      if (pending_syslog_.size() >= kMaxSyslogQueueDepth) {
+        ++dropped_syslog_streak_;
+        if (dropped_syslog_streak_ == 1) {
+          std::clog << "{\"event\":\"syslog_backpressure\",\"state\":\"drop\",\"count\":"
+                    << dropped_syslog_streak_ << "}" << std::endl;
+        }
+      } else {
+        if (dropped_syslog_streak_ > 0) {
+          std::clog << "{\"event\":\"syslog_backpressure\",\"state\":\"recover\",\"count\":"
+                    << dropped_syslog_streak_ << "}" << std::endl;
+        }
+        pending_syslog_.push_back(event);
+        dropped_syslog_streak_ = 0;
+        notify_dispatcher = true;
+      }
+    }
   }
   for (auto& subscriber : targets) {
     if (subscriber) {
       subscriber(event);
     }
   }
-  if (syslog_client) {
-    syslog_client->Publish(event);
+  if (notify_dispatcher) { // TSK081_EventBus_Throughput_and_Batching
+    syslog_cv_.notify_one();
   }
 }
 
@@ -1331,8 +1493,12 @@ bool EventBus::ConfigureSyslog(const std::string& host, uint16_t port, std::stri
   if (!client->Configure(host, port, error)) {
     return false;
   }
-  std::lock_guard<std::mutex> guard(mutex_);
-  syslog_client_ = std::move(client);
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    syslog_client_ = std::move(client);
+  }
+  StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching ensure worker active
+  syslog_cv_.notify_one();
   return true;
 }
 

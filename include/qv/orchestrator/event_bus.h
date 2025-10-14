@@ -4,6 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <condition_variable> // TSK081_EventBus_Throughput_and_Batching dispatcher coordination
+#include <deque>               // TSK081_EventBus_Throughput_and_Batching queued events
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -16,6 +18,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>             // TSK081_EventBus_Throughput_and_Batching background dispatcher
 #include <vector>
 
 #include "qv/crypto/hmac_sha256.h" // TSK033 migration tooling reuse
@@ -116,12 +119,24 @@ namespace qv::orchestrator {
     bool ConfigureSyslog(const std::string& host, uint16_t port,
                          std::string* error); // TSK029
 
+    ~EventBus(); // TSK081_EventBus_Throughput_and_Batching graceful shutdown
+
   private:
     EventBus();
+    void DispatchLoop(); // TSK081_EventBus_Throughput_and_Batching async publisher
+    void StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching ensure background thread
 
     std::vector<Subscriber> subs_;
     std::mutex mutex_;
     std::shared_ptr<SyslogPublisher> syslog_client_; // TSK029
+    std::condition_variable syslog_cv_;              // TSK081_EventBus_Throughput_and_Batching queue signaling
+    std::deque<Event> pending_syslog_;               // TSK081_EventBus_Throughput_and_Batching buffered events
+    std::thread dispatcher_thread_;                  // TSK081_EventBus_Throughput_and_Batching background worker
+    bool stop_dispatcher_{false};                    // TSK081_EventBus_Throughput_and_Batching lifecycle guard
+    uint64_t dropped_syslog_streak_{0};              // TSK081_EventBus_Throughput_and_Batching backpressure logging
+
+    static constexpr size_t kMaxSyslogQueueDepth = 1024; // TSK081_EventBus_Throughput_and_Batching backpressure limit
+    static constexpr size_t kMaxSyslogBatchSize = 32;     // TSK081_EventBus_Throughput_and_Batching batch size
   };
 
 } // namespace qv::orchestrator
