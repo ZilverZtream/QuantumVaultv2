@@ -14,7 +14,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator> // TSK079_Audit_Log_Integrity_Chain stream buffer helpers
 #include <limits>
+#include <memory> // TSK079_Audit_Log_Integrity_Chain smart pointer guards
 #include <mutex>
 #include <optional> // TSK069_DoS_Resource_Exhaustion_Guards enforce bounded serialization
 #include <random>
@@ -28,12 +30,19 @@
 #include <process.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>   // TSK079_Audit_Log_Integrity_Chain secure DPAPI storage
+#include <wincrypt.h>   // TSK079_Audit_Log_Integrity_Chain secure DPAPI storage
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <Security/Security.h> // TSK079_Audit_Log_Integrity_Chain secure keychain usage
+#else
+#include <sys/utsname.h>       // TSK079_Audit_Log_Integrity_Chain host identity derivation
+#endif
 #endif
 
 namespace qv::orchestrator {
@@ -44,6 +53,23 @@ constexpr int kSyslogFacility = 10;                             // LOG_AUTHPRIV 
 constexpr size_t kMaxEventBytes = 16 * 1024;                    // TSK069_DoS_Resource_Exhaustion_Guards cap serialized size
 constexpr auto kSyslogBackoffBase = std::chrono::milliseconds(200); // TSK069_DoS_Resource_Exhaustion_Guards
 constexpr auto kSyslogBackoffMax = std::chrono::seconds(30);        // TSK069_DoS_Resource_Exhaustion_Guards
+constexpr uint32_t kStateVersion = 1;                               // TSK079_Audit_Log_Integrity_Chain
+constexpr uint32_t kDerivedKeyVersion = 1;                           // TSK079_Audit_Log_Integrity_Chain
+constexpr size_t kDerivedSaltSize = 32;                              // TSK079_Audit_Log_Integrity_Chain
+
+uint32_t ToBigEndian32(uint32_t value) { // TSK079_Audit_Log_Integrity_Chain portable state encoding
+  if (qv::kIsLittleEndian) {
+    return qv::detail::ByteSwap32(value);
+  }
+  return value;
+}
+
+uint32_t FromBigEndian32(uint32_t value) { // TSK079_Audit_Log_Integrity_Chain portable state decoding
+  if (qv::kIsLittleEndian) {
+    return qv::detail::ByteSwap32(value);
+  }
+  return value;
+}
 
 bool AppendWithLimit(std::string& out, std::string_view chunk, size_t limit) { // TSK069_DoS_Resource_Exhaustion_Guards
   if (chunk.size() > limit - out.size()) {
@@ -60,6 +86,231 @@ std::chrono::steady_clock::duration ComputeBackoff(uint32_t exponent) { // TSK06
   auto bounded = std::min(scaled, max_ms);
   return std::chrono::duration_cast<std::chrono::steady_clock::duration>(bounded);
 }
+
+struct LoggerStateDisk { // TSK079_Audit_Log_Integrity_Chain durable counter persistence
+  uint32_t version_be{0};
+  uint32_t reserved{0};
+  uint64_t entry_counter_be{0};
+  uint64_t dropped_streak_be{0};
+  std::array<uint8_t, kHmacSize> last_mac{};
+  std::array<uint8_t, kHmacSize> mac{};
+};
+
+struct DerivedKeyDisk { // TSK079_Audit_Log_Integrity_Chain derived key salt persistence
+  uint32_t version_be{0};
+  std::array<uint8_t, kDerivedSaltSize> salt{};
+};
+
+std::array<uint8_t, kHmacSize> ComputeStateMac(const std::array<uint8_t, kHmacSize>& key,
+                                               uint32_t version, uint64_t entry_counter,
+                                               uint64_t dropped_streak,
+                                               const std::array<uint8_t, kHmacSize>& last_mac) { // TSK079_Audit_Log_Integrity_Chain
+  constexpr std::string_view kLabel = "QV_AUDIT_STATE_V1";
+  std::vector<uint8_t> buffer;
+  buffer.reserve(kLabel.size() + sizeof(version) + sizeof(entry_counter) + sizeof(dropped_streak) +
+                 last_mac.size());
+  buffer.insert(buffer.end(), kLabel.begin(), kLabel.end());
+  auto version_be = ToBigEndian32(version);
+  const auto* version_bytes = reinterpret_cast<const uint8_t*>(&version_be);
+  buffer.insert(buffer.end(), version_bytes, version_bytes + sizeof(version_be));
+  auto counter_be = qv::ToBigEndian(entry_counter);
+  const auto* counter_bytes = reinterpret_cast<const uint8_t*>(&counter_be);
+  buffer.insert(buffer.end(), counter_bytes, counter_bytes + sizeof(counter_be));
+  auto dropped_be = qv::ToBigEndian(dropped_streak);
+  const auto* dropped_bytes = reinterpret_cast<const uint8_t*>(&dropped_be);
+  buffer.insert(buffer.end(), dropped_bytes, dropped_bytes + sizeof(dropped_be));
+  buffer.insert(buffer.end(), last_mac.begin(), last_mac.end());
+  return qv::crypto::HMAC_SHA256::Compute(std::span<const uint8_t>(key.data(), key.size()),
+                                          std::span<const uint8_t>(buffer.data(), buffer.size()));
+}
+
+#if defined(_WIN32)
+bool LoadDpapiProtectedKey(const std::filesystem::path& path,
+                           std::array<uint8_t, kHmacSize>& key) { // TSK079_Audit_Log_Integrity_Chain
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return false;
+  }
+  std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (blob.empty()) {
+    return false;
+  }
+  DATA_BLOB input{static_cast<DWORD>(blob.size()), blob.data()};
+  DATA_BLOB output{};
+  if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, 0, &output)) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"dpapi unprotect failed\"}"
+              << std::endl;
+    return false;
+  }
+  std::unique_ptr<BYTE, decltype(&LocalFree)> guard(output.pbData, &LocalFree);
+  if (output.cbData != key.size()) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"dpapi key length mismatch\"}"
+              << std::endl;
+    return false;
+  }
+  std::memcpy(key.data(), output.pbData, key.size());
+  return true;
+}
+
+bool StoreDpapiProtectedKey(const std::filesystem::path& path,
+                            const std::array<uint8_t, kHmacSize>& key) { // TSK079_Audit_Log_Integrity_Chain
+  DATA_BLOB input{static_cast<DWORD>(key.size()), const_cast<BYTE*>(key.data())};
+  DATA_BLOB output{};
+  if (!CryptProtectData(&input, L"QuantumVault Audit", nullptr, nullptr, nullptr, 0, &output)) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"dpapi protect failed\"}"
+              << std::endl;
+    return false;
+  }
+  std::unique_ptr<BYTE, decltype(&LocalFree)> guard(output.pbData, &LocalFree);
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"dpapi key write failed\"}"
+              << std::endl;
+    return false;
+  }
+  out.write(reinterpret_cast<const char*>(output.pbData), static_cast<std::streamsize>(output.cbData));
+  out.flush();
+  return static_cast<bool>(out);
+}
+#elif defined(__APPLE__)
+bool LoadKeychainKey(const std::string& service, const std::string& account,
+                     std::array<uint8_t, kHmacSize>& key) { // TSK079_Audit_Log_Integrity_Chain
+  void* data = nullptr;
+  UInt32 length = 0;
+  SecKeychainItemRef item = nullptr;
+  OSStatus status =
+      SecKeychainFindGenericPassword(nullptr, static_cast<UInt32>(service.size()), service.c_str(),
+                                     static_cast<UInt32>(account.size()), account.c_str(), &length, &data, &item);
+  if (status != errSecSuccess) {
+    if (item) {
+      CFRelease(item);
+    }
+    return false;
+  }
+  std::unique_ptr<char, decltype(&SecKeychainItemFreeContent)> guard(
+      reinterpret_cast<char*>(data), [](void* ptr) { SecKeychainItemFreeContent(nullptr, ptr); });
+  if (length != key.size()) {
+    if (item) {
+      CFRelease(item);
+    }
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"keychain key length mismatch\"}"
+              << std::endl;
+    return false;
+  }
+  std::memcpy(key.data(), data, key.size());
+  if (item) {
+    CFRelease(item);
+  }
+  return true;
+}
+
+bool StoreKeychainKey(const std::string& service, const std::string& account,
+                      const std::array<uint8_t, kHmacSize>& key) { // TSK079_Audit_Log_Integrity_Chain
+  SecKeychainItemRef item = nullptr;
+  OSStatus status =
+      SecKeychainFindGenericPassword(nullptr, static_cast<UInt32>(service.size()), service.c_str(),
+                                     static_cast<UInt32>(account.size()), account.c_str(), nullptr, nullptr, &item);
+  if (status == errSecSuccess && item != nullptr) {
+    status = SecKeychainItemModifyAttributesAndData(item, nullptr, static_cast<UInt32>(key.size()), key.data());
+    CFRelease(item);
+    return status == errSecSuccess;
+  }
+  if (item) {
+    CFRelease(item);
+  }
+  status = SecKeychainAddGenericPassword(nullptr, static_cast<UInt32>(service.size()), service.c_str(),
+                                         static_cast<UInt32>(account.size()), account.c_str(),
+                                         static_cast<UInt32>(key.size()), key.data(), nullptr);
+  if (status != errSecSuccess) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"keychain store failed\"}"
+              << std::endl;
+  }
+  return status == errSecSuccess;
+}
+#else
+std::optional<std::vector<uint8_t>> ReadMachineSecret() { // TSK079_Audit_Log_Integrity_Chain derived key seed
+  constexpr const char* kCandidates[] = {"/etc/machine-id", "/var/lib/dbus/machine-id"};
+  for (const char* path : kCandidates) {
+    std::ifstream in(path);
+    if (!in) {
+      continue;
+    }
+    std::string value;
+    std::getline(in, value);
+    if (!value.empty()) {
+      return std::vector<uint8_t>(value.begin(), value.end());
+    }
+  }
+  struct utsname info {
+  };
+  if (uname(&info) == 0) {
+    std::string node(info.nodename);
+    if (!node.empty()) {
+      return std::vector<uint8_t>(node.begin(), node.end());
+    }
+  }
+  return std::nullopt;
+}
+
+bool DeriveKeyMaterial(const std::array<uint8_t, kDerivedSaltSize>& salt,
+                       std::array<uint8_t, kHmacSize>& key) { // TSK079_Audit_Log_Integrity_Chain
+  auto secret = ReadMachineSecret();
+  if (!secret) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"unable to derive machine secret\"}"
+              << std::endl;
+    return false;
+  }
+  constexpr std::string_view kLabel = "QV_AUDIT_DERIVE";
+  std::vector<uint8_t> buffer;
+  buffer.reserve(kLabel.size() + secret->size() + salt.size());
+  buffer.insert(buffer.end(), kLabel.begin(), kLabel.end());
+  buffer.insert(buffer.end(), secret->begin(), secret->end());
+  buffer.insert(buffer.end(), salt.begin(), salt.end());
+  auto digest = qv::crypto::SHA256_Hash(std::span<const uint8_t>(buffer.data(), buffer.size()));
+  std::copy(digest.begin(), digest.end(), key.begin());
+  return true;
+}
+
+bool LoadDerivedKey(const std::filesystem::path& path,
+                    std::array<uint8_t, kHmacSize>& key) { // TSK079_Audit_Log_Integrity_Chain
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return false;
+  }
+  DerivedKeyDisk disk{};
+  in.read(reinterpret_cast<char*>(&disk), sizeof(disk));
+  if (in.gcount() != static_cast<std::streamsize>(sizeof(disk))) {
+    return false;
+  }
+  if (FromBigEndian32(disk.version_be) != kDerivedKeyVersion) {
+    return false;
+  }
+  return DeriveKeyMaterial(disk.salt, key);
+}
+
+bool StoreDerivedKey(const std::filesystem::path& path,
+                     std::array<uint8_t, kHmacSize>& key) { // TSK079_Audit_Log_Integrity_Chain
+  std::random_device rd;
+  std::array<uint8_t, kDerivedSaltSize> salt{};
+  std::uniform_int_distribution<int> dist(0, 255);
+  for (auto& byte : salt) {
+    byte = static_cast<uint8_t>(dist(rd));
+  }
+  if (!DeriveKeyMaterial(salt, key)) {
+    return false;
+  }
+  DerivedKeyDisk disk{};
+  disk.version_be = ToBigEndian32(kDerivedKeyVersion);
+  disk.salt = salt;
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    return false;
+  }
+  out.write(reinterpret_cast<const char*>(&disk), sizeof(disk));
+  out.flush();
+  return static_cast<bool>(out);
+}
+#endif
 
 bool AppendEscapedWithLimit(std::string& out, std::string_view text, size_t limit) { // TSK069_DoS_Resource_Exhaustion_Guards
   for (unsigned char c : text) {
@@ -239,12 +490,15 @@ bool HexDecode(std::string_view text, std::span<uint8_t> out) { // TSK029
 
 std::array<uint8_t, kHmacSize>
 ComputeChainedMac(const std::array<uint8_t, kHmacSize>& key,
-                  const std::array<uint8_t, kHmacSize>& previous, uint64_t sequence,
-                  std::string_view canonical) { // TSK029
+                  const std::array<uint8_t, kHmacSize>& previous, uint64_t previous_count,
+                  uint64_t sequence, std::string_view canonical) { // TSK079_Audit_Log_Integrity_Chain strengthened chaining
   uint64_t sequence_be = qv::ToBigEndian(sequence);
+  uint64_t previous_be = qv::ToBigEndian(previous_count);
   std::vector<uint8_t> buffer;
-  buffer.reserve(previous.size() + sizeof(sequence_be) + canonical.size());
+  buffer.reserve(previous.size() + sizeof(sequence_be) + sizeof(previous_be) + canonical.size());
   buffer.insert(buffer.end(), previous.begin(), previous.end());
+  const auto* previous_bytes = reinterpret_cast<const uint8_t*>(&previous_be);
+  buffer.insert(buffer.end(), previous_bytes, previous_bytes + sizeof(previous_be));
   const auto* seq_bytes = reinterpret_cast<const uint8_t*>(&sequence_be);
   buffer.insert(buffer.end(), seq_bytes, seq_bytes + sizeof(sequence_be));
   const auto* canonical_bytes = reinterpret_cast<const uint8_t*>(canonical.data());
@@ -383,19 +637,37 @@ std::string DetectHostname() { // TSK029
 JsonLineLogger::JsonLineLogger()
     : log_path_(LogPath()),
       key_path_(log_path_.string() + ".key"),
-      max_bytes_(ResolveMaxBytes()) { // TSK029
+      state_path_(log_path_.string() + ".state"),
+      max_bytes_(ResolveMaxBytes()) { // TSK079_Audit_Log_Integrity_Chain
   last_mac_.fill(0);
   EnsureKey();
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    LoadStateLocked();
+  }
   std::array<uint8_t, kHmacSize> existing_mac{};
   uint64_t existing_seq = 0;
   if (ParseLog(existing_mac, existing_seq)) {
-    last_mac_ = existing_mac;
-    entry_counter_ = existing_seq;
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (state_loaded_) {
+      if (existing_seq != entry_counter_ || existing_mac != last_mac_) {
+        std::clog << "{\"event\":\"logger_integrity_failure\",\"message\":\"audit chain mismatch\"}"
+                  << std::endl;
+        integrity_ok_ = false;
+      }
+    } else {
+      last_mac_ = existing_mac;
+      entry_counter_ = existing_seq;
+      dropped_streak_ = 0;
+      state_loaded_ = true;
+      PersistStateLocked();
+    }
   } else {
     std::clog << "{\"event\":\"logger_integrity_failure\",\"message\":\"unable to verify existing audit log\"}"
               << std::endl;
-    last_mac_.fill(0);
-    entry_counter_ = 0;
+    std::lock_guard<std::mutex> guard(mutex_);
+    integrity_ok_ = false;
+    ResetStateLocked();
   }
 }
 
@@ -437,7 +709,7 @@ size_t JsonLineLogger::ResolveMaxBytes() const { // TSK029
   return static_cast<size_t>(std::min<unsigned long long>(value, std::numeric_limits<size_t>::max()));
 }
 
-void JsonLineLogger::EnsureKey() { // TSK029
+void JsonLineLogger::EnsureKey() { // TSK079_Audit_Log_Integrity_Chain hardened key storage
   if (key_loaded_) {
     return;
   }
@@ -446,28 +718,59 @@ void JsonLineLogger::EnsureKey() { // TSK029
   if (!parent.empty() && !std::filesystem::exists(parent, ec)) {
     std::filesystem::create_directories(parent, ec);
   }
-  std::ifstream in(key_path_, std::ios::binary);
-  if (in) {
-    in.read(reinterpret_cast<char*>(hmac_key_.data()), static_cast<std::streamsize>(hmac_key_.size()));
-    if (in.gcount() == static_cast<std::streamsize>(hmac_key_.size())) {
-      key_loaded_ = true;
-      return;
-    }
+#if defined(__APPLE__)
+  const std::string service = "com.quantumvault.audit";
+  const std::string account = qv::PathToUtf8String(log_path_);
+#endif
+#if defined(_WIN32)
+  if (LoadDpapiProtectedKey(key_path_, hmac_key_)) {
+    key_loaded_ = true;
+    return;
   }
+#elif defined(__APPLE__)
+  if (LoadKeychainKey(service, account, hmac_key_)) {
+    key_loaded_ = true;
+    return;
+  }
+#else
+  if (LoadDerivedKey(key_path_, hmac_key_)) {
+    key_loaded_ = true;
+    return;
+  }
+#endif
+
+#if defined(_WIN32)
   std::random_device rd;
   std::uniform_int_distribution<int> dist(0, 255);
   for (auto& byte : hmac_key_) {
     byte = static_cast<uint8_t>(dist(rd));
   }
-  std::ofstream out(key_path_, std::ios::binary | std::ios::trunc);
-  if (!out) {
+  if (!StoreDpapiProtectedKey(key_path_, hmac_key_)) {
     std::clog << "{\"event\":\"logger_error\",\"message\":\"failed to persist audit key\"}"
               << std::endl;
-  } else {
-    out.write(reinterpret_cast<const char*>(hmac_key_.data()),
-              static_cast<std::streamsize>(hmac_key_.size()));
-    out.flush();
+    integrity_ok_ = false;
+    return;
   }
+#elif defined(__APPLE__)
+  std::random_device rd;
+  std::uniform_int_distribution<int> dist(0, 255);
+  for (auto& byte : hmac_key_) {
+    byte = static_cast<uint8_t>(dist(rd));
+  }
+  if (!StoreKeychainKey(service, account, hmac_key_)) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"failed to store audit key\"}"
+              << std::endl;
+    integrity_ok_ = false;
+    return;
+  }
+#else
+  if (!StoreDerivedKey(key_path_, hmac_key_)) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"failed to persist derived audit key\"}"
+              << std::endl;
+    integrity_ok_ = false;
+    return;
+  }
+#endif
   key_loaded_ = true;
 }
 
@@ -483,8 +786,102 @@ void JsonLineLogger::EnsureOpen() { // TSK029
   stream_.open(log_path_, std::ios::out | std::ios::app);
 }
 
+bool JsonLineLogger::LoadStateLocked() { // TSK079_Audit_Log_Integrity_Chain
+  if (!key_loaded_) {
+    return false;
+  }
+  std::ifstream in(state_path_, std::ios::binary);
+  if (!in) {
+    return false;
+  }
+  LoggerStateDisk disk{};
+  in.read(reinterpret_cast<char*>(&disk), sizeof(disk));
+  if (in.gcount() != static_cast<std::streamsize>(sizeof(disk))) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"state file truncated\"}"
+              << std::endl;
+    integrity_ok_ = false;
+    return false;
+  }
+  const uint32_t version = FromBigEndian32(disk.version_be);
+  if (version != kStateVersion) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"state version mismatch\"}"
+              << std::endl;
+    integrity_ok_ = false;
+    return false;
+  }
+  const uint64_t entry_counter = qv::ToBigEndian(disk.entry_counter_be);
+  const uint64_t dropped_streak = qv::ToBigEndian(disk.dropped_streak_be);
+  auto expected = ComputeStateMac(hmac_key_, version, entry_counter, dropped_streak, disk.last_mac);
+  if (expected != disk.mac) {
+    std::clog << "{\"event\":\"logger_integrity_failure\",\"message\":\"state mac mismatch\"}"
+              << std::endl;
+    integrity_ok_ = false;
+    return false;
+  }
+  entry_counter_ = entry_counter;
+  dropped_streak_ = dropped_streak;
+  last_mac_ = disk.last_mac;
+  state_loaded_ = true;
+  return true;
+}
+
+void JsonLineLogger::PersistStateLocked() { // TSK079_Audit_Log_Integrity_Chain
+  if (!key_loaded_) {
+    return;
+  }
+  LoggerStateDisk disk{};
+  disk.version_be = ToBigEndian32(kStateVersion);
+  disk.entry_counter_be = qv::ToBigEndian(entry_counter_);
+  disk.dropped_streak_be = qv::ToBigEndian(dropped_streak_);
+  disk.last_mac = last_mac_;
+  disk.mac = ComputeStateMac(hmac_key_, kStateVersion, entry_counter_, dropped_streak_, last_mac_);
+  auto parent = state_path_.parent_path();
+  std::error_code ec;
+  if (!parent.empty() && !std::filesystem::exists(parent, ec)) {
+    std::filesystem::create_directories(parent, ec);
+  }
+  auto temp = state_path_;
+  temp += ".tmp";
+  std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"state write failed\"}"
+              << std::endl;
+    return;
+  }
+  out.write(reinterpret_cast<const char*>(&disk), sizeof(disk));
+  out.flush();
+  if (!out) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"state flush failed\"}"
+              << std::endl;
+    return;
+  }
+  std::filesystem::rename(temp, state_path_, ec);
+  if (ec) {
+    std::filesystem::remove(state_path_, ec);
+    std::filesystem::rename(temp, state_path_, ec);
+    if (ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"state rename failed\"}"
+                << std::endl;
+      std::error_code cleanup_ec;
+      std::filesystem::remove(temp, cleanup_ec);
+    }
+  }
+}
+
+void JsonLineLogger::ResetStateLocked() { // TSK079_Audit_Log_Integrity_Chain
+  entry_counter_ = 0;
+  dropped_streak_ = 0;
+  last_mac_.fill(0);
+  state_loaded_ = false;
+  std::error_code ec;
+  std::filesystem::remove(state_path_, ec);
+}
+
 bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& sequence) { // TSK029
   EnsureKey();
+  if (!key_loaded_) {
+    return false;
+  }
   std::ifstream in(log_path_);
   if (!in) {
     mac.fill(0);
@@ -536,6 +933,7 @@ bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& seq
     std::string_view line_view(line);
     constexpr std::string_view kMacMarker = ",\"audit_mac\":\"";
     constexpr std::string_view kSeqMarker = "\"audit_seq\":";
+    constexpr std::string_view kPrevMarker = "\"audit_prev_count\":";
     auto mac_pos = line_view.find(kMacMarker.data(), 0, kMacMarker.size());
     if (mac_pos == std::string::npos) {
       return false;
@@ -549,7 +947,27 @@ bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& seq
     if (!HexDecode(line_view.substr(mac_start, mac_end - mac_start), parsed)) {
       return false;
     }
-    auto seq_pos = line_view.find(kSeqMarker.data(), 0, kSeqMarker.size());
+    auto prev_pos = line_view.find(kPrevMarker.data(), 0, kPrevMarker.size());
+    if (prev_pos == std::string::npos) {
+      return false;
+    }
+    prev_pos += kPrevMarker.size();
+    size_t prev_end = prev_pos;
+    while (prev_end < line_view.size() &&
+           std::isdigit(static_cast<unsigned char>(line_view[prev_end]))) {
+      ++prev_end;
+    }
+    if (prev_end == prev_pos) {
+      return false;
+    }
+    uint64_t parsed_prev = 0;
+    auto [prev_ptr, prev_ec] =
+        std::from_chars(line_view.data() + prev_pos, line_view.data() + prev_end, parsed_prev);
+    if (prev_ec != std::errc() || prev_ptr != line_view.data() + prev_end) {
+      return false;
+    }
+
+    auto seq_pos = line_view.find(kSeqMarker.data(), prev_end, kSeqMarker.size());
     if (seq_pos == std::string::npos) {
       return false;
     }
@@ -567,13 +985,16 @@ bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& seq
     if (ec != std::errc() || ptr != line_view.data() + seq_end) {
       return false;
     }
+    if (parsed_prev != seq) {
+      return false;
+    }
     uint64_t expected_seq = seq + 1;
     if (parsed_seq != expected_seq) {
       return false;
     }
     std::string canonical(line_view.substr(0, mac_pos));
     canonical.push_back('}');
-    auto expected_mac = ComputeChainedMac(hmac_key_, previous, expected_seq, canonical);
+    auto expected_mac = ComputeChainedMac(hmac_key_, previous, seq, expected_seq, canonical);
     if (expected_mac != parsed) {
       return false;
     }
@@ -589,6 +1010,9 @@ bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& seq
 }
 
 bool JsonLineLogger::VerifyLogFile() { // TSK029
+  if (!integrity_ok_) {
+    return false;
+  }
   std::array<uint8_t, kHmacSize> mac{};
   uint64_t sequence = 0;
   if (!ParseLog(mac, sequence)) {
@@ -598,6 +1022,9 @@ bool JsonLineLogger::VerifyLogFile() { // TSK029
 }
 
 void JsonLineLogger::RotateIfNeeded(size_t incoming_bytes) { // TSK029
+  if (!integrity_ok_) {
+    return;
+  }
   std::error_code ec;
   auto current_size = std::filesystem::file_size(log_path_, ec);
   if (ec) {
@@ -609,6 +1036,8 @@ void JsonLineLogger::RotateIfNeeded(size_t incoming_bytes) { // TSK029
   if (!VerifyLogFile()) {
     std::clog << "{\"event\":\"logger_integrity_failure\",\"message\":\"audit chain verification failed\"}"
               << std::endl;
+    integrity_ok_ = false;
+    ResetStateLocked();
     return;
   }
   if (stream_.is_open()) {
@@ -630,9 +1059,18 @@ void JsonLineLogger::RotateIfNeeded(size_t incoming_bytes) { // TSK029
   stream_.close();
 }
 
-void JsonLineLogger::Log(const Event& event) { // TSK029
-  std::lock_guard<std::mutex> guard(mutex_);
+void JsonLineLogger::Log(const Event& event) { // TSK079_Audit_Log_Integrity_Chain synchronized logging
+  std::unique_lock<std::mutex> guard(mutex_);
+  if (!integrity_ok_) {
+    return;
+  }
   EnsureKey();
+  if (!key_loaded_) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"audit key unavailable\"}"
+              << std::endl;
+    integrity_ok_ = false;
+    return;
+  }
   auto timestamp = FormatTimestamp(std::chrono::system_clock::now());
   auto base = BuildEventJson(event, timestamp, kMaxEventBytes); // TSK069_DoS_Resource_Exhaustion_Guards
   if (!base) {
@@ -642,13 +1080,16 @@ void JsonLineLogger::Log(const Event& event) { // TSK029
       return;
     }
   }
-  const uint64_t next_sequence = entry_counter_ + 1;
+  const uint64_t previous_count = entry_counter_;
+  const uint64_t next_sequence = previous_count + 1;
   std::string prefix = base->substr(0, base->size() - 1);
+  prefix.append(",\"audit_prev_count\":");
+  prefix.append(std::to_string(previous_count));
   prefix.append(",\"audit_seq\":");
   prefix.append(std::to_string(next_sequence));
   std::string canonical = prefix;
   canonical.push_back('}');
-  auto mac = ComputeChainedMac(hmac_key_, last_mac_, next_sequence, canonical);
+  auto mac = ComputeChainedMac(hmac_key_, last_mac_, previous_count, next_sequence, canonical);
   std::string line = prefix;
   line.append(",\"audit_mac\":\"");
   line.append(HexEncode(std::span<const uint8_t>(mac.data(), mac.size())));
@@ -665,9 +1106,10 @@ void JsonLineLogger::Log(const Event& event) { // TSK029
   std::error_code size_ec;
   auto current_size = std::filesystem::file_size(log_path_, size_ec);
   if (!size_ec && current_size > max_bytes_) {
-    ++dropped_;
-    if (dropped_ == 1) {
-      std::clog << "{\"event\":\"logger_backpressure\",\"dropped\":" << dropped_ << "}"
+    ++dropped_streak_;
+    PersistStateLocked();
+    if (dropped_streak_ == 1) {
+      std::clog << "{\"event\":\"logger_backpressure\",\"dropped\":" << dropped_streak_ << "}"
                 << std::endl;
     }
     return;
@@ -677,7 +1119,9 @@ void JsonLineLogger::Log(const Event& event) { // TSK029
   stream_.flush();
   last_mac_ = mac;
   entry_counter_ = next_sequence;
-  dropped_ = 0;
+  dropped_streak_ = 0;
+  state_loaded_ = true;
+  PersistStateLocked();
 }
 
 class SyslogPublisher { // TSK029
