@@ -132,7 +132,9 @@ target_compile_definitions(qv_core
 
 add_library(qv_storage
     src/storage/block_device.cpp
+    src/storage/chunk_cache.cpp
     src/storage/chunk_manager.cpp
+    src/storage/read_ahead.cpp
 )
 target_include_directories(qv_storage
     PUBLIC
@@ -304,6 +306,11 @@ endfunction()
   target_link_libraries(qv_chunk_manager_test PRIVATE qv_storage)
   qv_apply_test_opts(qv_chunk_manager_test)
   add_test(NAME qv_chunk_manager COMMAND qv_chunk_manager_test)
+
+  add_executable(qv_storage_bench tests/benchmark/bench_performance.cpp) # TSK064_Performance_Optimization_and_Caching
+  target_include_directories(qv_storage_bench PUBLIC include)
+  target_link_libraries(qv_storage_bench PRIVATE qv_storage)
+  qv_apply_test_opts(qv_storage_bench)
 
   add_executable(qv_error_handling_test tests/test_error_handling.cpp) # TSK034
   target_include_directories(qv_error_handling_test PUBLIC include) # TSK034
