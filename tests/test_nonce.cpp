@@ -3,14 +3,20 @@
 #include "qv/security/zeroizer.h"
 #include <algorithm> // TSK014
 #include <array>
+#include <atomic>     // TSK067_Nonce_Safety
 #include <cassert>
-#include <chrono> // TSK015
+#include <chrono>     // TSK015
 #include <cstdint>
 #include <filesystem> // TSK014
-#include <fstream>   // TSK021_Nonce_Log_Durability_and_Crash_Safety
+#include <fstream>    // TSK021_Nonce_Log_Durability_and_Crash_Safety
 #include <iostream>
-#include <iterator> // TSK021_Nonce_Log_Durability_and_Crash_Safety
+#include <iterator>   // TSK021_Nonce_Log_Durability_and_Crash_Safety
+#include <mutex>      // TSK067_Nonce_Safety
 #include <span>
+#include <string>          // TSK067_Nonce_Safety
+#include <thread>          // TSK067_Nonce_Safety
+#include <unordered_set>   // TSK067_Nonce_Safety
+#include <utility>         // TSK067_Nonce_Safety
 #include <vector>
 
 namespace {
@@ -160,6 +166,62 @@ void TestNonceDetectsCorruption() { // TSK021_Nonce_Log_Durability_and_Crash_Saf
   std::filesystem::remove("qv_nonce.log.wal");
 }
 
+void TestConcurrentNonceGeneration() { // TSK067_Nonce_Safety
+  std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal");
+  qv::core::NonceGenerator generator(17, 0);
+  constexpr size_t kThreads = 8;
+  constexpr size_t kIterationsPerThread = 256;
+  std::atomic<uint64_t> chunk_index{0};
+  std::mutex results_mutex;
+  std::vector<std::pair<uint64_t, std::array<uint8_t, 12>>> results;
+  results.reserve(kThreads * kIterationsPerThread);
+
+  auto worker = [&]() {
+    std::vector<std::pair<uint64_t, std::array<uint8_t, 12>>> local;
+    local.reserve(kIterationsPerThread);
+    for (size_t i = 0; i < kIterationsPerThread; ++i) {
+      uint64_t index = chunk_index.fetch_add(1, std::memory_order_relaxed);
+      auto record = generator.NextAuthenticated();
+      local.emplace_back(index, record.nonce);
+    }
+    std::lock_guard<std::mutex> guard(results_mutex);
+    results.insert(results.end(), local.begin(), local.end());
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (size_t i = 0; i < kThreads; ++i) {
+    threads.emplace_back(worker);
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  assert(results.size() == kThreads * kIterationsPerThread &&
+         "all nonce records must be collected"); // TSK067_Nonce_Safety
+
+  std::unordered_set<std::string> observed;
+  observed.reserve(results.size());
+  constexpr char kHexDigits[] = "0123456789abcdef";
+  for (const auto& [index, nonce] : results) {
+    std::string key = std::to_string(index);
+    key.push_back(':');
+    for (auto byte : nonce) {
+      key.push_back(kHexDigits[(byte >> 4) & 0x0F]);
+      key.push_back(kHexDigits[byte & 0x0F]);
+    }
+    auto [_, inserted] = observed.insert(std::move(key));
+    assert(inserted && "duplicate chunk/nonce pair detected"); // TSK067_Nonce_Safety
+  }
+
+  assert(generator.CurrentCounter() == results.size() &&
+         "counter must reflect number of emitted nonces"); // TSK067_Nonce_Safety
+
+  std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal");
+}
+
 } // namespace
 
 int main() {
@@ -181,6 +243,7 @@ int main() {
   TestNonceRekeyPolicy();
   TestNonceWalRecovery();       // TSK021_Nonce_Log_Durability_and_Crash_Safety
   TestNonceDetectsCorruption(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  TestConcurrentNonceGeneration(); // TSK067_Nonce_Safety
   std::cout << "nonce test ok\n";
   return 0;
 }

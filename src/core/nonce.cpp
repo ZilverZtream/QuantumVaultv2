@@ -61,10 +61,14 @@ NonceGenerator::RekeyReason NonceGenerator::DetermineRekeyReason(
 }
 
 NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated() {
+  std::lock_guard<std::mutex> lock(nonce_mutex_); // TSK067_Nonce_Safety
   auto now = std::chrono::system_clock::now(); // TSK015
   uint64_t next = 0;
   while (true) { // TSK015
     uint64_t current = counter_.load(std::memory_order_acquire);
+    if (current == std::numeric_limits<uint64_t>::max()) { // TSK067_Nonce_Safety
+      throw Error{ErrorDomain::Security, 6, "Counter exhausted. Rekey required."};
+    }
     auto reason = DetermineRekeyReason(current, now); // TSK015
     if (reason != RekeyReason::kNone) {
       const char* msg = "Rekey required"; // TSK015

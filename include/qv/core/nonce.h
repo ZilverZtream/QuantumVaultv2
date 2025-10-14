@@ -95,6 +95,7 @@ namespace qv::core {
     RekeyPolicy policy_{};                                  // TSK015
     std::chrono::system_clock::time_point epoch_started_{}; // TSK015
     uint64_t base_counter_{0};                              // TSK015
+    mutable std::mutex nonce_mutex_;                        // TSK067_Nonce_Safety
     RekeyReason DetermineRekeyReason(uint64_t candidate,
                                      std::chrono::system_clock::time_point now) const; // TSK015
     static std::array<uint8_t, 12> MakeNonceBytes(uint32_t epoch, uint64_t counter);   // TSK015
