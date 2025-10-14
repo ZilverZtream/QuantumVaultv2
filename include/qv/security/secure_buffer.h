@@ -111,7 +111,8 @@ public:
         const size_t remaining = allocation_size_ - offset;
         const size_t chunk_size = std::min(chunk_target, remaining);
         auto chunk_span = std::span<uint8_t>(raw + offset, chunk_size);
-        const bool chunk_locked = Zeroizer::TryLockMemory(chunk_span);
+        const auto status = Zeroizer::TryLockMemory(chunk_span);             // TSK085
+        const bool chunk_locked = (status == Zeroizer::LockStatus::Locked);  // TSK085
         lock_regions_.push_back(LockRegion{raw + offset, chunk_size, chunk_locked});
         all_chunks_locked = all_chunks_locked && chunk_locked;
         offset += chunk_size;

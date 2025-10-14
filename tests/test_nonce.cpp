@@ -19,6 +19,10 @@
 #include <utility>         // TSK067_Nonce_Safety
 #include <vector>
 
+#if !defined(_WIN32)
+#include <sys/resource.h> // TSK085
+#endif
+
 namespace {
 
 void TestZeroizerWipe() { // TSK006
@@ -49,6 +53,42 @@ void TestZeroizerVectorHelper() { // TSK006
     assert(value == 0 && "vector helper must zeroize elements");
   }
 }
+
+#if !defined(_WIN32)
+void TestZeroizerLockFailure() { // TSK085
+  if (!qv::security::Zeroizer::MemoryLockingSupported()) {
+    return;
+  }
+
+  struct rlimit original_limit {};
+  if (::getrlimit(RLIMIT_MEMLOCK, &original_limit) != 0) {
+    return;
+  }
+
+  struct LimitGuard { // TSK085
+    struct rlimit limit;
+    explicit LimitGuard(struct rlimit value) : limit(value) {}
+    ~LimitGuard() { ::setrlimit(RLIMIT_MEMLOCK, &limit); }
+  } guard{original_limit};
+
+  struct rlimit zero_limit = original_limit;
+  zero_limit.rlim_cur = 0;
+  if (::setrlimit(RLIMIT_MEMLOCK, &zero_limit) != 0) {
+    return;
+  }
+
+  std::array<uint8_t, 4096> buffer{};
+  auto span = std::span<uint8_t>(buffer.data(), buffer.size());
+  const auto status = qv::security::Zeroizer::TryLockMemory(span);
+  assert(status == qv::security::Zeroizer::LockStatus::BestEffort &&
+         "lock failure should report best-effort");
+  qv::security::Zeroizer::UnlockMemory(span);
+}
+#else
+void TestZeroizerLockFailure() { // TSK085
+  // RLIMIT_MEMLOCK controls are POSIX-specific.
+}
+#endif
 
 void TestSecureBufferLifecycle() { // TSK006
   qv::security::SecureBuffer<uint32_t> buf(4);
@@ -239,6 +279,7 @@ int main() {
   TestZeroizerWipe();
   TestZeroizerScopeWiper();
   TestZeroizerVectorHelper();
+  TestZeroizerLockFailure();
   TestSecureBufferLifecycle();
   TestNonceRekeyPolicy();
   TestNonceWalRecovery();       // TSK021_Nonce_Log_Durability_and_Crash_Safety

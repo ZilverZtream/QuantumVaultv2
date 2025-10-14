@@ -15,10 +15,15 @@ public:
   // TSK006
   static bool MemoryLockingSupported() noexcept;
 
-  // TSK006
-  static bool TryLockMemory(std::span<uint8_t> data) noexcept;
+  enum class LockStatus { // TSK085
+    Locked,
+    BestEffort,
+    Unsupported,
+  };
 
-  // TSK006
+  static LockStatus TryLockMemory(std::span<uint8_t> data) noexcept; // TSK085
+
+  // TSK006, TSK085
   static void UnlockMemory(std::span<uint8_t> data) noexcept;
 
   template <typename T>
