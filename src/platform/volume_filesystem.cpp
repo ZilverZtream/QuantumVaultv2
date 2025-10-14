@@ -3,6 +3,7 @@
 // TSK062_FUSE_Filesystem_Integration_Linux simple chunk-backed filesystem façade
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -25,6 +26,35 @@ using mode_t = unsigned int;
 
 namespace qv::platform {
 namespace {
+// TSK073_FS_Races_and_Drain ensure consistent lock ordering for filesystem mutex.
+class FilesystemMutexGuard {
+ public:
+  explicit FilesystemMutexGuard(const std::mutex& mutex)
+      : mutex_(const_cast<std::mutex*>(&mutex)) {
+#if !defined(NDEBUG)
+    assert(!lock_held_ && "VolumeFilesystem mutex lock order violated");
+    lock_held_ = true;
+#endif
+    mutex_->lock();
+  }
+
+  FilesystemMutexGuard(const FilesystemMutexGuard&) = delete;
+  FilesystemMutexGuard& operator=(const FilesystemMutexGuard&) = delete;
+
+  ~FilesystemMutexGuard() {
+    mutex_->unlock();
+#if !defined(NDEBUG)
+    lock_held_ = false;
+#endif
+  }
+
+ private:
+  std::mutex* mutex_;
+#if !defined(NDEBUG)
+  inline static thread_local bool lock_held_ = false;
+#endif
+};
+
 constexpr mode_t kDefaultFileMode = 0644;
 constexpr mode_t kDefaultDirMode = 0755;
 constexpr uint64_t kChunkPayloadSize = storage::kChunkSize;
@@ -151,7 +181,7 @@ DirectoryEntry* VolumeFilesystem::FindDirectory(const std::string& path) {
 #if defined(__linux__)
 
 int VolumeFilesystem::GetAttr(const char* path, struct stat* stbuf) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   std::memset(stbuf, 0, sizeof(*stbuf));
   auto normalized = NormalizePath(path);
   if (normalized == "/") {
@@ -186,7 +216,7 @@ int VolumeFilesystem::GetAttr(const char* path, struct stat* stbuf) {
 }
 
 int VolumeFilesystem::ReadDir(const char* path, void* buf, fuse_fill_dir_t filler) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* dir = FindDirectory(path);
   if (!dir) {
     return -ENOENT;
@@ -204,7 +234,7 @@ int VolumeFilesystem::ReadDir(const char* path, void* buf, fuse_fill_dir_t fille
 
 int VolumeFilesystem::Open(const char* path, struct fuse_file_info* fi) {
   (void)fi;
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
     return -ENOENT;
@@ -273,7 +303,7 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
 
 #if defined(__linux__)
 int VolumeFilesystem::Read(const char* path, char* buf, size_t size, off_t offset) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
     return -ENOENT;
@@ -291,7 +321,7 @@ int VolumeFilesystem::Read(const char* path, char* buf, size_t size, off_t offse
 }
 
 int VolumeFilesystem::Write(const char* path, const char* buf, size_t size, off_t offset) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
     return -ENOENT;
@@ -317,7 +347,7 @@ int VolumeFilesystem::Write(const char* path, const char* buf, size_t size, off_
 
 int VolumeFilesystem::Create(const char* path, mode_t mode, struct fuse_file_info* fi) {
   (void)fi;
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -351,7 +381,7 @@ int VolumeFilesystem::Create(const char* path, mode_t mode, struct fuse_file_inf
 
 // TSK063_WinFsp_Windows_Driver_Integration shared helpers for WinFsp bridge
 uint64_t VolumeFilesystem::TotalSizeBytes() const {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   const uint64_t metadata_bytes = metadata_chunk_count_ * kChunkPayloadSize;
   const uint64_t allocated_chunks = next_chunk_index_ > data_start_chunk_
                                         ? next_chunk_index_ - data_start_chunk_
@@ -370,7 +400,7 @@ uint64_t VolumeFilesystem::FreeSpaceBytes() const {
 }
 
 std::optional<NodeMetadata> VolumeFilesystem::StatPath(const std::string& path) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   NodeMetadata metadata{};
   if (normalized == "/") {
@@ -405,7 +435,7 @@ std::optional<NodeMetadata> VolumeFilesystem::StatPath(const std::string& path) 
 
 std::vector<DirectoryListingEntry> VolumeFilesystem::ListDirectoryEntries(
     const std::string& path) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* dir = FindDirectory(path);
   if (!dir) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
@@ -442,7 +472,7 @@ std::vector<DirectoryListingEntry> VolumeFilesystem::ListDirectoryEntries(
 
 std::vector<uint8_t> VolumeFilesystem::ReadFileRange(const std::string& path, uint64_t offset,
                                                      size_t length) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
     throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
@@ -459,7 +489,7 @@ std::vector<uint8_t> VolumeFilesystem::ReadFileRange(const std::string& path, ui
 
 size_t VolumeFilesystem::WriteFileRange(const std::string& path, uint64_t offset,
                                         std::span<const uint8_t> data) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
     throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
@@ -481,7 +511,7 @@ size_t VolumeFilesystem::WriteFileRange(const std::string& path, uint64_t offset
 
 void VolumeFilesystem::CreateFileNode(const std::string& path, uint32_t mode, uint32_t uid,
                                       uint32_t gid) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -517,7 +547,7 @@ void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mod
   (void)mode;
   (void)uid;
   (void)gid;
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -541,7 +571,7 @@ void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mod
 }
 
 void VolumeFilesystem::RemoveFileNode(const std::string& path) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -565,7 +595,7 @@ void VolumeFilesystem::RemoveFileNode(const std::string& path) {
 }
 
 void VolumeFilesystem::RemoveDirectoryNode(const std::string& path) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   if (normalized == "/") {
     throw qv::Error{qv::ErrorDomain::Validation, 0, "Cannot remove root directory"};
@@ -594,7 +624,7 @@ void VolumeFilesystem::RemoveDirectoryNode(const std::string& path) {
 }
 
 void VolumeFilesystem::TruncateFileNode(const std::string& path, uint64_t size) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
     throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
@@ -613,7 +643,7 @@ void VolumeFilesystem::TruncateFileNode(const std::string& path, uint64_t size) 
 
 void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to,
                                   bool replace_existing) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto from_norm = NormalizePath(from);
   auto to_norm = NormalizePath(to);
   if (from_norm == "/" || to_norm == "/") {
@@ -710,7 +740,7 @@ void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to
 
 void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<timespec> modification,
                                         std::optional<timespec> change) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   if (auto* dir = FindDirectory(normalized)) {
     if (modification) {
@@ -735,7 +765,7 @@ void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<t
 
 
 int VolumeFilesystem::Unlink(const char* path) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -760,7 +790,7 @@ int VolumeFilesystem::Unlink(const char* path) {
 
 int VolumeFilesystem::Mkdir(const char* path, mode_t mode) {
   (void)mode;
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -784,7 +814,7 @@ int VolumeFilesystem::Mkdir(const char* path, mode_t mode) {
 }
 
 int VolumeFilesystem::Rmdir(const char* path) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   if (normalized == "/") {
     return -EBUSY;
@@ -813,7 +843,7 @@ int VolumeFilesystem::Rmdir(const char* path) {
 }
 
 int VolumeFilesystem::Truncate(const char* path, off_t size) {
-  std::scoped_lock lock(fs_mutex_);
+  FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
     return -ENOENT;
