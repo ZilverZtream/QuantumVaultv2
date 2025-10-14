@@ -78,18 +78,24 @@ namespace qv::orchestrator {
     size_t ResolveMaxBytes() const; // TSK029
     bool ParseLog(std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE>& mac,
                   uint64_t& sequence); // TSK029
+    bool LoadStateLocked();                              // TSK079_Audit_Log_Integrity_Chain
+    void PersistStateLocked();                           // TSK079_Audit_Log_Integrity_Chain
+    void ResetStateLocked();                             // TSK079_Audit_Log_Integrity_Chain
 
     std::mutex mutex_;
     std::ofstream stream_;
     std::filesystem::path log_path_;
     std::filesystem::path key_path_; // TSK029
+    std::filesystem::path state_path_;                   // TSK079_Audit_Log_Integrity_Chain
     size_t max_bytes_;               // TSK029
     const size_t max_files_ = 3;
-    size_t dropped_{0};
+    uint64_t dropped_streak_{0};                         // TSK079_Audit_Log_Integrity_Chain
     std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> hmac_key_{}; // TSK029
     std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> last_mac_{}; // TSK029
     uint64_t entry_counter_{0};                                         // TSK029
     bool key_loaded_{false};                                            // TSK029
+    bool state_loaded_{false};                                          // TSK079_Audit_Log_Integrity_Chain
+    bool integrity_ok_{true};                                           // TSK079_Audit_Log_Integrity_Chain
   };
 
   inline JsonLineLogger& DefaultJsonLogger() { // TSK019
