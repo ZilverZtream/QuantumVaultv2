@@ -24,6 +24,7 @@
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/error.h"
 #include "qv/orchestrator/event_bus.h" // TSK024_Key_Rotation_and_Lifecycle_Management
+#include "qv/orchestrator/io_util.h"   // TSK068_Atomic_Header_Writes atomic persistence
 #include "qv/security/zeroizer.h"
 
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2 // TSK036_PBKDF2_Argon2_Migration_Path
@@ -860,18 +861,11 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
       std::span<uint8_t>(creation.hybrid_key.data(), creation.hybrid_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
 
-  std::ofstream out(container, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    const int err = errno;
-    throw qv::Error{qv::ErrorDomain::IO, err, "Failed to create container: " + container.string()};
-  }
-
-  out.write(reinterpret_cast<const char*>(payload.data()),
-            static_cast<std::streamsize>(payload.size()));
-  if (!out) {
-    const int err = errno;
-    throw qv::Error{qv::ErrorDomain::IO, err,
-                    "Failed to write container header: " + container.string()};
+  try {
+    AtomicReplace(container, std::span<const uint8_t>(payload.data(), payload.size()));
+  } catch (const qv::Error& err) {
+    throw qv::Error{err.domain(), err.code(),
+                    "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
   }
 
   qv::orchestrator::Event created{}; // TSK029
@@ -1058,22 +1052,12 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
     throw qv::Error{qv::ErrorDomain::Internal, 0, "Header size changed unexpectedly"};
   }
 
-  std::fstream out(container, std::ios::binary | std::ios::in |
-                                  std::ios::out); // TSK024_Key_Rotation_and_Lifecycle_Management
-  if (!out) {
-    const int err = errno;
-    throw qv::Error{qv::ErrorDomain::IO, err,
-                    "Failed to open container for update: " + container.string()};
+  try {
+    AtomicReplace(container, std::span<const uint8_t>(payload.data(), payload.size()));
+  } catch (const qv::Error& err) {
+    throw qv::Error{err.domain(), err.code(),
+                    "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
   }
-  out.seekp(0);
-  out.write(reinterpret_cast<const char*>(payload.data()),
-            static_cast<std::streamsize>(payload.size()));
-  if (!out) {
-    const int err = errno;
-    throw qv::Error{qv::ErrorDomain::IO, err,
-                    "Failed to write updated header: " + container.string()};
-  }
-  out.flush();
 
   std::optional<std::filesystem::path> backup_path; // TSK024_Key_Rotation_and_Lifecycle_Management
   if (backup_public_key) {
@@ -1225,27 +1209,15 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
       std::span<const uint8_t>(payload.data(), payload.size()));
   payload.insert(payload.end(), new_mac.begin(), new_mac.end());
 
-  std::fstream out(container, std::ios::binary | std::ios::in | std::ios::out); // TSK033
-  if (!out) {
-    const int err = errno;
+  try {
+    AtomicReplace(container, std::span<const uint8_t>(payload.data(), payload.size()));
+  } catch (const qv::Error& err) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
-    throw qv::Error{qv::ErrorDomain::IO, err,
-                    "Failed to open container for migration write: " + container.string()};
+    throw qv::Error{err.domain(), err.code(),
+                    "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
   }
-  out.seekp(0);
-  out.write(reinterpret_cast<const char*>(payload.data()),
-            static_cast<std::streamsize>(payload.size()));
-  if (!out) {
-    const int err = errno;
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
-    throw qv::Error{qv::ErrorDomain::IO, err,
-                    "Failed to persist migrated header: " + container.string()};
-  }
-  out.flush();
 
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));

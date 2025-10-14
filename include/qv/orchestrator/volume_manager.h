@@ -15,7 +15,8 @@
 namespace qv::orchestrator {
   class VolumeManager {
   public:
-    static constexpr uint32_t kLatestHeaderVersion = 0x00040100u; // TSK033 expose canonical header target
+    static constexpr uint32_t kLatestHeaderVersion =
+        0x00040101u; // TSK033, TSK068_Atomic_Header_Writes bump durability revision
 
     enum class PasswordKdf { // TSK036_PBKDF2_Argon2_Migration_Path
       kPbkdf2,

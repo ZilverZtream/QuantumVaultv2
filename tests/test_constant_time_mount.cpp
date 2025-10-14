@@ -20,7 +20,7 @@
 namespace {
 // TSK004 / TSK013
 constexpr std::array<uint8_t, 8> kMagic = {'Q','V','A','U','L','T','\0','\0'};
-constexpr uint32_t kVersion = 0x00040100;
+constexpr uint32_t kVersion = 0x00040101; // TSK068_Atomic_Header_Writes align with durability bump
 constexpr uint16_t kTlvTypePbkdf2 = 0x1001;
 constexpr uint16_t kTlvTypeHybridSalt = 0x1002;
 constexpr uint16_t kTlvTypeEpoch = 0x4E4F;

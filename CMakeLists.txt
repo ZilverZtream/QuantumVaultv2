@@ -148,6 +148,7 @@ add_library(qv_orchestrator
     src/orchestrator/constant_time_mount.cpp
     src/orchestrator/plugin_manager.cpp
     src/orchestrator/volume_manager.cpp
+    src/orchestrator/io_util.cpp # TSK068_Atomic_Header_Writes durability helper
     src/orchestrator/event_bus.cpp
 )
 target_include_directories(qv_orchestrator
@@ -334,6 +335,14 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_constant_time_mount.cpp")
   target_link_libraries(qv_constant_time_mount_test PRIVATE qv_core qv_orchestrator)
   qv_apply_test_opts(qv_constant_time_mount_test)
   add_test(NAME qv_constant_time_mount COMMAND qv_constant_time_mount_test)
+endif()
+
+if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_io_util.cpp")
+  add_executable(qv_io_util_test tests/test_io_util.cpp) # TSK068_Atomic_Header_Writes durability regression
+  target_include_directories(qv_io_util_test PUBLIC include)
+  target_link_libraries(qv_io_util_test PRIVATE qv_orchestrator)
+  qv_apply_test_opts(qv_io_util_test)
+  add_test(NAME qv_io_util COMMAND qv_io_util_test)
 endif()
 
   find_program(DUDECT_RUNNER dudect_runner)
