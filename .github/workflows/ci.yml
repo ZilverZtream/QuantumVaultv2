@@ -112,6 +112,7 @@ jobs:
             build/lib/**
 
   sanitizers:
+    needs: build # TSK039_Static_Analysis_and_CI_Quality_Gates ensure sanitizer gate is required
     name: Sanitizers (ASan + UBSan) # TSK018
     runs-on: ubuntu-latest
     steps:
@@ -150,6 +151,143 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1
           ASAN_OPTIONS: detect_leaks=1
         run: ctest --test-dir build --build-config RelWithDebInfo
+
+  clang-tidy:
+    needs: build # TSK039_Static_Analysis_and_CI_Quality_Gates
+    name: clang-tidy (Linux) # TSK039_Static_Analysis_and_CI_Quality_Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-tidy toolchain # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tidy ninja-build pkg-config libssl-dev libsodium-dev
+
+      - name: Configure compilation database # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build dependencies for analysis # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: cmake --build build --config Debug --parallel
+
+      - name: Run clang-tidy # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          clang_tidy_checks='-*,clang-analyzer-*,bugprone-*,cert-*,performance-*'
+          clang_tidy_headers="${PWD}/(include|src|tests|plugins)/"
+          clang_tidy_sources=$(git ls-files '*.cpp')
+          if [ -z "$clang_tidy_sources" ]; then
+            echo "No translation units found for clang-tidy" >&2
+            exit 1
+          fi
+          clang-tidy \
+            --warnings-as-errors='*' \
+            --checks="$clang_tidy_checks" \
+            -header-filter="^${clang_tidy_headers}" \
+            -p build \
+            $clang_tidy_sources
+
+  coverage:
+    needs: build # TSK039_Static_Analysis_and_CI_Quality_Gates
+    name: Coverage (>=80%) # TSK039_Static_Analysis_and_CI_Quality_Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install coverage tooling # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lcov bc ninja-build pkg-config libssl-dev libsodium-dev
+
+      - name: Build with coverage instrumentation # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DQV_ENABLE_COVERAGE=ON -GNinja
+          cmake --build build --parallel
+
+      - name: Run test suite (coverage) # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: ctest --test-dir build
+
+      - name: Capture coverage report # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          lcov --directory build --capture --output-file coverage.info
+          lcov --remove coverage.info '/usr/*' '*/tests/*' --output-file coverage.info
+          lcov --list coverage.info
+
+      - name: Upload coverage to Codecov # TSK039_Static_Analysis_and_CI_Quality_Gates
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: bash <(curl -s https://codecov.io/bash) -f coverage.info
+
+      - name: Enforce coverage threshold # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          coverage=$(lcov --summary coverage.info | awk '/lines/ {gsub("%", "", $2); print $2; exit}')
+          if [ -z "$coverage" ]; then
+            echo "Unable to parse coverage summary" >&2
+            exit 1
+          fi
+          echo "Line coverage: ${coverage}%"
+          coverage_limit=80
+          below=$(python - "$coverage" "$coverage_limit" <<'PY'
+import sys
+coverage = float(sys.argv[1])
+limit = float(sys.argv[2])
+print(int(coverage < limit))
+PY
+)
+          if [ "$below" -ne 0 ]; then
+            echo "Coverage ${coverage}% below ${coverage_limit}% threshold" >&2
+            exit 1
+          fi
+
+  complexity:
+    needs: build # TSK039_Static_Analysis_and_CI_Quality_Gates
+    name: Cyclomatic Complexity (lizard) # TSK039_Static_Analysis_and_CI_Quality_Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run lizard analysis # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          python -m pip install --upgrade pip lizard
+          lizard --CCN 15 -w include src plugins tests
+
+  semgrep:
+    needs: build # TSK039_Static_Analysis_and_CI_Quality_Gates
+    name: Semgrep Crypto Scan # TSK039_Static_Analysis_and_CI_Quality_Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Semgrep # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: python -m pip install --upgrade pip semgrep
+
+      - name: Run Semgrep checks # TSK039_Static_Analysis_and_CI_Quality_Gates
+        run: |
+          cat <<'EOF' > semgrep-ci.yml
+          rules:
+            - id: insecure-rand-api
+              message: Use of rand() is not cryptographically secure. Prefer platform CSPRNG APIs. # TSK039_Static_Analysis_and_CI_Quality_Gates
+              languages: [c, cpp]
+              severity: ERROR
+              pattern: rand(...)
+              metadata:
+                cwe: CWE-338
+                task: TSK039_Static_Analysis_and_CI_Quality_Gates
+            - id: hardcoded-secret-literal
+              message: Potential hardcoded credential detected. Replace with secure secret management. # TSK039_Static_Analysis_and_CI_Quality_Gates
+              languages: [c, cpp]
+              severity: ERROR
+              pattern-either:
+                - pattern: const char $VAR[] = "$SECRET";
+                - pattern: std::string $VAR = "$SECRET";
+                - pattern: auto $VAR = "$SECRET";
+              metavariable-regex:
+                VAR: (?i).*(key|secret|password|token|passphrase).*
+                SECRET: (?i)[^"\s]{8,}
+              metadata:
+                cwe: CWE-798
+                task: TSK039_Static_Analysis_and_CI_Quality_Gates
+          EOF
+          semgrep --config=p/owasp-top-ten --config=p/secrets --config=semgrep-ci.yml --error
 
   fuzz:
     name: Fuzz Harness (libFuzzer) # TSK030
