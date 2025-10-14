@@ -3,12 +3,16 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
 #include "qv/core/nonce.h"
 #include "qv/crypto/aegis.h"
 #include "qv/storage/block_device.h"
+#include "qv/storage/chunk_cache.h"
+#include "qv/storage/read_ahead.h"
 
 namespace qv::storage {
 
@@ -21,7 +25,9 @@ public:
                qv::crypto::CipherType cipher = qv::crypto::CipherType::AEGIS_128X);
 
   void WriteChunk(uint64_t logical_offset, std::span<const uint8_t> data);
-  std::vector<uint8_t> ReadChunk(uint64_t logical_offset);
+  std::vector<uint8_t> ReadChunk(uint64_t logical_offset, bool for_prefetch = false);
+
+  void Flush();  // TSK064_Performance_Optimization_and_Caching
 
   qv::crypto::CipherType ActiveCipher() const { return cipher_; }
 
@@ -33,10 +39,19 @@ private:
   qv::crypto::CipherType cipher_{qv::crypto::CipherType::AES_256_GCM};
   qv::core::NonceGenerator nonce_generator_;
   BlockDevice device_;
+  ChunkCache cache_;
+  std::unique_ptr<ReadAheadManager> read_ahead_;
+  std::mutex sequential_mutex_;
+  int64_t last_read_chunk_{-1};
+  uint64_t sequential_read_count_{0};
+  int64_t read_ahead_window_end_{-1};
 
   std::vector<uint8_t> MakeNonce(const qv::core::NonceGenerator::NonceRecord& record,
                                  int64_t chunk_index) const;
   qv::crypto::CipherType ResolveCipher(qv::crypto::CipherType requested) const;
+  std::vector<uint8_t> ReadChunkFromDevice(int64_t chunk_index);
+  void PersistChunk(int64_t chunk_index, const std::vector<uint8_t>& data);
+  void HandleSequentialRead(int64_t chunk_index);
 };
 
 }  // namespace qv::storage

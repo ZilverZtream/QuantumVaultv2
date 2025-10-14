@@ -30,7 +30,13 @@ ChunkManager::ChunkManager(const std::filesystem::path& container,
       epoch_(epoch),
       cipher_(ResolveCipher(cipher)),
       nonce_generator_(epoch_),
-      device_(container_, master_key_, epoch_, 0, cipher_) {}
+      device_(container_, master_key_, epoch_, 0, cipher_),
+      cache_(),
+      read_ahead_(nullptr) {
+  cache_.SetWriteBackCallback(
+      [this](int64_t index, const std::vector<uint8_t>& data) { PersistChunk(index, data); });
+  read_ahead_ = std::make_unique<ReadAheadManager>(*this, cache_);
+}
 
 std::vector<uint8_t> ChunkManager::MakeNonce(const qv::core::NonceGenerator::NonceRecord& record,
                                              int64_t chunk_index) const {
@@ -79,6 +85,7 @@ qv::crypto::CipherType ChunkManager::ResolveCipher(qv::crypto::CipherType reques
   return qv::crypto::CipherType::AES_256_GCM;
 }
 
+// TSK064_Performance_Optimization_and_Caching
 void ChunkManager::WriteChunk(uint64_t logical_offset, std::span<const uint8_t> data) {
   if (data.size() > kChunkPayloadSize) {
     throw Error{ErrorDomain::Validation, 0, "Chunk write exceeds payload size"};
@@ -86,52 +93,43 @@ void ChunkManager::WriteChunk(uint64_t logical_offset, std::span<const uint8_t> 
   if (logical_offset % kChunkPayloadSize != 0) {
     throw Error{ErrorDomain::Validation, 0, "Logical offset must align with chunk size"};
   }
+
   int64_t chunk_index = static_cast<int64_t>(logical_offset / kChunkPayloadSize);
-  auto nonce_record = nonce_generator_.NextAuthenticated();
-  auto nonce = MakeNonce(nonce_record, chunk_index);
-  std::array<uint8_t, kChunkPayloadSize> plaintext{};
-  std::fill(plaintext.begin(), plaintext.end(), 0);
-  std::copy(data.begin(), data.end(), plaintext.begin());
-  auto aad_envelope = qv::core::MakeChunkAAD(epoch_, chunk_index, logical_offset,
-                                             static_cast<uint32_t>(data.size()),
-                                             nonce_record.mac);
-  auto aad_bytes = qv::AsBytesConst(aad_envelope);
-  auto encrypt_result = qv::crypto::AEAD_Encrypt(
-      cipher_,
-      std::span<const uint8_t>(plaintext.data(), plaintext.size()),
-      aad_bytes,
-      nonce,
-      std::span<const uint8_t>(data_key_.data(), data_key_.size()));
-  if (encrypt_result.ciphertext.size() != kChunkPayloadSize) {
-    throw Error{ErrorDomain::Crypto, 0, "Encrypted chunk size mismatch"};
+  std::vector<uint8_t> buffer(data.begin(), data.end());
+  auto cached = cache_.Put(chunk_index, std::move(buffer), true);
+  if (cached) {
+    PersistChunk(chunk_index, cached->data);
+    cache_.MarkClean(chunk_index);
   }
-
-  ChunkHeader header{};
-  header.logical_offset = logical_offset;
-  header.data_size = static_cast<uint32_t>(data.size());
-  header.epoch = epoch_;
-  header.chunk_index = chunk_index;
-  std::fill(header.tag.begin(), header.tag.end(), 0);
-  std::copy_n(encrypt_result.tag.begin(),
-              std::min<size_t>(encrypt_result.tag.size(), header.tag.size()),
-              header.tag.begin());
-  std::fill(header.nonce.begin(), header.nonce.end(), 0);
-  std::copy_n(nonce.begin(), std::min<size_t>(nonce.size(), header.nonce.size()), header.nonce.begin());
-  std::copy(nonce_record.mac.begin(), nonce_record.mac.end(), header.aad_mac.begin());
-  header.cipher_id = static_cast<uint8_t>(cipher_);
-  header.tag_size = static_cast<uint8_t>(encrypt_result.tag.size());
-  header.nonce_size = static_cast<uint8_t>(nonce.size());
-
-  device_.WriteChunk(header, encrypt_result.ciphertext);
-
-  qv::security::Zeroizer::Wipe(plaintext);
 }
 
-std::vector<uint8_t> ChunkManager::ReadChunk(uint64_t logical_offset) {
+// TSK064_Performance_Optimization_and_Caching
+std::vector<uint8_t> ChunkManager::ReadChunk(uint64_t logical_offset, bool for_prefetch) {
   if (logical_offset % kChunkPayloadSize != 0) {
     throw Error{ErrorDomain::Validation, 0, "Logical offset must align with chunk size"};
   }
   int64_t chunk_index = static_cast<int64_t>(logical_offset / kChunkPayloadSize);
+
+  if (auto cached = cache_.Get(chunk_index)) {
+    if (!for_prefetch) {
+      HandleSequentialRead(chunk_index);
+    }
+    return cached->data;
+  }
+
+  auto plaintext = ReadChunkFromDevice(chunk_index);
+  cache_.Put(chunk_index, std::vector<uint8_t>(plaintext.begin(), plaintext.end()), false);
+  if (!for_prefetch) {
+    HandleSequentialRead(chunk_index);
+  }
+  return plaintext;
+}
+
+void ChunkManager::Flush() {
+  cache_.Flush([this](int64_t index, const std::vector<uint8_t>& data) { PersistChunk(index, data); });
+}
+
+std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
   auto record = device_.ReadChunk(chunk_index);
   auto cipher = static_cast<qv::crypto::CipherType>(record.header.cipher_id);
   if (!qv::crypto::CipherAvailable(cipher) && cipher != qv::crypto::CipherType::AES_256_GCM) {
@@ -163,6 +161,72 @@ std::vector<uint8_t> ChunkManager::ReadChunk(uint64_t logical_offset) {
   }
   plaintext.resize(record.header.data_size);
   return plaintext;
+}
+
+void ChunkManager::PersistChunk(int64_t chunk_index, const std::vector<uint8_t>& data) {
+  auto nonce_record = nonce_generator_.NextAuthenticated();
+  auto nonce = MakeNonce(nonce_record, chunk_index);
+  std::array<uint8_t, kChunkPayloadSize> plaintext{};
+  std::fill(plaintext.begin(), plaintext.end(), 0);
+  auto logical_offset = static_cast<uint64_t>(chunk_index) * kChunkPayloadSize;
+  auto copy_size = std::min<size_t>(data.size(), plaintext.size());
+  std::copy_n(data.begin(), copy_size, plaintext.begin());
+  auto aad_envelope = qv::core::MakeChunkAAD(epoch_, chunk_index, logical_offset,
+                                             static_cast<uint32_t>(copy_size),
+                                             nonce_record.mac);
+  auto aad_bytes = qv::AsBytesConst(aad_envelope);
+  auto encrypt_result = qv::crypto::AEAD_Encrypt(
+      cipher_,
+      std::span<const uint8_t>(plaintext.data(), plaintext.size()),
+      aad_bytes,
+      nonce,
+      std::span<const uint8_t>(data_key_.data(), data_key_.size()));
+  if (encrypt_result.ciphertext.size() != kChunkPayloadSize) {
+    throw Error{ErrorDomain::Crypto, 0, "Encrypted chunk size mismatch"};
+  }
+
+  ChunkHeader header{};
+  header.logical_offset = logical_offset;
+  header.data_size = static_cast<uint32_t>(copy_size);
+  header.epoch = epoch_;
+  header.chunk_index = chunk_index;
+  std::fill(header.tag.begin(), header.tag.end(), 0);
+  std::copy_n(encrypt_result.tag.begin(),
+              std::min<size_t>(encrypt_result.tag.size(), header.tag.size()),
+              header.tag.begin());
+  std::fill(header.nonce.begin(), header.nonce.end(), 0);
+  std::copy_n(nonce.begin(), std::min<size_t>(nonce.size(), header.nonce.size()), header.nonce.begin());
+  std::copy(nonce_record.mac.begin(), nonce_record.mac.end(), header.aad_mac.begin());
+  header.cipher_id = static_cast<uint8_t>(cipher_);
+  header.tag_size = static_cast<uint8_t>(encrypt_result.tag.size());
+  header.nonce_size = static_cast<uint8_t>(nonce.size());
+
+  device_.WriteChunk(header, encrypt_result.ciphertext);
+
+  qv::security::Zeroizer::Wipe(plaintext);
+}
+
+void ChunkManager::HandleSequentialRead(int64_t chunk_index) {
+  std::unique_lock lock(sequential_mutex_);
+  if (last_read_chunk_ >= 0 && chunk_index == last_read_chunk_ + 1) {
+    sequential_read_count_ += 1;
+  } else if (chunk_index == last_read_chunk_) {
+    // repeated read of same chunk keeps streak intact
+  } else {
+    sequential_read_count_ = 1;
+  }
+
+  if (sequential_read_count_ >= 3 && read_ahead_) {
+    int64_t start_chunk = chunk_index + 1;
+    if (start_chunk >= read_ahead_window_end_) {
+      read_ahead_window_end_ = start_chunk + 8;
+      lock.unlock();
+      read_ahead_->RequestReadAhead(static_cast<uint64_t>(start_chunk) * kChunkPayloadSize, 8);
+      lock.lock();
+    }
+  }
+
+  last_read_chunk_ = chunk_index;
 }
 
 }  // namespace qv::storage
