@@ -103,6 +103,7 @@ add_library(qv_core
     src/core/nonce.cpp
     src/core/nonce_log.cpp
     src/core/pqc_hybrid_kdf.cpp
+    src/crypto/aegis.cpp
     src/crypto/aes_gcm.cpp
     src/crypto/hmac_sha256.cpp
     src/crypto/provider.cpp
@@ -128,6 +129,17 @@ target_compile_definitions(qv_core
       QV_HAVE_SODIUM=$<BOOL:$<AND:$<BOOL:${qv_have_sodium}>,$<NOT:$<BOOL:${QV_USE_STUB_CRYPTO}>>>> # TSK008
       $<$<BOOL:${QV_FIPS_MODE}>:QV_FIPS_MODE=1> # TSK023_Production_Crypto_Provider_Complete_Integration propagate FIPS mode
 )
+
+add_library(qv_storage
+    src/storage/block_device.cpp
+    src/storage/chunk_manager.cpp
+)
+target_include_directories(qv_storage
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(qv_storage PUBLIC qv_core)
 
 add_library(qv_orchestrator
     src/orchestrator/plugin_verification.cpp
@@ -157,7 +169,7 @@ target_include_directories(qv
       $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 ) # TSK008
-target_link_libraries(qv PRIVATE qv_core qv_orchestrator)
+target_link_libraries(qv PRIVATE qv_core qv_orchestrator qv_storage)
 if (WIN32)
   target_link_libraries(qv PRIVATE Crypt32) # TSK035_Platform_Specific_Security_Integration
 elseif(APPLE)
@@ -239,6 +251,12 @@ endfunction()
   qv_apply_test_opts(qv_chunk_auth_test) # TSK040
   add_test(NAME qv_chunk_auth COMMAND qv_chunk_auth_test) # TSK040
 
+  add_executable(qv_chunk_manager_test tests/test_chunk_manager.cpp) # TSK061_Block_Device_and_Chunk_Storage_Engine
+  target_include_directories(qv_chunk_manager_test PUBLIC include)
+  target_link_libraries(qv_chunk_manager_test PRIVATE qv_storage)
+  qv_apply_test_opts(qv_chunk_manager_test)
+  add_test(NAME qv_chunk_manager COMMAND qv_chunk_manager_test)
+
   add_executable(qv_error_handling_test tests/test_error_handling.cpp) # TSK034
   target_include_directories(qv_error_handling_test PUBLIC include) # TSK034
   target_link_libraries(qv_error_handling_test PRIVATE qv_core Threads::Threads) # TSK034
@@ -296,6 +314,7 @@ add_test(NAME wiring-check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/too
 
 install(TARGETS
     qv_core
+    qv_storage
     qv_orchestrator
     qv
     qv_example_crypto
