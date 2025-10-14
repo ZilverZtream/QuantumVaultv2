@@ -32,6 +32,7 @@
 #include "qv/crypto/ct.h"
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/orchestrator/event_bus.h"  // TSK019
+#include "qv/orchestrator/ipc_lock.h"   // TSK075_Lockout_Persistence_and_IPC
 #include "qv/security/zeroizer.h"
 #include "qv/storage/block_device.h"
 
@@ -56,6 +57,19 @@ std::shared_ptr<qv::storage::BlockDevice> MakeBlockDevice(
       container, master_key, 0, 0, qv::crypto::CipherType::AES_256_GCM);
 }
 
+using VolumeUuid = std::array<uint8_t, 16>;                                     // TSK075_Lockout_Persistence_and_IPC
+
+#pragma pack(push, 1)
+struct LockFileHeader { // TSK075_Lockout_Persistence_and_IPC
+  uint32_t version_le{0};
+  uint32_t failures_le{0};
+  uint64_t last_attempt_le{0};
+  uint32_t locked_le{0};
+};
+#pragma pack(pop)
+
+static_assert(sizeof(LockFileHeader) == 20, "lock file header layout mismatch"); // TSK075_Lockout_Persistence_and_IPC
+
 class FailureTracker { // TSK026
 public:
   struct FailureState {
@@ -69,94 +83,131 @@ public:
     return tracker;
   }
 
-  void EnforceDelay(const std::filesystem::path& container) {
-    auto lock_path = LockFilePath(container);
-    std::error_code ec;
-    if (std::filesystem::exists(lock_path, ec)) {
+  void EnforceDelay(const std::filesystem::path& container,
+                    const std::optional<VolumeUuid>& volume_uuid) {
+    const VolumeUuid uuid = NormalizeUuid(volume_uuid);                           // TSK075_Lockout_Persistence_and_IPC
+    auto gate = qv::orchestrator::ScopedIpcLock::ForPath(container);              // TSK075_Lockout_Persistence_and_IPC
+    const bool have_gate = gate.locked();                                         // TSK075_Lockout_Persistence_and_IPC
+    const auto now = SystemClock::now();
+
+    AttemptState state;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      const auto key = qv::PathToUtf8String(container);
+      state = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
+    }
+
+    if (state.locked) {
       throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
                       "Volume locked due to repeated authentication failures"}; // TSK026
     }
 
-    auto key = qv::PathToUtf8String(container);
-    std::unique_lock<std::mutex> lock(mutex_);
-    auto it = attempts_.find(key);
-    if (it == attempts_.end()) {
+    if (!state.have_last_attempt || state.failures <= 0) {
       return;
     }
 
-    if (it->second.locked) {
-      std::error_code locked_ec;
-      if (std::filesystem::exists(lock_path, locked_ec)) {
-        lock.unlock();
-        throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
-                        "Volume locked due to repeated authentication failures"}; // TSK026
-      }
-      it->second.locked = false;
-      it->second.failures = 0;
+    const auto required_delay = RequiredDelay(state.failures);
+    const auto required_duration = std::chrono::duration_cast<SystemClock::duration>(required_delay);
+    const auto elapsed = now - state.last_attempt;
+    if (elapsed >= required_duration) {
       return;
     }
 
-    auto required = RequiredDelay(it->second.failures);
-    auto now = Clock::now();
-    auto elapsed = now - it->second.last_attempt;
-    if (elapsed >= required) {
-      return;
-    }
-
-    auto sleep_for = required - elapsed;
-    lock.unlock();
+    const auto sleep_for = required_duration - elapsed;
     std::this_thread::sleep_for(sleep_for);
   }
 
-  FailureState RecordAttempt(const std::filesystem::path& container, bool success) {
-    auto key = qv::PathToUtf8String(container);
-    std::unique_lock<std::mutex> lock(mutex_);
-    auto& entry = attempts_[key];
-    entry.last_attempt = Clock::now();
+  FailureState RecordAttempt(const std::filesystem::path& container,
+                             const std::optional<VolumeUuid>& volume_uuid,
+                             bool success) {
+    const VolumeUuid uuid = NormalizeUuid(volume_uuid);                           // TSK075_Lockout_Persistence_and_IPC
+    auto gate = qv::orchestrator::ScopedIpcLock::ForPath(container);              // TSK075_Lockout_Persistence_and_IPC
+    const bool have_gate = gate.locked();                                         // TSK075_Lockout_Persistence_and_IPC
+    const auto now = SystemClock::now();
 
-    if (success) {
-      entry.failures = 0;
-      entry.locked = false;
-      attempts_.erase(key);
+    FailureState result{};
+    AttemptState snapshot{};
+    bool should_persist = false;
+    bool should_remove = false;
+
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      const auto key = qv::PathToUtf8String(container);
+      auto& entry = attempts_[key];
+      snapshot = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
+
+      if (success) {
+        attempts_.erase(key);
+        should_remove = true;
+      } else {
+        snapshot.have_last_attempt = true;
+        snapshot.last_attempt = now;
+        if (snapshot.failures < kMaxAttempts) {
+          snapshot.failures += 1;
+        }
+        if (snapshot.failures >= kMaxAttempts) {
+          snapshot.locked = true;
+        }
+        entry = snapshot;
+        result = BuildFailureState(snapshot);
+        should_persist = true;
+      }
+    }
+
+    if (should_remove) {
+      if (have_gate) {
+        RemovePersistentState(container);
+      } else {
+        std::error_code ec;
+        std::filesystem::remove(LockFilePath(container), ec);
+      }
       return {};
     }
 
-    entry.failures += 1;
-    FailureState state;
-    state.failures = entry.failures;
-    state.enforced_delay = std::chrono::duration_cast<std::chrono::seconds>(
-        RequiredDelay(entry.failures));
-
-    if (entry.failures >= kMaxAttempts) {
-      entry.locked = true;
-      state.locked = true;
-      lock.unlock();
-      auto lock_path = LockFilePath(container);
-      std::ofstream lock_file(lock_path, std::ios::out | std::ios::trunc);
-      if (!lock_file) {
-        throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
-                        "Failed to persist lock file for protected volume"}; // TSK026
-      }
-      lock_file << "locked";
-      lock_file.close();
-      return state;
+    if (should_persist && have_gate) {
+      WritePersistentState(container, uuid, snapshot);
     }
 
-    return state;
+    return result;
   }
 
 private:
-  using Clock = std::chrono::steady_clock;
+  using SystemClock = std::chrono::system_clock;                                  // TSK075_Lockout_Persistence_and_IPC
 
   struct AttemptState {
     int failures{0};
-    Clock::time_point last_attempt{Clock::now()};
     bool locked{false};
+    bool have_last_attempt{false};
+    SystemClock::time_point last_attempt{};
+  };
+
+  struct PersistLoadResult {
+    std::optional<AttemptState> state;
+    bool tampered{false};
   };
 
   static constexpr auto kMinDelay = std::chrono::seconds(3);
   static constexpr auto kMaxDelay = std::chrono::seconds(60);
   static constexpr int kMaxAttempts = 5;
+  static constexpr uint32_t kLockFileVersion = 1;                                   // TSK075_Lockout_Persistence_and_IPC
+
+  AttemptState LoadAttemptStateLocked(const std::string& key,
+                                      const std::filesystem::path& container,
+                                      const VolumeUuid& uuid,
+                                      SystemClock::time_point now,
+                                      bool have_gate);
+  FailureState BuildFailureState(const AttemptState& state) const;
+  PersistLoadResult ReadPersistentState(const std::filesystem::path& container,
+                                        const VolumeUuid& uuid) const;
+  void WritePersistentState(const std::filesystem::path& container,
+                            const VolumeUuid& uuid,
+                            const AttemptState& state) const;
+  void RemovePersistentState(const std::filesystem::path& container) const;
+
+  static VolumeUuid NormalizeUuid(const std::optional<VolumeUuid>& uuid);
+  static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> DeriveMacKey(const VolumeUuid& uuid);
+  static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> ComputeLockMac(const LockFileHeader& header,
+                                                                               const VolumeUuid& uuid);
 
   std::chrono::seconds RequiredDelay(int failures) const {
     if (failures <= 0) {
@@ -170,6 +221,156 @@ private:
   std::mutex mutex_;
   std::unordered_map<std::string, AttemptState> attempts_;
 };
+
+FailureTracker::AttemptState FailureTracker::LoadAttemptStateLocked(
+    const std::string& key, const std::filesystem::path& container, const VolumeUuid& uuid,
+    SystemClock::time_point now, bool have_gate) {
+  auto& entry = attempts_[key];
+  if (have_gate) {
+    auto persisted = ReadPersistentState(container, uuid);                       // TSK075_Lockout_Persistence_and_IPC
+    if (persisted.tampered) {
+      entry.failures = kMaxAttempts;
+      entry.locked = true;
+      entry.have_last_attempt = true;
+      entry.last_attempt = now;
+    } else if (persisted.state) {
+      entry = *persisted.state;
+    }
+  }
+  if (!entry.have_last_attempt) {
+    entry.last_attempt = now;
+  }
+  return entry;
+}
+
+FailureTracker::FailureState FailureTracker::BuildFailureState(const AttemptState& state) const {
+  FailureState result{};
+  result.failures = state.failures;
+  result.locked = state.locked;
+  if (state.have_last_attempt) {
+    result.enforced_delay = RequiredDelay(state.failures);
+  }
+  return result;
+}
+
+FailureTracker::PersistLoadResult FailureTracker::ReadPersistentState(
+    const std::filesystem::path& container, const VolumeUuid& uuid) const {
+  PersistLoadResult result{};
+  auto lock_path = LockFilePath(container);
+  std::ifstream in(lock_path, std::ios::binary);
+  if (!in) {
+    return result;
+  }
+
+  LockFileHeader header{};
+  in.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (static_cast<size_t>(in.gcount()) != sizeof(header)) {
+    result.tampered = true;
+    return result;
+  }
+
+  std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> stored_mac{};
+  in.read(reinterpret_cast<char*>(stored_mac.data()), stored_mac.size());
+  if (static_cast<size_t>(in.gcount()) != stored_mac.size()) {
+    result.tampered = true;
+    return result;
+  }
+
+  if (FromLittleEndian32(header.version_le) != kLockFileVersion) {
+    result.tampered = true;
+    return result;
+  }
+
+  auto expected_mac = ComputeLockMac(header, uuid);
+  if (!std::equal(stored_mac.begin(), stored_mac.end(), expected_mac.begin(), expected_mac.end())) {
+    result.tampered = true;
+    return result;
+  }
+
+  AttemptState state{};
+  uint32_t failures = FromLittleEndian32(header.failures_le);
+  if (failures > static_cast<uint32_t>(kMaxAttempts)) {
+    failures = static_cast<uint32_t>(kMaxAttempts);
+  }
+  state.failures = static_cast<int>(failures);
+  state.locked = FromLittleEndian32(header.locked_le) != 0;
+  if (state.locked && state.failures < kMaxAttempts) {
+    state.failures = kMaxAttempts;
+  }
+  uint64_t last_epoch = FromLittleEndian64(header.last_attempt_le);
+  if (last_epoch != 0) {
+    state.have_last_attempt = true;
+    state.last_attempt = SystemClock::time_point(std::chrono::seconds(last_epoch));
+  }
+  result.state = state;
+  return result;
+}
+
+void FailureTracker::WritePersistentState(const std::filesystem::path& container,
+                                          const VolumeUuid& uuid,
+                                          const AttemptState& state) const {
+  auto lock_path = LockFilePath(container);
+  LockFileHeader header{};
+  header.version_le = qv::ToLittleEndian(kLockFileVersion);
+  auto failures = static_cast<uint32_t>(std::min(state.failures, kMaxAttempts));
+  header.failures_le = qv::ToLittleEndian(failures);
+  uint64_t last_epoch = 0;
+  if (state.have_last_attempt) {
+    last_epoch = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                    state.last_attempt.time_since_epoch())
+                    .count());
+  }
+  header.last_attempt_le = ToLittleEndian64(last_epoch);
+  header.locked_le = qv::ToLittleEndian(state.locked ? 1u : 0u);
+
+  auto mac = ComputeLockMac(header, uuid);
+
+  std::ofstream out(lock_path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                    "Failed to persist lock file for protected volume"}; // TSK026
+  }
+  out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  out.write(reinterpret_cast<const char*>(mac.data()), mac.size());
+  if (!out) {
+    throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                    "Failed to persist lock file for protected volume"}; // TSK026
+  }
+}
+
+void FailureTracker::RemovePersistentState(const std::filesystem::path& container) const {
+  auto lock_path = LockFilePath(container);
+  std::error_code ec;
+  std::filesystem::remove(lock_path, ec);
+}
+
+VolumeUuid FailureTracker::NormalizeUuid(const std::optional<VolumeUuid>& uuid) {
+  VolumeUuid normalized{};
+  if (uuid) {
+    normalized = *uuid;
+  }
+  return normalized;
+}
+
+std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> FailureTracker::DeriveMacKey(
+    const VolumeUuid& uuid) {
+  static constexpr std::array<uint8_t, 16> kMacSalt = {'Q', 'V', 'L', 'O', 'C', 'K', '_', 'H',
+                                                       'M', 'A', 'C', '_', 'S', 'A', 'L', 'T'}; // TSK075_Lockout_Persistence_and_IPC
+  return qv::crypto::HMAC_SHA256::Compute(std::span<const uint8_t>(kMacSalt.data(), kMacSalt.size()),
+                                          std::span<const uint8_t>(uuid.data(), uuid.size()));
+}
+
+std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> FailureTracker::ComputeLockMac(
+    const LockFileHeader& header, const VolumeUuid& uuid) {
+  auto key = DeriveMacKey(uuid);
+  auto header_bytes = qv::AsBytesConst(header);
+  std::vector<uint8_t> message;
+  message.reserve(header_bytes.size() + uuid.size());
+  message.insert(message.end(), header_bytes.begin(), header_bytes.end());
+  message.insert(message.end(), uuid.begin(), uuid.end());
+  return qv::crypto::HMAC_SHA256::Compute(std::span<const uint8_t>(key.data(), key.size()),
+                                          std::span<const uint8_t>(message.data(), message.size()));
+}
 
 // TSK004, TSK013
 constexpr std::array<uint8_t, 8> kHeaderMagic = {'Q','V','A','U','L','T','\0','\0'};
@@ -195,9 +396,15 @@ constexpr size_t kHeaderMacSize = qv::crypto::HMAC_SHA256::TAG_SIZE;
 constexpr uint16_t ToLittleEndian16(uint16_t value) {
   return qv::kIsLittleEndian ? value : _byteswap_ushort(value);
 }
+constexpr uint64_t ToLittleEndian64(uint64_t value) {
+  return qv::kIsLittleEndian ? value : _byteswap_uint64(value);
+}
 #elif defined(__clang__) || defined(__GNUC__)
 constexpr uint16_t ToLittleEndian16(uint16_t value) {
   return qv::kIsLittleEndian ? value : __builtin_bswap16(value);
+}
+constexpr uint64_t ToLittleEndian64(uint64_t value) {
+  return qv::kIsLittleEndian ? value : __builtin_bswap64(value);
 }
 #else
 constexpr uint16_t ToLittleEndian16(uint16_t value) {
@@ -205,6 +412,16 @@ constexpr uint16_t ToLittleEndian16(uint16_t value) {
     return value;
   }
   return static_cast<uint16_t>(((value & 0xFF) << 8) | ((value >> 8) & 0xFF));
+}
+constexpr uint64_t ToLittleEndian64(uint64_t value) {
+  if (qv::kIsLittleEndian) {
+    return value;
+  }
+  uint64_t swapped = 0;
+  for (int i = 0; i < 8; ++i) {
+    swapped |= ((value >> (i * 8)) & 0xFFull) << ((7 - i) * 8);
+  }
+  return swapped;
 }
 #endif
 
@@ -214,6 +431,10 @@ constexpr uint16_t FromLittleEndian16(uint16_t value) {
 
 constexpr uint32_t FromLittleEndian32(uint32_t value) {
   return qv::ToLittleEndian(value);
+}
+
+constexpr uint64_t FromLittleEndian64(uint64_t value) {
+  return ToLittleEndian64(value);
 }
 
 #pragma pack(push, 1)
@@ -439,6 +660,26 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
   return parsed;
 }
 
+std::optional<VolumeUuid> ReadVolumeUuid(const std::filesystem::path& container) { // TSK075_Lockout_Persistence_and_IPC
+  std::ifstream in(container, std::ios::binary);
+  if (!in) {
+    return std::nullopt;
+  }
+  VolumeHeader header{};
+  in.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (static_cast<size_t>(in.gcount()) != sizeof(header)) {
+    return std::nullopt;
+  }
+  bool magic_ok = qv::crypto::ct::CompareEqual(header.magic, kHeaderMagic);
+  auto version = FromLittleEndian32(header.version);
+  if (!magic_ok || version != kHeaderVersion) {
+    return std::nullopt;
+  }
+  VolumeUuid uuid{};
+  std::copy(header.uuid.begin(), header.uuid.end(), uuid.begin());
+  return uuid;
+}
+
 std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
                                           const ParsedHeader& parsed) { // TSK013
   std::vector<uint8_t> pass_bytes(password.begin(), password.end());
@@ -629,7 +870,8 @@ std::optional<ConstantTimeMount::VolumeHandle>
 ConstantTimeMount::Mount(const std::filesystem::path& container,
                          const std::string& password) {
   auto& tracker = FailureTracker::Instance();                     // TSK026
-  tracker.EnforceDelay(container);                                // TSK026
+  auto volume_uuid = ReadVolumeUuid(container);                   // TSK075_Lockout_Persistence_and_IPC
+  tracker.EnforceDelay(container, volume_uuid);                   // TSK026, TSK075_Lockout_Persistence_and_IPC
 
   Attempt a, b;
   auto start = std::chrono::steady_clock::now();
@@ -657,7 +899,7 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   uint32_t h2 = r2_ok ? static_cast<uint32_t>(r2->dummy) : 0;
   uint32_t selected = qv::crypto::ct::Select<uint32_t>(h1, h2, (!r1_ok && r2_ok));
 
-  auto state = tracker.RecordAttempt(container, any_success);     // TSK026
+  auto state = tracker.RecordAttempt(container, volume_uuid, any_success); // TSK026, TSK075_Lockout_Persistence_and_IPC
   if (!any_success) {
     Event event{};                                                // TSK026
     event.category = EventCategory::kSecurity;                    // TSK026
