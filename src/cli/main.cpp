@@ -127,6 +127,7 @@ namespace {
     std::cerr << "  --syslog=host:port   Forward audit logs to syslog collector\n";
     std::cerr << "  --keychain           Persist credentials in OS key store\n"; // TSK035_Platform_Specific_Security_Integration
     std::cerr << "  --tpm-seal           Seal credentials with TPM PCR policy\n"; // TSK035_Platform_Specific_Security_Integration
+    std::cerr << "  --kdf-iterations=N   Override PBKDF2 iteration count for new headers\n"; // TSK036_PBKDF2_Argon2_Migration_Path
   }
 
   std::filesystem::path MetadataDirFor(const std::filesystem::path& container) {
@@ -1526,6 +1527,7 @@ int main(int argc, char** argv) {
 
     SecurityIntegrationFlags security_flags{}; // TSK035_Platform_Specific_Security_Integration
     int index = 1;                             // TSK029 parse global flags
+    std::optional<uint32_t> kdf_iterations_override; // TSK036_PBKDF2_Argon2_Migration_Path
     for (; index < argc; ++index) {
       std::string_view arg = argv[index];
       if (arg.rfind("--", 0) != 0) {
@@ -1593,6 +1595,22 @@ int main(int argc, char** argv) {
         }
         continue;
       }
+      if (arg.rfind("--kdf-iterations=", 0) == 0) { // TSK036_PBKDF2_Argon2_Migration_Path
+        auto value = arg.substr(std::string_view("--kdf-iterations=").size());
+        if (value.empty()) {
+          PrintUsage();
+          return kExitUsage;
+        }
+        unsigned long long parsed_iterations = 0;
+        auto [endptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed_iterations);
+        if (ec != std::errc() || endptr != value.data() + value.size() || parsed_iterations == 0 ||
+            parsed_iterations > 0x00FFFFFFull) {
+          PrintUsage();
+          return kExitUsage;
+        }
+        kdf_iterations_override = static_cast<uint32_t>(parsed_iterations);
+        continue;
+      }
 
       PrintUsage();
       return kExitUsage;
@@ -1605,6 +1623,22 @@ int main(int argc, char** argv) {
 
     std::string cmd = argv[index++];
     qv::orchestrator::VolumeManager vm;
+    auto policy = vm.GetKdfPolicy(); // TSK036_PBKDF2_Argon2_Migration_Path
+    if (kdf_iterations_override) {
+      policy.algorithm = qv::orchestrator::VolumeManager::PasswordKdf::kPbkdf2;
+      policy.iteration_override = kdf_iterations_override;
+    }
+    policy.progress = [](uint32_t current, uint32_t total) { // TSK036_PBKDF2_Argon2_Migration_Path
+      if (total == 0) {
+        return;
+      }
+      auto percent = static_cast<uint32_t>((static_cast<uint64_t>(current) * 100u) / total);
+      std::cerr << "\rDeriving password key... " << percent << "%" << std::flush;
+      if (current >= total) {
+        std::cerr << std::endl;
+      }
+    };
+    vm.SetKdfPolicy(policy);
 
     if (cmd == "create") {
       if (argc - index != 1) {
