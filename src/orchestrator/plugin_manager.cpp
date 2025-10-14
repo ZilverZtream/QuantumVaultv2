@@ -53,6 +53,9 @@ namespace {
   constexpr uint32_t kPluginResultMessageType = 0x51565253u;    // "QVRS"
   constexpr rlim_t kPluginMemoryLimitBytes = 64ull * 1024ull * 1024ull; // 64 MiB cap.
   constexpr rlim_t kPluginCpuLimitSeconds = 5;                                // 5s CPU.
+#endif
+  constexpr size_t kMaxLoadedPlugins = 32; // TSK038_Resource_Limits_and_DoS_Prevention
+#if !defined(_WIN32)
 
   enum class PluginCommand : uint32_t {
     kInit = 1u,
@@ -612,6 +615,15 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
                             "plugin_path_resolution_failure",                       // TSK030
                             "Unable to resolve plugin path", so_path);             // TSK030
     return false;                                                                     // TSK030
+  }
+
+  if (loaded_.size() >= kMaxLoadedPlugins) { // TSK038_Resource_Limits_and_DoS_Prevention
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, // TSK038_Resource_Limits_and_DoS_Prevention
+                            "plugin_limit_reached", // TSK038_Resource_Limits_and_DoS_Prevention
+                            "Maximum plugin capacity reached", canonical_path, // TSK038_Resource_Limits_and_DoS_Prevention
+                            {qv::orchestrator::EventField("plugin_limit", std::to_string(kMaxLoadedPlugins),
+                                                          qv::orchestrator::FieldPrivacy::kPublic, true)}); // TSK038_Resource_Limits_and_DoS_Prevention
+    return false; // TSK038_Resource_Limits_and_DoS_Prevention
   }
 
   bool within_allowed_root = false;                                                  // TSK030
