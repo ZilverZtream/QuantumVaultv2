@@ -860,7 +860,9 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   }
   qv::orchestrator::EventBus::Instance().Publish(created);
 
-  return ConstantTimeMount::VolumeHandle{1};
+  ConstantTimeMount::VolumeHandle handle{};
+  handle.dummy = 1;
+  return handle;
 }
 
 std::optional<ConstantTimeMount::VolumeHandle>
@@ -1085,7 +1087,9 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   }
   qv::orchestrator::EventBus::Instance().Publish(event);
 
-  return ConstantTimeMount::VolumeHandle{1}; // TSK024_Key_Rotation_and_Lifecycle_Management
+  ConstantTimeMount::VolumeHandle handle{}; // TSK024_Key_Rotation_and_Lifecycle_Management
+  handle.dummy = 1; // TSK024_Key_Rotation_and_Lifecycle_Management
+  return handle; // TSK024_Key_Rotation_and_Lifecycle_Management
 }
 
 std::optional<ConstantTimeMount::VolumeHandle>
@@ -1231,5 +1235,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
                             true);
   qv::orchestrator::EventBus::Instance().Publish(event);
 
-  return ConstantTimeMount::VolumeHandle{1};
+  ConstantTimeMount::VolumeHandle handle{};
+  handle.dummy = 1;
+  return handle;
 }

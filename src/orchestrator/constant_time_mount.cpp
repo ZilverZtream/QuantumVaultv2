@@ -28,10 +28,12 @@
 #include "qv/core/pqc_hybrid_kdf.h"
 #include "qv/core/nonce.h"
 #include "qv/common.h"
+#include "qv/crypto/aegis.h"
 #include "qv/crypto/ct.h"
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/orchestrator/event_bus.h"  // TSK019
 #include "qv/security/zeroizer.h"
+#include "qv/storage/block_device.h"
 
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2 // TSK036_PBKDF2_Argon2_Migration_Path
 #include <argon2.h>
@@ -45,6 +47,13 @@ std::filesystem::path LockFilePath(const std::filesystem::path& container) { // 
   auto lock_path = container;
   lock_path += ".locked";
   return lock_path;
+}
+
+std::shared_ptr<qv::storage::BlockDevice> MakeBlockDevice(
+    const std::filesystem::path& container) { // TSK062_FUSE_Filesystem_Integration_Linux
+  std::array<uint8_t, 32> master_key{};
+  return std::make_shared<qv::storage::BlockDevice>(
+      container, master_key, 0, 0, qv::crypto::CipherType::AES_256_GCM);
 }
 
 class FailureTracker { // TSK026
@@ -651,7 +660,10 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   }
 
   if (any_success) {
-    return VolumeHandle{static_cast<int>(selected)};
+    VolumeHandle handle{};
+    handle.dummy = static_cast<int>(selected);
+    handle.device = MakeBlockDevice(container);
+    return handle;
   }
   return std::nullopt;
 }
@@ -789,7 +801,10 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   }
 
   if (mask != 0u) {
-    return VolumeHandle{1};
+    VolumeHandle handle{};
+    handle.dummy = 1;
+    handle.device = MakeBlockDevice(container);
+    return handle;
   }
   return std::nullopt;
 }

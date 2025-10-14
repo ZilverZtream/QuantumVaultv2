@@ -188,6 +188,26 @@ target_compile_definitions(qv PRIVATE
     QV_ENABLE_TPM_SEALING=$<BOOL:${qv_have_tpm}>   # TSK035_Platform_Specific_Security_Integration
 )
 
+# TSK062_FUSE_Filesystem_Integration_Linux build the Linux FUSE bridge when dependencies are present
+if (UNIX)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FUSE3 REQUIRED fuse3)
+
+  add_executable(qv.fuse
+    src/platform/fuse_adapter.cpp
+    src/platform/volume_filesystem.cpp)
+  target_include_directories(qv.fuse PRIVATE
+    ${FUSE3_INCLUDE_DIRS}
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>)
+  target_compile_options(qv.fuse PRIVATE ${FUSE3_CFLAGS_OTHER})
+  target_link_directories(qv.fuse PRIVATE ${FUSE3_LIBRARY_DIRS})
+  target_link_libraries(qv.fuse PRIVATE
+    qv_core
+    qv_orchestrator
+    qv_storage
+    ${FUSE3_LIBRARIES})
+endif()
+
 # Plugins (examples)
 add_library(qv_example_crypto MODULE plugins/example_crypto/example_crypto.cpp)
 target_include_directories(qv_example_crypto
