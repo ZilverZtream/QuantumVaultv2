@@ -172,6 +172,34 @@ target_include_directories(qv
 target_link_libraries(qv PRIVATE qv_core qv_orchestrator qv_storage)
 if (WIN32)
   target_link_libraries(qv PRIVATE Crypt32) # TSK035_Platform_Specific_Security_Integration
+  find_path(WINFSP_INCLUDE_DIR winfsp/winfsp.h
+            PATHS "C:/Program Files (x86)/WinFsp/inc" "C:/Program Files/WinFsp/inc")
+  find_library(WINFSP_LIBRARY winfsp-x64
+               PATHS "C:/Program Files (x86)/WinFsp/lib" "C:/Program Files/WinFsp/lib")
+
+  if (WINFSP_INCLUDE_DIR AND WINFSP_LIBRARY)
+    target_compile_definitions(qv PRIVATE QV_HAVE_WINFSP=1)
+    target_include_directories(qv PRIVATE ${WINFSP_INCLUDE_DIR})
+    target_sources(qv PRIVATE
+      src/platform/winfsp_adapter.cpp
+      src/platform/volume_filesystem.cpp)
+    target_link_libraries(qv PRIVATE ${WINFSP_LIBRARY})
+
+    add_executable(qv.winfsp
+      src/platform/winfsp_adapter.cpp
+      src/platform/volume_filesystem.cpp)
+    target_include_directories(qv.winfsp PRIVATE
+      ${WINFSP_INCLUDE_DIR}
+      $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>)
+    target_link_libraries(qv.winfsp PRIVATE
+      qv_core
+      qv_orchestrator
+      qv_storage
+      ${WINFSP_LIBRARY})
+    target_compile_definitions(qv.winfsp PRIVATE QV_HAVE_WINFSP=1)
+  else()
+    message(WARNING "WinFsp SDK not found; WinFsp integration disabled")
+  endif()
 elseif(APPLE)
   target_link_libraries(qv PRIVATE "-framework Security") # TSK035_Platform_Specific_Security_Integration
 endif()

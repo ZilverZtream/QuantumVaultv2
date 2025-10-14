@@ -5,11 +5,21 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <limits>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string_view>
 #include <vector>
+
+#if defined(__linux__)
 #include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+using mode_t = unsigned int;
+#endif
 
 #include "qv/error.h"
 
@@ -138,6 +148,8 @@ DirectoryEntry* VolumeFilesystem::FindDirectory(const std::string& path) {
   return current;
 }
 
+#if defined(__linux__)
+
 int VolumeFilesystem::GetAttr(const char* path, struct stat* stbuf) {
   std::scoped_lock lock(fs_mutex_);
   std::memset(stbuf, 0, sizeof(*stbuf));
@@ -259,6 +271,7 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
   file.start_offset = start_chunk * kChunkPayloadSize;
 }
 
+#if defined(__linux__)
 int VolumeFilesystem::Read(const char* path, char* buf, size_t size, off_t offset) {
   std::scoped_lock lock(fs_mutex_);
   auto* file = FindFile(path);
@@ -334,6 +347,392 @@ int VolumeFilesystem::Create(const char* path, mode_t mode, struct fuse_file_inf
   SaveMetadata();
   return 0;
 }
+#endif  // defined(__linux__)
+
+// TSK063_WinFsp_Windows_Driver_Integration shared helpers for WinFsp bridge
+uint64_t VolumeFilesystem::TotalSizeBytes() const {
+  std::scoped_lock lock(fs_mutex_);
+  const uint64_t metadata_bytes = metadata_chunk_count_ * kChunkPayloadSize;
+  const uint64_t allocated_chunks = next_chunk_index_ > data_start_chunk_
+                                        ? next_chunk_index_ - data_start_chunk_
+                                        : 0;
+  const uint64_t data_bytes = allocated_chunks * kChunkPayloadSize;
+  return metadata_bytes + data_bytes;
+}
+
+uint64_t VolumeFilesystem::FreeSpaceBytes() const {
+  constexpr uint64_t kAssumedCapacity = 512ull * 1024ull * 1024ull * 1024ull;  // 512 GiB
+  auto used = TotalSizeBytes();
+  if (used >= kAssumedCapacity) {
+    return 0;
+  }
+  return kAssumedCapacity - used;
+}
+
+std::optional<NodeMetadata> VolumeFilesystem::StatPath(const std::string& path) {
+  std::scoped_lock lock(fs_mutex_);
+  auto normalized = NormalizePath(path);
+  NodeMetadata metadata{};
+  if (normalized == "/") {
+    metadata.is_directory = true;
+    metadata.mode = kDefaultDirMode;
+    metadata.modification_time = root_->mtime;
+    metadata.change_time = root_->mtime;
+    return metadata;
+  }
+
+  if (auto* dir = FindDirectory(normalized)) {
+    metadata.is_directory = true;
+    metadata.mode = kDefaultDirMode;
+    metadata.modification_time = dir->mtime;
+    metadata.change_time = dir->mtime;
+    return metadata;
+  }
+
+  if (auto* file = FindFile(normalized)) {
+    metadata.is_directory = false;
+    metadata.size = file->size;
+    metadata.mode = file->mode == 0 ? kDefaultFileMode : file->mode;
+    metadata.modification_time = file->mtime;
+    metadata.change_time = file->ctime;
+    metadata.uid = file->uid;
+    metadata.gid = file->gid;
+    return metadata;
+  }
+
+  return std::nullopt;
+}
+
+std::vector<DirectoryListingEntry> VolumeFilesystem::ListDirectoryEntries(
+    const std::string& path) {
+  std::scoped_lock lock(fs_mutex_);
+  auto* dir = FindDirectory(path);
+  if (!dir) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Directory not found: " + path};
+  }
+
+  std::vector<DirectoryListingEntry> entries;
+  entries.reserve(dir->subdirs.size() + dir->files.size());
+  for (const auto& subdir : dir->subdirs) {
+    DirectoryListingEntry entry{};
+    entry.name = subdir->name;
+    entry.is_directory = true;
+    entry.metadata.is_directory = true;
+    entry.metadata.mode = kDefaultDirMode;
+    entry.metadata.modification_time = subdir->mtime;
+    entry.metadata.change_time = subdir->mtime;
+    entries.emplace_back(entry);
+  }
+  for (const auto& file : dir->files) {
+    DirectoryListingEntry entry{};
+    entry.name = file.name;
+    entry.is_directory = false;
+    entry.metadata.is_directory = false;
+    entry.metadata.size = file.size;
+    entry.metadata.mode = file.mode == 0 ? kDefaultFileMode : file.mode;
+    entry.metadata.modification_time = file.mtime;
+    entry.metadata.change_time = file.ctime;
+    entry.metadata.uid = file.uid;
+    entry.metadata.gid = file.gid;
+    entries.emplace_back(entry);
+  }
+  return entries;
+}
+
+std::vector<uint8_t> VolumeFilesystem::ReadFileRange(const std::string& path, uint64_t offset,
+                                                     size_t length) {
+  std::scoped_lock lock(fs_mutex_);
+  auto* file = FindFile(path);
+  if (!file) {
+    throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
+  }
+  auto data = ReadFileContent(*file);
+  if (offset >= data.size()) {
+    return {};
+  }
+  size_t readable = std::min<size_t>(length, data.size() - static_cast<size_t>(offset));
+  std::vector<uint8_t> result(readable);
+  std::memcpy(result.data(), data.data() + static_cast<size_t>(offset), readable);
+  return result;
+}
+
+size_t VolumeFilesystem::WriteFileRange(const std::string& path, uint64_t offset,
+                                        std::span<const uint8_t> data) {
+  std::scoped_lock lock(fs_mutex_);
+  auto* file = FindFile(path);
+  if (!file) {
+    throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
+  }
+  auto existing = ReadFileContent(*file);
+  if (existing.size() < offset) {
+    existing.resize(static_cast<size_t>(offset), 0);
+  }
+  if (existing.size() < offset + data.size()) {
+    existing.resize(static_cast<size_t>(offset + data.size()), 0);
+  }
+  std::memcpy(existing.data() + static_cast<size_t>(offset), data.data(), data.size());
+  WriteFileContent(*file, existing);
+  file->size = existing.size();
+  file->mtime = CurrentTimespec();
+  SaveMetadata();
+  return data.size();
+}
+
+void VolumeFilesystem::CreateFileNode(const std::string& path, uint32_t mode, uint32_t uid,
+                                      uint32_t gid) {
+  std::scoped_lock lock(fs_mutex_);
+  auto normalized = NormalizePath(path);
+  auto parent_path = std::filesystem::path(normalized).parent_path().string();
+  if (parent_path.empty()) {
+    parent_path = "/";
+  }
+  auto* dir = FindDirectory(parent_path);
+  if (!dir) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Parent directory missing: " + parent_path};
+  }
+  auto name = std::filesystem::path(normalized).filename().string();
+  for (const auto& file : dir->files) {
+    if (file.name == name) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "File already exists: " + path};
+    }
+  }
+  FileEntry entry{};
+  entry.name = name;
+  entry.mode = mode;
+  entry.size = 0;
+  entry.start_offset = 0;
+  entry.mtime = CurrentTimespec();
+  entry.ctime = entry.mtime;
+  entry.uid = static_cast<uid_t>(uid);
+  entry.gid = static_cast<gid_t>(gid);
+  dir->files.push_back(entry);
+  dir->mtime = entry.mtime;
+  SaveMetadata();
+}
+
+void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mode, uint32_t uid,
+                                           uint32_t gid) {
+  (void)mode;
+  (void)uid;
+  (void)gid;
+  std::scoped_lock lock(fs_mutex_);
+  auto normalized = NormalizePath(path);
+  auto parent_path = std::filesystem::path(normalized).parent_path().string();
+  if (parent_path.empty()) {
+    parent_path = "/";
+  }
+  auto* parent = FindDirectory(parent_path);
+  if (!parent) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Parent directory missing: " + parent_path};
+  }
+  auto name = std::filesystem::path(normalized).filename().string();
+  if (FindDirectory(normalized)) {
+    throw qv::Error{qv::ErrorDomain::State, 0, "Directory already exists: " + path};
+  }
+  auto dir = std::make_shared<DirectoryEntry>();
+  dir->name = name;
+  dir->mtime = CurrentTimespec();
+  parent->subdirs.push_back(dir);
+  parent->mtime = dir->mtime;
+  SaveMetadata();
+}
+
+void VolumeFilesystem::RemoveFileNode(const std::string& path) {
+  std::scoped_lock lock(fs_mutex_);
+  auto normalized = NormalizePath(path);
+  auto parent_path = std::filesystem::path(normalized).parent_path().string();
+  if (parent_path.empty()) {
+    parent_path = "/";
+  }
+  auto* dir = FindDirectory(parent_path);
+  if (!dir) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Parent directory missing: " + parent_path};
+  }
+  auto before = dir->files.size();
+  auto target = std::filesystem::path(normalized).filename().string();
+  dir->files.erase(std::remove_if(dir->files.begin(), dir->files.end(),
+                                  [&](const FileEntry& file) { return file.name == target; }),
+                   dir->files.end());
+  if (dir->files.size() == before) {
+    throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
+  }
+  dir->mtime = CurrentTimespec();
+  SaveMetadata();
+}
+
+void VolumeFilesystem::RemoveDirectoryNode(const std::string& path) {
+  std::scoped_lock lock(fs_mutex_);
+  auto normalized = NormalizePath(path);
+  if (normalized == "/") {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Cannot remove root directory"};
+  }
+  auto parent_path = std::filesystem::path(normalized).parent_path().string();
+  if (parent_path.empty()) {
+    parent_path = "/";
+  }
+  auto* parent = FindDirectory(parent_path);
+  if (!parent) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Parent directory missing: " + parent_path};
+  }
+  auto name = std::filesystem::path(normalized).filename().string();
+  auto it = std::find_if(parent->subdirs.begin(), parent->subdirs.end(),
+                         [&](const std::shared_ptr<DirectoryEntry>& child) { return child->name == name; });
+  if (it == parent->subdirs.end()) {
+    throw qv::Error{qv::ErrorDomain::IO, 0, "Directory not found: " + path};
+  }
+  if (!(*it)->files.empty() || !(*it)->subdirs.empty()) {
+    throw qv::Error{qv::ErrorDomain::State, 0, "Directory not empty: " + path};
+  }
+  parent->subdirs.erase(it);
+  parent->mtime = CurrentTimespec();
+  SaveMetadata();
+}
+
+void VolumeFilesystem::TruncateFileNode(const std::string& path, uint64_t size) {
+  std::scoped_lock lock(fs_mutex_);
+  auto* file = FindFile(path);
+  if (!file) {
+    throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
+  }
+  auto data = ReadFileContent(*file);
+  if (size < data.size()) {
+    data.resize(static_cast<size_t>(size));
+  } else if (size > data.size()) {
+    data.resize(static_cast<size_t>(size), 0);
+  }
+  WriteFileContent(*file, data);
+  file->size = data.size();
+  file->mtime = CurrentTimespec();
+  SaveMetadata();
+}
+
+void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to,
+                                  bool replace_existing) {
+  std::scoped_lock lock(fs_mutex_);
+  auto from_norm = NormalizePath(from);
+  auto to_norm = NormalizePath(to);
+  if (from_norm == "/" || to_norm == "/") {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Cannot rename root directory"};
+  }
+
+  auto* source_dir = FindDirectory(from_norm);
+  bool is_directory = source_dir != nullptr;
+  if (!is_directory && !FindFile(from_norm)) {
+    throw qv::Error{qv::ErrorDomain::IO, 0, "Source not found: " + from};
+  }
+
+  auto dest_parent_path = std::filesystem::path(to_norm).parent_path().string();
+  if (dest_parent_path.empty()) {
+    dest_parent_path = "/";
+  }
+  auto* dest_parent = FindDirectory(dest_parent_path);
+  if (!dest_parent) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Destination parent missing: " + dest_parent_path};
+  }
+  auto dest_name = std::filesystem::path(to_norm).filename().string();
+
+  if (is_directory) {
+    // Check for conflicts
+    auto existing_dir = FindDirectory(to_norm);
+    if (existing_dir) {
+      if (!replace_existing) {
+        throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
+      }
+      if (!existing_dir->files.empty() || !existing_dir->subdirs.empty()) {
+        throw qv::Error{qv::ErrorDomain::State, 0, "Destination directory not empty"};
+      }
+      auto existing_it = std::find_if(dest_parent->subdirs.begin(), dest_parent->subdirs.end(),
+                                      [&](const std::shared_ptr<DirectoryEntry>& child) {
+                                        return child->name == dest_name;
+                                      });
+      if (existing_it != dest_parent->subdirs.end()) {
+        dest_parent->subdirs.erase(existing_it);
+      }
+    }
+
+    auto from_parent_path = std::filesystem::path(from_norm).parent_path().string();
+    if (from_parent_path.empty()) {
+      from_parent_path = "/";
+    }
+    auto* from_parent = FindDirectory(from_parent_path);
+    auto name = std::filesystem::path(from_norm).filename().string();
+    auto it = std::find_if(from_parent->subdirs.begin(), from_parent->subdirs.end(),
+                           [&](const std::shared_ptr<DirectoryEntry>& child) {
+                             return child->name == name;
+                           });
+    if (it == from_parent->subdirs.end()) {
+      throw qv::Error{qv::ErrorDomain::IO, 0, "Source directory missing"};
+    }
+    auto moved = *it;
+    from_parent->subdirs.erase(it);
+    moved->name = dest_name;
+    dest_parent->subdirs.push_back(moved);
+    dest_parent->mtime = CurrentTimespec();
+    from_parent->mtime = dest_parent->mtime;
+  } else {
+    // Handle file rename
+    auto dest_file_it = std::find_if(dest_parent->files.begin(), dest_parent->files.end(),
+                                     [&](const FileEntry& f) { return f.name == dest_name; });
+    if (dest_file_it != dest_parent->files.end()) {
+      if (!replace_existing) {
+        throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
+      }
+      dest_parent->files.erase(dest_file_it);
+    }
+
+    auto from_parent_path = std::filesystem::path(from_norm).parent_path().string();
+    if (from_parent_path.empty()) {
+      from_parent_path = "/";
+    }
+    auto* from_parent = FindDirectory(from_parent_path);
+    auto name = std::filesystem::path(from_norm).filename().string();
+    auto it = std::find_if(from_parent->files.begin(), from_parent->files.end(),
+                           [&](const FileEntry& file) { return file.name == name; });
+    if (it == from_parent->files.end()) {
+      throw qv::Error{qv::ErrorDomain::IO, 0, "Source file missing"};
+    }
+    FileEntry entry = *it;
+    from_parent->files.erase(it);
+    entry.name = dest_name;
+    dest_parent->files.push_back(entry);
+    dest_parent->mtime = CurrentTimespec();
+    from_parent->mtime = dest_parent->mtime;
+  }
+
+  SaveMetadata();
+}
+
+void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<timespec> modification,
+                                        std::optional<timespec> change) {
+  std::scoped_lock lock(fs_mutex_);
+  auto normalized = NormalizePath(path);
+  if (auto* dir = FindDirectory(normalized)) {
+    if (modification) {
+      dir->mtime = *modification;
+    }
+    if (change) {
+      dir->mtime = *change;
+    }
+    SaveMetadata();
+    return;
+  }
+  if (auto* file = FindFile(normalized)) {
+    if (modification) {
+      file->mtime = *modification;
+    }
+    if (change) {
+      file->ctime = *change;
+    }
+    SaveMetadata();
+  }
+}
+
 
 int VolumeFilesystem::Unlink(const char* path) {
   std::scoped_lock lock(fs_mutex_);
@@ -434,6 +833,8 @@ int VolumeFilesystem::Truncate(const char* path, off_t size) {
   SaveMetadata();
   return 0;
 }
+
+#endif  // defined(__linux__)
 
 void VolumeFilesystem::SerializeDirectory(std::ostringstream& out, const DirectoryEntry* dir,
                                           const std::string& path) {
