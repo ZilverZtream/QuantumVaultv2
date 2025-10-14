@@ -2,13 +2,15 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <sstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -18,6 +20,7 @@
 #if !defined(_WIN32)
 #include <csignal>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -37,7 +40,6 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #endif
-#endif
 
 #include "qv/orchestrator/event_bus.h" // TSK019
 #include "qv/orchestrator/plugin_abi.h"
@@ -53,6 +55,8 @@ namespace {
   constexpr uint32_t kPluginResultMessageType = 0x51565253u;    // "QVRS"
   constexpr rlim_t kPluginMemoryLimitBytes = 64ull * 1024ull * 1024ull; // 64 MiB cap.
   constexpr rlim_t kPluginCpuLimitSeconds = 5;                                // 5s CPU.
+  constexpr std::chrono::milliseconds kPluginHandshakeTimeout{5000}; // TSK077
+  constexpr std::chrono::milliseconds kPluginInitTimeout{5000};       // TSK077
 #endif
   constexpr size_t kMaxLoadedPlugins = 32; // TSK038_Resource_Limits_and_DoS_Prevention
 #if !defined(_WIN32)
@@ -117,6 +121,75 @@ namespace {
     return true;
   }
 
+  class PluginDeadline { // TSK077
+   public:
+    explicit PluginDeadline(std::chrono::milliseconds timeout) {
+      if (timeout.count() > 0) {
+        deadline_ = std::chrono::steady_clock::now() + timeout;
+      }
+    }
+
+    bool WaitReadable(int fd) {
+      while (true) {
+        const int timeout_ms = RemainingMillis();
+        struct pollfd pfd {
+          fd, POLLIN, 0
+        };
+        int rc = ::poll(&pfd, 1, timeout_ms);
+        if (rc == 0) {
+          return false;
+        }
+        if (rc < 0) {
+          if (errno == EINTR)
+            continue;
+          return false;
+        }
+        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+          return false;
+        }
+        return (pfd.revents & POLLIN) != 0;
+      }
+    }
+
+   private:
+    int RemainingMillis() const {
+      if (!deadline_) {
+        return -1;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= *deadline_) {
+        return 0;
+      }
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(*deadline_ - now);
+      return static_cast<int>(remaining.count());
+    }
+
+    std::optional<std::chrono::steady_clock::time_point> deadline_;
+  };
+
+  bool ReadAllWithDeadline(int fd, void* data, size_t size, PluginDeadline* deadline) {
+    if (!deadline) {
+      return ReadAll(fd, data, size);
+    }
+    auto* bytes = static_cast<uint8_t*>(data);
+    size_t read = 0;
+    while (read < size) {
+      if (!deadline->WaitReadable(fd)) {
+        return false;
+      }
+      ssize_t rc = ::read(fd, bytes + read, size - read);
+      if (rc < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+          continue;
+        return false;
+      }
+      if (rc == 0)
+        return false;
+      read += static_cast<size_t>(rc);
+    }
+    return true;
+  }
+
   void SetPluginResourceLimits() {
     struct rlimit mem_limit {
       kPluginMemoryLimitBytes, kPluginMemoryLimitBytes
@@ -130,45 +203,72 @@ namespace {
   }
 
 #if defined(__linux__)
-  void ApplyPluginSandbox() {
+  void InstallPluginSeccompFilter(bool allow_filesystem) { // TSK077
     if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
       return;
     }
 
-#define QV_ALLOW_SYSCALL(name)                                                                \
-  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_##name, 0, 1),                                    \
-      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+    std::vector<sock_filter> filter;
+    filter.reserve(32);
+    filter.push_back({static_cast<uint16_t>(BPF_LD | BPF_W | BPF_ABS), 0, 0,
+                     static_cast<uint32_t>(offsetof(struct seccomp_data, nr))});
 
-    struct sock_filter filter[] = {
-        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        QV_ALLOW_SYSCALL(read),
-        QV_ALLOW_SYSCALL(write),
-        QV_ALLOW_SYSCALL(close),
-        QV_ALLOW_SYSCALL(exit),
-        QV_ALLOW_SYSCALL(exit_group),
-        QV_ALLOW_SYSCALL(futex),
-        QV_ALLOW_SYSCALL(clock_gettime),
-        QV_ALLOW_SYSCALL(nanosleep),
-        QV_ALLOW_SYSCALL(getrandom),
-        QV_ALLOW_SYSCALL(rt_sigreturn),
-        QV_ALLOW_SYSCALL(rt_sigaction),
-        QV_ALLOW_SYSCALL(rt_sigprocmask),
-        QV_ALLOW_SYSCALL(mmap),
-        QV_ALLOW_SYSCALL(munmap),
-        QV_ALLOW_SYSCALL(mprotect),
-        QV_ALLOW_SYSCALL(brk),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    auto allow_syscall = [&filter](int syscall_number) {
+      filter.push_back({static_cast<uint16_t>(BPF_JMP | BPF_JEQ | BPF_K), 0, 1,
+                        static_cast<uint32_t>(syscall_number)});
+      filter.push_back({static_cast<uint16_t>(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_ALLOW});
     };
 
-#undef QV_ALLOW_SYSCALL
+    allow_syscall(__NR_read);
+    allow_syscall(__NR_write);
+    allow_syscall(__NR_close);
+    allow_syscall(__NR_exit);
+    allow_syscall(__NR_exit_group);
+    allow_syscall(__NR_futex);
+    allow_syscall(__NR_clock_gettime);
+    allow_syscall(__NR_nanosleep);
+    allow_syscall(__NR_getrandom);
+    allow_syscall(__NR_rt_sigreturn);
+    allow_syscall(__NR_rt_sigaction);
+    allow_syscall(__NR_rt_sigprocmask);
+    allow_syscall(__NR_mmap);
+    allow_syscall(__NR_munmap);
+    allow_syscall(__NR_mprotect);
+    allow_syscall(__NR_brk);
 
-    const unsigned short program_length =
-        static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0]));
-    struct sock_fprog program {program_length, filter};
+    if (allow_filesystem) {
+#if defined(__NR_openat)
+      allow_syscall(__NR_openat);
+#endif
+#if defined(__NR_newfstatat)
+      allow_syscall(__NR_newfstatat);
+#endif
+#if defined(__NR_fstat)
+      allow_syscall(__NR_fstat);
+#endif
+#if defined(__NR_pread64)
+      allow_syscall(__NR_pread64);
+#endif
+    }
+
+    filter.push_back({static_cast<uint16_t>(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_KILL_PROCESS});
+
+    struct sock_fprog program {
+      static_cast<unsigned short>(filter.size()), filter.data()
+    };
 
     ::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program);
   }
+
+  void ApplyPluginSandboxBeforeLoad() {
+    InstallPluginSeccompFilter(true);
+  }
+
+  void ApplyPluginSandbox() {
+    InstallPluginSeccompFilter(false);
+  }
 #else
+  void ApplyPluginSandboxBeforeLoad() {}
   void ApplyPluginSandbox() {}
 #endif
 
@@ -259,8 +359,9 @@ namespace {
   }
 
   bool ReceiveHandshake(int fd, PluginHandshakePacket* packet, std::string& name,
-                        std::string& version) {
-    if (!ReadAll(fd, packet, sizeof(*packet)))
+                        std::string& version, std::chrono::milliseconds timeout) {
+    PluginDeadline deadline(timeout);
+    if (!ReadAllWithDeadline(fd, packet, sizeof(*packet), &deadline))
       return false;
     if (packet->type != kPluginHandshakeMessageType)
       return false;
@@ -277,12 +378,12 @@ namespace {
     version.clear();
     if (packet->name_size > 0) {
       name.resize(packet->name_size);
-      if (!ReadAll(fd, name.data(), packet->name_size))
+      if (!ReadAllWithDeadline(fd, name.data(), packet->name_size, &deadline))
         return false;
     }
     if (packet->version_size > 0) {
       version.resize(packet->version_size);
-      if (!ReadAll(fd, version.data(), packet->version_size))
+      if (!ReadAllWithDeadline(fd, version.data(), packet->version_size, &deadline))
         return false;
     }
     return true;
@@ -295,9 +396,11 @@ namespace {
     return WriteAll(fd, &packet, sizeof(packet));
   }
 
-  bool AwaitCommandResult(int fd, PluginCommand expected, int* status_out) {
+  bool AwaitCommandResult(int fd, PluginCommand expected, int* status_out,
+                          std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) {
+    PluginDeadline deadline(timeout);
     PluginCommandResultPacket packet{};
-    if (!ReadAll(fd, &packet, sizeof(packet)))
+    if (!ReadAllWithDeadline(fd, &packet, sizeof(packet), timeout.count() > 0 ? &deadline : nullptr))
       return false;
     if (packet.type != kPluginResultMessageType)
       return false;
@@ -310,6 +413,15 @@ namespace {
 
   [[noreturn]] void PluginSubprocess(int channel, const std::filesystem::path& path) {
     SetPluginResourceLimits();
+
+#if defined(__linux__)
+    ::prctl(PR_SET_PDEATHSIG, SIGKILL); // TSK077
+    if (::getppid() == 1) {
+      ::kill(::getpid(), SIGKILL);
+    }
+#endif
+
+    ApplyPluginSandboxBeforeLoad(); // TSK077
 
     DynLib library;
     if (!library.Open(path)) {
@@ -816,7 +928,8 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   PluginHandshakePacket handshake{};
   std::string plugin_name;
   std::string plugin_version;
-  if (!ReceiveHandshake(sockets[0], &handshake, plugin_name, plugin_version)) {
+  if (!ReceiveHandshake(sockets[0], &handshake, plugin_name, plugin_version,
+                        kPluginHandshakeTimeout)) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_handshake_failure",
                             "Failed to negotiate plugin handshake", canonical_path);
     ::close(sockets[0]);
@@ -886,7 +999,8 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   }
 
   int init_status = 0;
-  if (!AwaitCommandResult(sockets[0], PluginCommand::kInit, &init_status) || init_status != 0) {
+  if (!AwaitCommandResult(sockets[0], PluginCommand::kInit, &init_status, kPluginInitTimeout) ||
+      init_status != 0) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_initialization_failed",
                             "Plugin initialization routine failed", canonical_path);
     ::close(sockets[0]);
