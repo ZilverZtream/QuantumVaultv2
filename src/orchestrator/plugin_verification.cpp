@@ -369,26 +369,26 @@ bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& e
 
   bool signature_present = !IsAllZero(std::span<const uint8_t>(expected.signature));
   bool hash_present = !IsAllZero(std::span<const uint8_t>(expected.expected_hash));
-
-  bool signature_valid = false;
-  if (signature_present && !IsAllZero(std::span<const uint8_t>(signing_key))) {
-    if (IsKeyTrusted(policy, plugin_id, signing_key)) {
-      signature_valid = Ed25519_Verify(signing_key, hash, expected.signature);
-    }
-  }
+  bool key_nonzero = !IsAllZero(std::span<const uint8_t>(signing_key));                 // TSK070
+  bool key_trusted = IsKeyTrusted(policy, plugin_id, signing_key);                      // TSK070
+  bool signature_check = Ed25519_Verify(signing_key, hash, expected.signature);         // TSK070
+  uint32_t signature_mask = signature_check ? 1u : 0u;                                  // TSK070
+  signature_mask &= signature_present ? 1u : 0u;                                        // TSK070
+  signature_mask &= key_nonzero ? 1u : 0u;                                              // TSK070
+  signature_mask &= key_trusted ? 1u : 0u;                                              // TSK070
 
   const bool require_signature = expected.enforce_signature || policy.require_signature;
   const bool allow_hash = expected.allow_hash_fallback || policy.allow_hash_fallback;
   bool fallback_hash_match = CompareEqual<32>(hash, expected.expected_hash);        // TSK037
-  bool fallback_ok = allow_hash & hash_present & fallback_hash_match;              // TSK037
+  bool fallback_ok = allow_hash & hash_present & fallback_hash_match;              // TSK037 & TSK070
   std::atomic_signal_fence(std::memory_order_seq_cst);                              // TSK037
 
-  if (require_signature && !signature_valid) {
-    return false;
-  }
-
-  if (!signature_valid && !fallback_ok) {
-    return false;
+  uint32_t require_mask = require_signature ? 1u : 0u;                                // TSK070
+  uint32_t fallback_mask = fallback_ok ? 1u : 0u;                                      // TSK070
+  uint32_t integrity_mask = signature_mask | (fallback_mask & (require_mask ^ 1u));    // TSK070
+  bool integrity_ok = integrity_mask != 0u;                                            // TSK070
+  if (!integrity_ok) {                                                                 // TSK070
+    return false;                                                                       // TSK070
   }
 
   auto abi = QueryPluginABI(path);
