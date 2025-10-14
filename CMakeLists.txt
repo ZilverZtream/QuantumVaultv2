@@ -9,7 +9,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(QV_BUILD_TESTS "Build unit tests" ON)
 option(QV_USE_STUB_CRYPTO "Use stub implementations for cryptography" OFF) # TSK008
-option(QV_ENABLE_SANITIZERS "Enable address/undefined sanitizers" OFF) # TSK008
+set(_QV_ENABLE_SANITIZERS_DEFAULT OFF)
+if (NOT MSVC)
+  set(_QV_ENABLE_SANITIZERS_DEFAULT ON)
+endif()
+option(QV_ENABLE_SANITIZERS "Enable address/undefined sanitizers" ${_QV_ENABLE_SANITIZERS_DEFAULT}) # TSK039_Static_Analysis_and_CI_Quality_Gates default Linux/macOS sanitizers
+option(QV_ENABLE_COVERAGE "Enable coverage instrumentation" OFF) # TSK039_Static_Analysis_and_CI_Quality_Gates
 option(QV_FIPS_MODE "Enable FIPS 140-2/3 compliance mode" OFF) # TSK023_Production_Crypto_Provider_Complete_Integration
 
 if (QV_FIPS_MODE AND QV_USE_STUB_CRYPTO)
@@ -24,11 +29,21 @@ endif()
 
 if (QV_ENABLE_SANITIZERS)
   if (MSVC)
-    message(WARNING "Sanitizers are not currently supported on MSVC builds") # TSK008
+    message(WARNING "Sanitizers are not currently supported on MSVC builds") # TSK039_Static_Analysis_and_CI_Quality_Gates guard
   else()
     set(_qv_sanitizers "address,undefined")
-    add_compile_options(-fsanitize=${_qv_sanitizers}) # TSK008
-    add_link_options(-fsanitize=${_qv_sanitizers}) # TSK008
+    add_compile_options(-fsanitize=${_qv_sanitizers}) # TSK039_Static_Analysis_and_CI_Quality_Gates instrumentation
+    add_link_options(-fsanitize=${_qv_sanitizers}) # TSK039_Static_Analysis_and_CI_Quality_Gates instrumentation
+  endif()
+endif()
+
+if (QV_ENABLE_COVERAGE)
+  if (MSVC)
+    message(WARNING "Coverage instrumentation is not currently supported on MSVC builds; disabling") # TSK039_Static_Analysis_and_CI_Quality_Gates portability guard
+    set(QV_ENABLE_COVERAGE OFF CACHE BOOL "Enable coverage instrumentation" FORCE)
+  else()
+    add_compile_options(--coverage) # TSK039_Static_Analysis_and_CI_Quality_Gates instrumentation
+    add_link_options(--coverage) # TSK039_Static_Analysis_and_CI_Quality_Gates instrumentation
   endif()
 endif()
 
