@@ -21,6 +21,26 @@
 #include <system_error>
 #include <vector>
 
+#ifndef QV_SENSITIVE_FUNCTION  // TSK028A_Memory_Wiping_Gaps
+#if defined(_MSC_VER)
+#define QV_SENSITIVE_BEGIN __pragma(optimize("", off))
+#define QV_SENSITIVE_END __pragma(optimize("", on))
+#define QV_SENSITIVE_FUNCTION __declspec(noinline)
+#elif defined(__clang__)
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION [[clang::optnone]] __attribute__((noinline))
+#elif defined(__GNUC__)
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION __attribute__((noinline, optimize("O0")))
+#else
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION
+#endif
+#endif  // QV_SENSITIVE_FUNCTION TSK028A_Memory_Wiping_Gaps
+
 #if defined(__linux__)
 #include <thread>
 #endif
@@ -1202,9 +1222,11 @@ namespace {
   }
 
 #if defined(__linux__)
-  int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
-                  qv::orchestrator::VolumeManager& vm,
-                  const SecurityIntegrationFlags& security_flags) {
+  QV_SENSITIVE_BEGIN
+  QV_SENSITIVE_FUNCTION int HandleMount(const std::filesystem::path& container,
+                                        const std::filesystem::path& mountpoint,
+                                        qv::orchestrator::VolumeManager& vm,
+                                        const SecurityIntegrationFlags& security_flags) {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing, // TSK020
@@ -1232,44 +1254,53 @@ namespace {
     if (!cached) {
       password = ReadPassword("Password: ");
     }
-    auto handle = vm.Mount(container, password);
-    SecureZero(password);
-    if (!handle) {
-      const char* message =
+    try {
+      auto handle = vm.Mount(container, password);
+      if (!handle) {
+        SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
+        const char* message =
 #ifdef NDEBUG
-          "Authentication failed or volume unavailable.";
+            "Authentication failed or volume unavailable.";
 #else
-          "Authentication failed.";
+            "Authentication failed.";
 #endif
-      std::cerr << message << std::endl;
-      return kExitAuth;
+        std::cerr << message << std::endl;
+        return kExitAuth;
+      }
+      SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
+      if (!handle->device) {
+        throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
+      }
+
+      qv::platform::FUSEAdapter adapter(handle->device);
+      adapter.Mount(mountpoint);
+      g_active_fuse_adapter = &adapter;
+      g_fuse_running.store(true);
+      std::signal(SIGINT, FuseSignalHandler);
+      std::signal(SIGTERM, FuseSignalHandler);
+
+      std::cout << "Mounted " << SanitizePath(container) << " at " << SanitizePath(mountpoint) << std::endl;
+      std::cout << "Press Ctrl+C to unmount..." << std::endl;
+
+      while (g_fuse_running.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
+
+      g_active_fuse_adapter = nullptr;
+      adapter.Unmount();
+      return kExitOk;
+    } catch (...) {
+      SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
+      throw;
     }
-    if (!handle->device) {
-      throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
-    }
-
-    qv::platform::FUSEAdapter adapter(handle->device);
-    adapter.Mount(mountpoint);
-    g_active_fuse_adapter = &adapter;
-    g_fuse_running.store(true);
-    std::signal(SIGINT, FuseSignalHandler);
-    std::signal(SIGTERM, FuseSignalHandler);
-
-    std::cout << "Mounted " << SanitizePath(container) << " at " << SanitizePath(mountpoint) << std::endl;
-    std::cout << "Press Ctrl+C to unmount..." << std::endl;
-
-    while (g_fuse_running.load()) {
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-
-    g_active_fuse_adapter = nullptr;
-    adapter.Unmount();
-    return kExitOk;
   }
+  QV_SENSITIVE_END
 #elif defined(_WIN32) && defined(QV_HAVE_WINFSP)
-  int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
-                  qv::orchestrator::VolumeManager& vm,
-                  const SecurityIntegrationFlags& security_flags) {
+  QV_SENSITIVE_BEGIN
+  QV_SENSITIVE_FUNCTION int HandleMount(const std::filesystem::path& container,
+                                        const std::filesystem::path& mountpoint,
+                                        qv::orchestrator::VolumeManager& vm,
+                                        const SecurityIntegrationFlags& security_flags) {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing,  // TSK020
@@ -1294,37 +1325,45 @@ namespace {
       password = ReadPassword("Password: ");
     }
 
-    auto handle = vm.Mount(container, password);
-    SecureZero(password);
-    if (!handle) {
-      const char* message =
+    try {
+      auto handle = vm.Mount(container, password);
+      if (!handle) {
+        SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
+        const char* message =
 #ifdef NDEBUG
-          "Authentication failed or volume unavailable.";
+            "Authentication failed or volume unavailable.";
 #else
-          "Authentication failed.";
+            "Authentication failed.";
 #endif
-      std::cerr << message << std::endl;
-      return kExitAuth;
+        std::cerr << message << std::endl;
+        return kExitAuth;
+      }
+      SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
+      if (!handle->device) {
+        throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
+      }
+
+      qv::platform::WinFspAdapter adapter(handle->device);
+      adapter.Mount(mount_target);
+      g_winfsp_running.store(true);
+      SetConsoleCtrlHandler(WinFspSignalHandler, TRUE);
+
+      std::wcout << L"Mounted at " << mount_target << std::endl;
+      std::wcout << L"Press Ctrl+C to unmount..." << std::endl;
+
+      while (g_winfsp_running.load()) {
+        Sleep(200);
+      }
+
+      SetConsoleCtrlHandler(WinFspSignalHandler, FALSE);
+      adapter.Unmount();
+      return kExitOk;
+    } catch (...) {
+      SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
+      throw;
     }
-    if (!handle->device) {
-      throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
-    }
-
-    qv::platform::WinFspAdapter adapter(handle->device);
-    adapter.Mount(mount_target);
-    g_winfsp_running.store(true);
-    SetConsoleCtrlHandler(WinFspSignalHandler, TRUE);
-
-    std::wcout << L"Mounted at " << mount_target << std::endl;
-    std::wcout << L"Press Ctrl+C to unmount..." << std::endl;
-
-    while (g_winfsp_running.load()) {
-      Sleep(200);
-    }
-
-    SetConsoleCtrlHandler(WinFspSignalHandler, FALSE);
-    adapter.Unmount();
-    return kExitOk;
+  }
+  QV_SENSITIVE_END
 #elif defined(_WIN32)
   int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
                   qv::orchestrator::VolumeManager& vm,
@@ -1349,7 +1388,8 @@ namespace {
   }
 #endif
 
-  int HandleRekey(
+  QV_SENSITIVE_BEGIN
+  QV_SENSITIVE_FUNCTION int HandleRekey(
       const std::filesystem::path& container, std::optional<std::filesystem::path> backup_key,
       qv::orchestrator::VolumeManager& vm,
       const SecurityIntegrationFlags& security_flags) { // TSK024_Key_Rotation_and_Lifecycle_Management, TSK035_Platform_Specific_Security_Integration
@@ -1363,12 +1403,15 @@ namespace {
       std::cerr << "Validation error: Passwords do not match." << std::endl;
       return kExitUsage;
     }
+    const auto wipe_passwords = [&]() noexcept {
+      SecureZero(current);   // TSK028A_Memory_Wiping_Gaps
+      SecureZero(next);      // TSK028A_Memory_Wiping_Gaps
+      SecureZero(confirm);   // TSK028A_Memory_Wiping_Gaps
+    };
     try {
       auto handle = vm.Rekey(container, current, next, std::move(backup_key));
       if (!handle) {
-        SecureZero(current);
-        SecureZero(next);
-        SecureZero(confirm);
+        wipe_passwords();
         std::cerr << "I/O error: Failed to rekey volume." << std::endl;
         return kExitIO;
       }
@@ -1376,17 +1419,14 @@ namespace {
         PersistCredential(container, next, security_flags);
       }
     } catch (...) {
-      SecureZero(current);
-      SecureZero(next);
-      SecureZero(confirm);
+      wipe_passwords();
       throw;
     }
-    SecureZero(current);
-    SecureZero(next);
-    SecureZero(confirm);
+    wipe_passwords();
     std::cout << "Rekeyed." << std::endl;
     return kExitOk;
   }
+  QV_SENSITIVE_END
 
   int HandleMigrate(const std::filesystem::path& container, std::optional<uint32_t> target_version,
                     qv::orchestrator::VolumeManager& vm) { // TSK033

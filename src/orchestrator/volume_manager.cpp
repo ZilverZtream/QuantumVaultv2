@@ -30,6 +30,26 @@
 #include <argon2.h>
 #endif
 
+#ifndef QV_SENSITIVE_FUNCTION  // TSK028A_Memory_Wiping_Gaps
+#if defined(_MSC_VER)
+#define QV_SENSITIVE_BEGIN __pragma(optimize("", off))
+#define QV_SENSITIVE_END __pragma(optimize("", on))
+#define QV_SENSITIVE_FUNCTION __declspec(noinline)
+#elif defined(__clang__)
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION [[clang::optnone]] __attribute__((noinline))
+#elif defined(__GNUC__)
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION __attribute__((noinline, optimize("O0")))
+#else
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION
+#endif
+#endif  // QV_SENSITIVE_FUNCTION TSK028A_Memory_Wiping_Gaps
+
 using namespace qv::orchestrator;
 
 namespace {
@@ -752,7 +772,8 @@ std::vector<uint8_t> VolumeManager::DecryptChunk(
       data_key);
 }
 
-std::optional<ConstantTimeMount::VolumeHandle>
+QV_SENSITIVE_BEGIN
+QV_SENSITIVE_FUNCTION std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Create(const std::filesystem::path& container, const std::string& password) {
   if (std::filesystem::exists(container)) {
     throw qv::Error{qv::ErrorDomain::Validation,
@@ -774,25 +795,35 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   FillRandom(hybrid_salt);
 
   std::vector<uint8_t> password_bytes(password.begin(), password.end());
-  VectorWipeGuard password_guard(password_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
+  VectorWipeGuard password_guard(password_bytes); // TSK028_Secure_Deletion_and_Data_Remanence, TSK028A_Memory_Wiping_Gaps
   std::optional<Argon2Config> argon2_config; // TSK036_PBKDF2_Argon2_Migration_Path
   uint32_t pbkdf_iterations = 0;             // TSK036_PBKDF2_Argon2_Migration_Path
   std::array<uint8_t, 32> classical_key{};   // TSK036_PBKDF2_Argon2_Migration_Path
   std::span<const uint8_t> password_span(password_bytes.data(), password_bytes.size());
-  if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
-    Argon2Config cfg{};
-    cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
-    std::copy(password_salt.begin(), password_salt.end(), cfg.salt.begin());
-    classical_key = DerivePasswordKeyArgon2id(password_span, cfg);
-    argon2_config = cfg;
-  } else {
-    pbkdf_iterations = DeterminePbkdfIterations(password_span, password_salt, kdf_policy_);
-    classical_key = DerivePasswordKey(password_span, password_salt, pbkdf_iterations, kdf_policy_.progress);
+  const auto wipe_password_bytes = [&]() noexcept {
+    if (!password_bytes.empty()) {
+      qv::security::Zeroizer::Wipe(
+          std::span<uint8_t>(password_bytes.data(), password_bytes.size()));  // TSK028A_Memory_Wiping_Gaps
+      password_bytes.clear();
+    }
+  };
+  try {
+    if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
+      Argon2Config cfg{};
+      cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
+      std::copy(password_salt.begin(), password_salt.end(), cfg.salt.begin());
+      classical_key = DerivePasswordKeyArgon2id(password_span, cfg);
+      argon2_config = cfg;
+    } else {
+      pbkdf_iterations = DeterminePbkdfIterations(password_span, password_salt, kdf_policy_);
+      classical_key = DerivePasswordKey(password_span, password_salt, pbkdf_iterations, kdf_policy_.progress);
+    }
+    wipe_password_bytes();
+  } catch (...) {
+    wipe_password_bytes();
+    throw;
   }
   qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
-  if (!password_bytes.empty()) {
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(password_bytes.data(), password_bytes.size()));
-  }
 
   qv::core::EpochTLV epoch{};
   epoch.type = ToLittleEndian16(kTlvTypeEpoch);
@@ -864,6 +895,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   handle.dummy = 1;
   return handle;
 }
+QV_SENSITIVE_END
 
 std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Mount(const std::filesystem::path& container, const std::string& password) {
@@ -881,7 +913,8 @@ VolumeManager::Mount(const std::filesystem::path& container, const std::string& 
   return handle;
 }
 
-std::optional<ConstantTimeMount::VolumeHandle>
+QV_SENSITIVE_BEGIN
+QV_SENSITIVE_FUNCTION std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Rekey(const std::filesystem::path& container, const std::string& current_password,
                      const std::string& new_password,
                      std::optional<std::filesystem::path> backup_public_key) {
@@ -1091,6 +1124,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   handle.dummy = 1; // TSK024_Key_Rotation_and_Lifecycle_Management
   return handle; // TSK024_Key_Rotation_and_Lifecycle_Management
 }
+QV_SENSITIVE_END
 
 std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_version,
