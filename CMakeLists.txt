@@ -146,6 +146,7 @@ target_link_libraries(qv_storage PUBLIC qv_core)
 add_library(qv_orchestrator
     src/orchestrator/plugin_verification.cpp
     src/orchestrator/constant_time_mount.cpp
+    src/orchestrator/ipc_lock.cpp
     src/orchestrator/plugin_manager.cpp
     src/orchestrator/volume_manager.cpp
     src/orchestrator/io_util.cpp # TSK068_Atomic_Header_Writes durability helper
