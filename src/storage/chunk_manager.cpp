@@ -117,6 +117,7 @@ void ChunkManager::WriteChunk(uint64_t logical_offset, std::span<const uint8_t> 
 
   int64_t chunk_index = static_cast<int64_t>(logical_offset / kChunkPayloadSize);
   std::vector<uint8_t> buffer(data.begin(), data.end());
+  cache_.Invalidate(chunk_index);  // TSK076_Cache_Coherency
   auto cached = cache_.Put(chunk_index, std::move(buffer), true);
   if (cached) {
     PersistChunk(chunk_index, cached->data);

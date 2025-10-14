@@ -35,6 +35,16 @@ int main() {
     return 1;
   }
 
+  for (int iteration = 0; iteration < 8; ++iteration) {  // TSK076_Cache_Coherency
+    std::vector<uint8_t> fuzz(qv::storage::kChunkSize / 2, static_cast<uint8_t>(iteration));
+    manager.WriteChunk(0, fuzz);
+    auto latest = manager.ReadChunk(0);
+    if (latest != fuzz) {
+      std::cerr << "stale cache detected" << std::endl;
+      return 1;
+    }
+  }
+
   std::cout << "chunk manager ok" << std::endl;
   std::filesystem::remove(container);
   return 0;
