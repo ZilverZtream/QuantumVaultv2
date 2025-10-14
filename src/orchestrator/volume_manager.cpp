@@ -975,14 +975,42 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
 
-  if (parsed.epoch_value ==
-      std::numeric_limits<uint32_t>::max()) { // TSK024_Key_Rotation_and_Lifecycle_Management
+  const uint32_t old_epoch = parsed.epoch_value; // TSK024_Key_Rotation_and_Lifecycle_Management
+  const uint32_t warning_threshold = qv::core::EpochOverflowWarningThreshold(); // TSK071_Epoch_Overflow_Safety shared policy
+  const uint32_t unsafe_threshold = qv::core::EpochOverflowUnsafeThreshold();   // TSK071_Epoch_Overflow_Safety shared policy
+  if (qv::core::EpochRekeyWouldBeUnsafe(old_epoch)) {                           // TSK071_Epoch_Overflow_Safety guard unsafe increment
+    qv::orchestrator::Event refused{};                                          // TSK071_Epoch_Overflow_Safety refusal telemetry
+    refused.category = EventCategory::kSecurity;
+    refused.severity = EventSeverity::kError;
+    refused.event_id = "volume_epoch_rekey_refused";
+    refused.message = "Epoch counter too close to overflow";
+    refused.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+    refused.fields.emplace_back("epoch", std::to_string(old_epoch), FieldPrivacy::kPublic, true);
+    refused.fields.emplace_back("unsafe_threshold", std::to_string(unsafe_threshold), FieldPrivacy::kPublic, true);
+    refused.fields.emplace_back(
+        "remaining_epochs",
+        std::to_string(qv::core::kEpochOverflowHardLimit - old_epoch), FieldPrivacy::kPublic, true);
+    qv::orchestrator::EventBus::Instance().Publish(refused);
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
-    throw qv::Error{qv::ErrorDomain::State, 0, "Epoch counter overflow"};
+    throw qv::Error{qv::ErrorDomain::State, 0, "Epoch counter overflow risk"};
   }
 
-  const uint32_t old_epoch = parsed.epoch_value; // TSK024_Key_Rotation_and_Lifecycle_Management
-  const uint32_t new_epoch = old_epoch + 1;      // TSK024_Key_Rotation_and_Lifecycle_Management
+  if (qv::core::EpochRequiresOverflowWarning(old_epoch)) { // TSK071_Epoch_Overflow_Safety proactive telemetry
+    qv::orchestrator::Event warning{};                     // TSK071_Epoch_Overflow_Safety proactive telemetry
+    warning.category = EventCategory::kSecurity;
+    warning.severity = EventSeverity::kWarning;
+    warning.event_id = "volume_epoch_near_overflow";
+    warning.message = "Epoch counter approaching overflow margin";
+    warning.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+    warning.fields.emplace_back("epoch", std::to_string(old_epoch), FieldPrivacy::kPublic, true);
+    warning.fields.emplace_back("warning_threshold", std::to_string(warning_threshold), FieldPrivacy::kPublic, true);
+    warning.fields.emplace_back(
+        "remaining_epochs",
+        std::to_string(qv::core::kEpochOverflowHardLimit - old_epoch), FieldPrivacy::kPublic, true);
+    qv::orchestrator::EventBus::Instance().Publish(warning);
+  }
+
+  const uint32_t new_epoch = old_epoch + 1; // TSK024_Key_Rotation_and_Lifecycle_Management
 
   std::array<uint8_t, kPbkdfSaltSize>
       new_password_salt{}; // TSK036_PBKDF2_Argon2_Migration_Path

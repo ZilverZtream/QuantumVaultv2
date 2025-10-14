@@ -11,6 +11,7 @@
 #include <mutex>
 #include <new>      // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional> // TSK015
+#include <limits>   // TSK071_Epoch_Overflow_Safety exported thresholds
 #include <span>
 #include <string_view> // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <vector>
@@ -109,6 +110,16 @@ namespace qv::core {
     uint16_t length = 4;
     uint32_t epoch;
   };
+
+  inline constexpr uint32_t kEpochOverflowHardLimit =
+      std::numeric_limits<uint32_t>::max(); // TSK071_Epoch_Overflow_Safety share limit
+  inline constexpr uint32_t kEpochOverflowWarningMargin = 16u; // TSK071_Epoch_Overflow_Safety guard band
+  inline constexpr uint32_t kEpochOverflowUnsafeMargin = 1u;   // TSK071_Epoch_Overflow_Safety final slot reserved
+
+  uint32_t EpochOverflowWarningThreshold();     // TSK071_Epoch_Overflow_Safety exported helpers
+  uint32_t EpochOverflowUnsafeThreshold();      // TSK071_Epoch_Overflow_Safety exported helpers
+  bool EpochRequiresOverflowWarning(uint32_t epoch); // TSK071_Epoch_Overflow_Safety exported helpers
+  bool EpochRekeyWouldBeUnsafe(uint32_t epoch);      // TSK071_Epoch_Overflow_Safety exported helpers
 
   inline constexpr const char* RekeyReasonToString(NonceGenerator::RekeyReason reason) { // TSK015
     switch (reason) {

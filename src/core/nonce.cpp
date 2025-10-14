@@ -157,3 +157,24 @@ std::optional<NonceGenerator::NonceRecord> NonceGenerator::LastPersisted() const
   record.nonce = MakeNonceBytes(epoch_, record.counter);
   return record;
 }
+
+static_assert(kEpochOverflowWarningMargin < kEpochOverflowHardLimit,
+              "warning margin must be below hard limit"); // TSK071_Epoch_Overflow_Safety sanity guard
+static_assert(kEpochOverflowUnsafeMargin < kEpochOverflowHardLimit,
+              "unsafe margin must be below hard limit"); // TSK071_Epoch_Overflow_Safety sanity guard
+
+uint32_t qv::core::EpochOverflowWarningThreshold() { // TSK071_Epoch_Overflow_Safety shared policy
+  return kEpochOverflowHardLimit - kEpochOverflowWarningMargin;
+}
+
+uint32_t qv::core::EpochOverflowUnsafeThreshold() { // TSK071_Epoch_Overflow_Safety shared policy
+  return kEpochOverflowHardLimit - kEpochOverflowUnsafeMargin;
+}
+
+bool qv::core::EpochRequiresOverflowWarning(uint32_t epoch) { // TSK071_Epoch_Overflow_Safety shared policy
+  return epoch >= EpochOverflowWarningThreshold();
+}
+
+bool qv::core::EpochRekeyWouldBeUnsafe(uint32_t epoch) { // TSK071_Epoch_Overflow_Safety shared policy
+  return epoch >= EpochOverflowUnsafeThreshold();
+}
