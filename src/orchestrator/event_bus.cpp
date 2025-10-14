@@ -9,12 +9,14 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio> // TSK069_DoS_Resource_Exhaustion_Guards bounded escaping helpers
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <optional> // TSK069_DoS_Resource_Exhaustion_Guards enforce bounded serialization
 #include <random>
 #include <sstream>
 #include <string>
@@ -39,6 +41,95 @@ namespace {
 
 constexpr size_t kHmacSize = qv::crypto::HMAC_SHA256::TAG_SIZE; // TSK029
 constexpr int kSyslogFacility = 10;                             // LOG_AUTHPRIV // TSK029
+constexpr size_t kMaxEventBytes = 16 * 1024;                    // TSK069_DoS_Resource_Exhaustion_Guards cap serialized size
+constexpr auto kSyslogBackoffBase = std::chrono::milliseconds(200); // TSK069_DoS_Resource_Exhaustion_Guards
+constexpr auto kSyslogBackoffMax = std::chrono::seconds(30);        // TSK069_DoS_Resource_Exhaustion_Guards
+
+bool AppendWithLimit(std::string& out, std::string_view chunk, size_t limit) { // TSK069_DoS_Resource_Exhaustion_Guards
+  if (chunk.size() > limit - out.size()) {
+    return false;
+  }
+  out.append(chunk.data(), chunk.size());
+  return true;
+}
+
+std::chrono::steady_clock::duration ComputeBackoff(uint32_t exponent) { // TSK069_DoS_Resource_Exhaustion_Guards
+  auto clamped = std::min<uint32_t>(exponent, 10u);
+  auto scaled = kSyslogBackoffBase * (1u << clamped);
+  auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(kSyslogBackoffMax);
+  auto bounded = std::min(scaled, max_ms);
+  return std::chrono::duration_cast<std::chrono::steady_clock::duration>(bounded);
+}
+
+bool AppendEscapedWithLimit(std::string& out, std::string_view text, size_t limit) { // TSK069_DoS_Resource_Exhaustion_Guards
+  for (unsigned char c : text) {
+    switch (c) {
+    case '\\':
+      if (!AppendWithLimit(out, "\\\\", limit)) {
+        return false;
+      }
+      break;
+    case '"':
+      if (!AppendWithLimit(out, "\\\"", limit)) {
+        return false;
+      }
+      break;
+    case '\b':
+      if (!AppendWithLimit(out, "\\b", limit)) {
+        return false;
+      }
+      break;
+    case '\f':
+      if (!AppendWithLimit(out, "\\f", limit)) {
+        return false;
+      }
+      break;
+    case '\n':
+      if (!AppendWithLimit(out, "\\n", limit)) {
+        return false;
+      }
+      break;
+    case '\r':
+      if (!AppendWithLimit(out, "\\r", limit)) {
+        return false;
+      }
+      break;
+    case '\t':
+      if (!AppendWithLimit(out, "\\t", limit)) {
+        return false;
+      }
+      break;
+    default:
+      if (c < 0x20) {
+        char buffer[7];
+        std::snprintf(buffer, sizeof(buffer), "\\u%04x", static_cast<int>(c));
+        if (!AppendWithLimit(out, buffer, limit)) {
+          return false;
+        }
+      } else {
+        char plain = static_cast<char>(c);
+        if (!AppendWithLimit(out, std::string_view(&plain, 1), limit)) {
+          return false;
+        }
+      }
+      break;
+    }
+  }
+  return true;
+}
+
+Event BuildOversizeEvent(const Event& original) { // TSK069_DoS_Resource_Exhaustion_Guards redacted fallback
+  Event replacement;
+  replacement.category = EventCategory::kDiagnostics;
+  replacement.severity = EventSeverity::kWarning;
+  replacement.event_id = "event_too_large";
+  replacement.message = "Event payload exceeded logger limits";
+  if (!original.event_id.empty()) {
+    replacement.fields.emplace_back("original_event_id", original.event_id, FieldPrivacy::kHash);
+  }
+  replacement.fields.emplace_back("limit_bytes", std::to_string(kMaxEventBytes), FieldPrivacy::kPublic, true);
+  return replacement;
+}
 
 std::string EscapeJson(std::string_view text) { // TSK029
   std::string out;
@@ -163,20 +254,41 @@ ComputeChainedMac(const std::array<uint8_t, kHmacSize>& key,
       std::span<const uint8_t>(buffer.data(), buffer.size()));
 }
 
-std::string BuildEventJson(const Event& event, const std::string& timestamp) { // TSK029
-  std::ostringstream payload;
-  payload << '{';
-  payload << "\"ts\":\"" << EscapeJson(timestamp) << "\"";
-  payload << ",\"severity\":\"" << SeverityToString(event.severity) << "\"";
-  payload << ",\"category\":\"" << CategoryToString(event.category) << "\"";
+std::optional<std::string> BuildEventJson(const Event& event, const std::string& timestamp, // TSK069_DoS_Resource_Exhaustion_Guards
+                                          size_t max_bytes) {
+  std::string payload;
+  payload.reserve(std::min<size_t>(max_bytes, 256));
+  if (!AppendWithLimit(payload, "{\"ts\":\"", max_bytes) ||
+      !AppendEscapedWithLimit(payload, timestamp, max_bytes) ||
+      !AppendWithLimit(payload, "\"", max_bytes) ||
+      !AppendWithLimit(payload, ",\"severity\":\"", max_bytes) ||
+      !AppendWithLimit(payload, SeverityToString(event.severity), max_bytes) ||
+      !AppendWithLimit(payload, "\"", max_bytes) ||
+      !AppendWithLimit(payload, ",\"category\":\"", max_bytes) ||
+      !AppendWithLimit(payload, CategoryToString(event.category), max_bytes) ||
+      !AppendWithLimit(payload, "\"", max_bytes)) {
+    return std::nullopt;
+  }
   if (!event.event_id.empty()) {
-    payload << ",\"event_id\":\"" << EscapeJson(event.event_id) << "\"";
+    if (!AppendWithLimit(payload, ",\"event_id\":\"", max_bytes) ||
+        !AppendEscapedWithLimit(payload, event.event_id, max_bytes) ||
+        !AppendWithLimit(payload, "\"", max_bytes)) {
+      return std::nullopt;
+    }
   }
   if (!event.message.empty()) {
-    payload << ",\"message\":\"" << EscapeJson(event.message) << "\"";
+    if (!AppendWithLimit(payload, ",\"message\":\"", max_bytes) ||
+        !AppendEscapedWithLimit(payload, event.message, max_bytes) ||
+        !AppendWithLimit(payload, "\"", max_bytes)) {
+      return std::nullopt;
+    }
   }
   for (const auto& field : event.fields) {
-    payload << ",\"" << EscapeJson(field.key) << "\":";
+    if (!AppendWithLimit(payload, ",\"", max_bytes) ||
+        !AppendEscapedWithLimit(payload, field.key, max_bytes) ||
+        !AppendWithLimit(payload, "\":", max_bytes)) {
+      return std::nullopt;
+    }
     std::string sanitized = field.value;
     if (field.privacy == FieldPrivacy::kRedact) {
       sanitized = "[REDACTED]"; // TSK029 ensure sensitive data is masked
@@ -184,13 +296,21 @@ std::string BuildEventJson(const Event& event, const std::string& timestamp) { /
       sanitized = HashForTelemetry(sanitized);
     }
     if (field.numeric && field.privacy == FieldPrivacy::kPublic) {
-      payload << sanitized;
+      if (!AppendWithLimit(payload, sanitized, max_bytes)) {
+        return std::nullopt;
+      }
     } else {
-      payload << "\"" << EscapeJson(sanitized) << "\"";
+      if (!AppendWithLimit(payload, "\"", max_bytes) ||
+          !AppendEscapedWithLimit(payload, sanitized, max_bytes) ||
+          !AppendWithLimit(payload, "\"", max_bytes)) {
+        return std::nullopt;
+      }
     }
   }
-  payload << '}';
-  return payload.str();
+  if (!AppendWithLimit(payload, "}", max_bytes)) {
+    return std::nullopt;
+  }
+  return payload;
 }
 
 int SeverityToSyslog(EventSeverity severity) { // TSK029
@@ -374,47 +494,84 @@ bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& seq
   std::array<uint8_t, kHmacSize> previous{};
   uint64_t seq = 0;
   std::string line;
-  while (std::getline(in, line)) {
+  line.reserve(kMaxEventBytes); // TSK069_DoS_Resource_Exhaustion_Guards
+  while (true) {
+    line.clear();
+    bool truncated = false;
+    bool saw_char = false;
+    bool eof_reached = false;
+    while (true) {
+      int ch = in.get();
+      if (ch == std::char_traits<char>::eof()) {
+        if (in.bad()) {
+          return false;
+        }
+        eof_reached = true;
+        break;
+      }
+      saw_char = true;
+      if (ch == '\n') {
+        break;
+      }
+      if (!truncated) {
+        if (line.size() >= kMaxEventBytes) {
+          truncated = true;
+        } else {
+          line.push_back(static_cast<char>(ch));
+        }
+      }
+    }
+    if (!saw_char && eof_reached) {
+      break;
+    }
+    if (truncated) { // TSK069_DoS_Resource_Exhaustion_Guards
+      return false;
+    }
     if (line.empty()) {
+      if (eof_reached) {
+        break;
+      }
       continue;
     }
+    std::string_view line_view(line);
     constexpr std::string_view kMacMarker = ",\"audit_mac\":\"";
     constexpr std::string_view kSeqMarker = "\"audit_seq\":";
-    auto mac_pos = line.find(kMacMarker.data(), 0, kMacMarker.size());
+    auto mac_pos = line_view.find(kMacMarker.data(), 0, kMacMarker.size());
     if (mac_pos == std::string::npos) {
       return false;
     }
     auto mac_start = mac_pos + kMacMarker.size();
-    auto mac_end = line.find('"', mac_start);
+    auto mac_end = line_view.find('"', mac_start);
     if (mac_end == std::string::npos) {
       return false;
     }
     std::array<uint8_t, kHmacSize> parsed{};
-    if (!HexDecode(std::string_view(line.data() + mac_start, mac_end - mac_start), parsed)) {
+    if (!HexDecode(line_view.substr(mac_start, mac_end - mac_start), parsed)) {
       return false;
     }
-    auto seq_pos = line.find(kSeqMarker.data(), 0, kSeqMarker.size());
+    auto seq_pos = line_view.find(kSeqMarker.data(), 0, kSeqMarker.size());
     if (seq_pos == std::string::npos) {
       return false;
     }
     seq_pos += kSeqMarker.size();
     size_t seq_end = seq_pos;
-    while (seq_end < line.size() && std::isdigit(static_cast<unsigned char>(line[seq_end]))) {
+    while (seq_end < line_view.size() &&
+           std::isdigit(static_cast<unsigned char>(line_view[seq_end]))) {
       ++seq_end;
     }
     if (seq_end == seq_pos) {
       return false;
     }
     uint64_t parsed_seq = 0;
-    auto [ptr, ec] = std::from_chars(line.data() + seq_pos, line.data() + seq_end, parsed_seq);
-    if (ec != std::errc() || ptr != line.data() + seq_end) {
+    auto [ptr, ec] = std::from_chars(line_view.data() + seq_pos, line_view.data() + seq_end, parsed_seq);
+    if (ec != std::errc() || ptr != line_view.data() + seq_end) {
       return false;
     }
     uint64_t expected_seq = seq + 1;
     if (parsed_seq != expected_seq) {
       return false;
     }
-    std::string canonical = line.substr(0, mac_pos);
+    std::string canonical(line_view.substr(0, mac_pos));
     canonical.push_back('}');
     auto expected_mac = ComputeChainedMac(hmac_key_, previous, expected_seq, canonical);
     if (expected_mac != parsed) {
@@ -422,6 +579,9 @@ bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& seq
     }
     previous = expected_mac;
     seq = expected_seq;
+    if (eof_reached) {
+      break;
+    }
   }
   mac = previous;
   sequence = seq;
@@ -474,12 +634,16 @@ void JsonLineLogger::Log(const Event& event) { // TSK029
   std::lock_guard<std::mutex> guard(mutex_);
   EnsureKey();
   auto timestamp = FormatTimestamp(std::chrono::system_clock::now());
-  auto base = BuildEventJson(event, timestamp);
-  if (base.empty()) {
-    return;
+  auto base = BuildEventJson(event, timestamp, kMaxEventBytes); // TSK069_DoS_Resource_Exhaustion_Guards
+  if (!base) {
+    Event replacement = BuildOversizeEvent(event); // TSK069_DoS_Resource_Exhaustion_Guards
+    base = BuildEventJson(replacement, timestamp, kMaxEventBytes);
+    if (!base) {
+      return;
+    }
   }
   const uint64_t next_sequence = entry_counter_ + 1;
-  std::string prefix = base.substr(0, base.size() - 1);
+  std::string prefix = base->substr(0, base->size() - 1);
   prefix.append(",\"audit_seq\":");
   prefix.append(std::to_string(next_sequence));
   std::string canonical = prefix;
@@ -536,6 +700,8 @@ class SyslogPublisher { // TSK029
   std::string hostname_ = DetectHostname();
   std::string app_name_ = "quantumvault";
   std::string procid_ = DetectProcessId();
+  std::chrono::steady_clock::time_point next_allowed_send_{}; // TSK069_DoS_Resource_Exhaustion_Guards
+  uint32_t backoff_exp_{0};                                   // TSK069_DoS_Resource_Exhaustion_Guards
 };
 
 SyslogPublisher::~SyslogPublisher() { // TSK029
@@ -635,12 +801,23 @@ void SyslogPublisher::Publish(const Event& event) { // TSK029
   if (!configured_) {
     return;
   }
-    const auto timestamp = FormatSyslogTimestamp(std::chrono::system_clock::now()); // TSK035_Platform_Specific_Security_Integration
-  const auto payload = BuildEventJson(event, timestamp);
+  const auto timestamp = FormatSyslogTimestamp(std::chrono::system_clock::now()); // TSK035_Platform_Specific_Security_Integration
+  auto payload = BuildEventJson(event, timestamp, kMaxEventBytes);                // TSK069_DoS_Resource_Exhaustion_Guards
+  if (!payload) {
+    auto replacement = BuildOversizeEvent(event); // TSK069_DoS_Resource_Exhaustion_Guards
+    payload = BuildEventJson(replacement, timestamp, kMaxEventBytes);
+    if (!payload) {
+      return;
+    }
+  }
+  auto now = std::chrono::steady_clock::now();
+  if (now < next_allowed_send_) { // TSK069_DoS_Resource_Exhaustion_Guards
+    return;
+  }
   const int pri = kSyslogFacility * 8 + SeverityToSyslog(event.severity);
   std::ostringstream oss;
   oss << '<' << pri << ">1 " << timestamp << ' ' << hostname_ << ' ' << app_name_ << ' '
-      << procid_ << ' ' << (event.event_id.empty() ? "-" : event.event_id) << " - " << payload;
+      << procid_ << ' ' << (event.event_id.empty() ? "-" : event.event_id) << " - " << *payload;
   auto message = oss.str();
 #if defined(_WIN32)
   if (socket_ == INVALID_SOCKET) {
@@ -650,6 +827,11 @@ void SyslogPublisher::Publish(const Event& event) { // TSK029
                       reinterpret_cast<const sockaddr*>(&remote_), remote_len_);
   if (sent == SOCKET_ERROR) {
     std::clog << "{\"event\":\"syslog_error\",\"message\":\"sendto failed\"}" << std::endl;
+    next_allowed_send_ = now + ComputeBackoff(backoff_exp_);
+    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
+  } else {
+    backoff_exp_ = 0;
+    next_allowed_send_ = now;
   }
 #else
   if (socket_ < 0) {
@@ -659,6 +841,11 @@ void SyslogPublisher::Publish(const Event& event) { // TSK029
                        reinterpret_cast<const sockaddr*>(&remote_), remote_len_);
   if (sent < 0) {
     std::clog << "{\"event\":\"syslog_error\",\"message\":\"sendto failed\"}" << std::endl;
+    next_allowed_send_ = now + ComputeBackoff(backoff_exp_);
+    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
+  } else {
+    backoff_exp_ = 0;
+    next_allowed_send_ = now;
   }
 #endif
 }
