@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional> // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV tracking
 #include <thread>
 #include <vector>
 #include <span>
@@ -30,6 +31,10 @@
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/orchestrator/event_bus.h"  // TSK019
 #include "qv/security/zeroizer.h"
+
+#if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2 // TSK036_PBKDF2_Argon2_Migration_Path
+#include <argon2.h>
+#endif
 
 using namespace qv::orchestrator;
 
@@ -168,6 +173,7 @@ constexpr size_t kHistogramBuckets = 512;
 constexpr uint64_t kLogIntervalNs = std::chrono::seconds(2).count();
 constexpr uint16_t kTlvTypePbkdf2 = 0x1001;                                     // TSK013
 constexpr uint16_t kTlvTypeHybridSalt = 0x1002;                                 // TSK013
+constexpr uint16_t kTlvTypeArgon2 = 0x1003;                                     // TSK036_PBKDF2_Argon2_Migration_Path
 constexpr uint16_t kTlvTypeEpoch = 0x4E4F;                                      // matches EpochTLV
 constexpr uint16_t kTlvTypePqc = 0x7051;
 constexpr uint16_t kTlvTypeReservedV2 = 0x7F02;                                 // TSK013
@@ -218,10 +224,28 @@ struct ReservedV2Tlv { // TSK013
 static_assert(sizeof(VolumeHeader) == 32, "unexpected volume header size");        // TSK013
 static_assert(sizeof(ReservedV2Tlv) == 36, "reserved TLV size mismatch");          // TSK013
 
-constexpr size_t kSerializedHeaderBytes = sizeof(VolumeHeader) + 4 + (4 + kPbkdfSaltSize) +
+constexpr size_t kPasswordTlvBytes =
+    4 + std::max<size_t>(4 + kPbkdfSaltSize, sizeof(uint32_t) * 6 + kPbkdfSaltSize); // TSK036_PBKDF2_Argon2_Migration_Path
+
+constexpr size_t kSerializedHeaderBytes = sizeof(VolumeHeader) + kPasswordTlvBytes +
                                           4 + kHybridSaltSize + sizeof(qv::core::EpochTLV) +
                                           sizeof(qv::core::PQC_KEM_TLV) + sizeof(ReservedV2Tlv); // TSK013
 constexpr size_t kTotalHeaderBytes = kSerializedHeaderBytes + kHeaderMacSize;       // TSK013
+
+enum class PasswordKdf { // TSK036_PBKDF2_Argon2_Migration_Path
+  kPbkdf2,
+  kArgon2id
+};
+
+struct Argon2Config { // TSK036_PBKDF2_Argon2_Migration_Path
+  uint32_t version{1};
+  uint32_t time_cost{3};
+  uint32_t memory_cost_kib{64u * 1024u};
+  uint32_t parallelism{4};
+  uint32_t hash_length{32};
+  uint32_t target_ms{500};
+  std::array<uint8_t, kPbkdfSaltSize> salt{};
+};
 
 struct ParsedHeader { // TSK013
   VolumeHeader header{};
@@ -233,7 +257,10 @@ struct ParsedHeader { // TSK013
   uint32_t epoch{0};
   std::array<uint8_t, sizeof(qv::core::EpochTLV)> epoch_tlv_bytes{};
   qv::core::PQC_KEM_TLV pqc{};
+  Argon2Config argon2{};                 // TSK036_PBKDF2_Argon2_Migration_Path
+  PasswordKdf algorithm{PasswordKdf::kPbkdf2}; // TSK036_PBKDF2_Argon2_Migration_Path
   bool have_pbkdf{false};
+  bool have_argon2{false};              // TSK036_PBKDF2_Argon2_Migration_Path
   bool have_hybrid{false};
   bool have_epoch{false};
   bool have_pqc{false};
@@ -290,6 +317,35 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         } else {
           parsed.have_pbkdf = true;
         }
+        parsed.algorithm = PasswordKdf::kPbkdf2; // TSK036_PBKDF2_Argon2_Migration_Path
+        break;
+      }
+      case kTlvTypeArgon2: { // TSK036_PBKDF2_Argon2_Migration_Path
+        if (length != sizeof(uint32_t) * 6 + kPbkdfSaltSize) {
+          parsed.have_argon2 = false;
+          break;
+        }
+        std::memcpy(&parsed.argon2.version, payload.data(), sizeof(parsed.argon2.version));
+        std::memcpy(&parsed.argon2.time_cost, payload.data() + sizeof(uint32_t), sizeof(parsed.argon2.time_cost));
+        std::memcpy(&parsed.argon2.memory_cost_kib, payload.data() + sizeof(uint32_t) * 2,
+                    sizeof(parsed.argon2.memory_cost_kib));
+        std::memcpy(&parsed.argon2.parallelism, payload.data() + sizeof(uint32_t) * 3,
+                    sizeof(parsed.argon2.parallelism));
+        std::memcpy(&parsed.argon2.hash_length, payload.data() + sizeof(uint32_t) * 4,
+                    sizeof(parsed.argon2.hash_length));
+        std::memcpy(&parsed.argon2.target_ms, payload.data() + sizeof(uint32_t) * 5,
+                    sizeof(parsed.argon2.target_ms));
+        parsed.argon2.version = FromLittleEndian32(parsed.argon2.version);
+        parsed.argon2.time_cost = FromLittleEndian32(parsed.argon2.time_cost);
+        parsed.argon2.memory_cost_kib = FromLittleEndian32(parsed.argon2.memory_cost_kib);
+        parsed.argon2.parallelism = FromLittleEndian32(parsed.argon2.parallelism);
+        parsed.argon2.hash_length = FromLittleEndian32(parsed.argon2.hash_length);
+        parsed.argon2.target_ms = FromLittleEndian32(parsed.argon2.target_ms);
+        std::memcpy(parsed.argon2.salt.data(), payload.data() + sizeof(uint32_t) * 6,
+                    parsed.argon2.salt.size());
+        std::copy(parsed.argon2.salt.begin(), parsed.argon2.salt.end(), parsed.pbkdf_salt.begin());
+        parsed.have_argon2 = true;
+        parsed.algorithm = PasswordKdf::kArgon2id;
         break;
       }
       case kTlvTypeHybridSalt: {
@@ -346,7 +402,8 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
     offset += length;
   }
 
-  parsed.valid = magic_ok && version_ok && parsed.have_pbkdf && parsed.have_hybrid && parsed.have_pqc;
+  parsed.valid = magic_ok && version_ok && (parsed.have_pbkdf || parsed.have_argon2) &&
+                parsed.have_hybrid && parsed.have_pqc;
   return parsed;
 }
 
@@ -354,30 +411,50 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
                                           const ParsedHeader& parsed) { // TSK013
   std::vector<uint8_t> pass_bytes(password.begin(), password.end());
   std::array<uint8_t, 32> output{};
-  std::array<uint8_t, 20> block{};
-  std::memcpy(block.data(), parsed.pbkdf_salt.data(), parsed.pbkdf_salt.size());
-  block[16] = 0;
-  block[17] = 0;
-  block[18] = 0;
-  block[19] = 1;
+  std::span<const uint8_t> password_span(pass_bytes.data(), pass_bytes.size());
 
-  auto u = qv::crypto::HMAC_SHA256::Compute(pass_bytes,
-                                            std::span<const uint8_t>(block.data(), block.size()));
-  output = u;
-  auto iter = u;
-  for (uint32_t i = 1; i < parsed.pbkdf_iterations; ++i) {
-    iter = qv::crypto::HMAC_SHA256::Compute(pass_bytes,
-                                            std::span<const uint8_t>(iter.data(), iter.size()));
-    for (size_t j = 0; j < output.size(); ++j) {
-      output[j] ^= iter[j];
+  if (parsed.algorithm == PasswordKdf::kArgon2id) { // TSK036_PBKDF2_Argon2_Migration_Path
+#if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
+    if (parsed.argon2.hash_length != output.size()) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unsupported Argon2 hash length"};
     }
+    int rc = argon2id_hash_raw(parsed.argon2.time_cost, parsed.argon2.memory_cost_kib,
+                               parsed.argon2.parallelism, password_span.data(), password_span.size(),
+                               parsed.argon2.salt.data(), parsed.argon2.salt.size(), output.data(),
+                               output.size());
+    if (rc != ARGON2_OK) {
+      throw qv::Error{qv::ErrorDomain::Crypto, rc, "Argon2id derivation failed"};
+    }
+#else
+    throw qv::Error{qv::ErrorDomain::Dependency, 0,
+                    "Argon2id support not available in this build"};
+#endif
+  } else {
+    std::array<uint8_t, 20> block{};
+    std::memcpy(block.data(), parsed.pbkdf_salt.data(), parsed.pbkdf_salt.size());
+    block[16] = 0;
+    block[17] = 0;
+    block[18] = 0;
+    block[19] = 1;
+
+    auto u = qv::crypto::HMAC_SHA256::Compute(password_span,
+                                              std::span<const uint8_t>(block.data(), block.size()));
+    output = u;
+    auto iter = u;
+    for (uint32_t i = 1; i < parsed.pbkdf_iterations; ++i) {
+      iter = qv::crypto::HMAC_SHA256::Compute(password_span,
+                                              std::span<const uint8_t>(iter.data(), iter.size()));
+      for (size_t j = 0; j < output.size(); ++j) {
+        output[j] ^= iter[j];
+      }
+    }
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(iter.data(), iter.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(u.data(), u.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(block.data(), block.size()));
   }
-  qv::security::Zeroizer::Wipe(std::span<uint8_t>(iter.data(), iter.size()));
-  qv::security::Zeroizer::Wipe(std::span<uint8_t>(u.data(), u.size()));
   if (!pass_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(pass_bytes.data(), pass_bytes.size()));
   }
-  qv::security::Zeroizer::Wipe(std::span<uint8_t>(block.data(), block.size()));
   return output;
 }
 

@@ -68,6 +68,12 @@ if (UNIX AND NOT APPLE AND PkgConfig_FOUND)
   endif()
 endif()
 
+find_path(ARGON2_INCLUDE_DIR argon2.h) # TSK036_PBKDF2_Argon2_Migration_Path locate headers
+find_library(ARGON2_LIBRARY argon2)    # TSK036_PBKDF2_Argon2_Migration_Path locate library
+if (NOT ARGON2_INCLUDE_DIR OR NOT ARGON2_LIBRARY)
+  message(FATAL_ERROR "libargon2 (argon2.h) is required for TSK036_PBKDF2_Argon2_Migration_Path")
+endif()
+
 set(qv_have_sodium OFF)
 set(qv_sodium_target "")
 if (TARGET sodium::sodium)
@@ -120,7 +126,9 @@ target_include_directories(qv_orchestrator
       $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 ) # TSK008
-target_link_libraries(qv_orchestrator PUBLIC qv_core)
+target_link_libraries(qv_orchestrator PUBLIC qv_core ${ARGON2_LIBRARY})
+target_include_directories(qv_orchestrator PRIVATE ${ARGON2_INCLUDE_DIR}) # TSK036_PBKDF2_Argon2_Migration_Path headers
+target_compile_definitions(qv_orchestrator PUBLIC QV_HAVE_ARGON2=1)       # TSK036_PBKDF2_Argon2_Migration_Path flag
 # TSK005 platform signature verification dependencies
 if (WIN32)
   target_link_libraries(qv_orchestrator PRIVATE Wintrust Crypt32)

@@ -3,16 +3,19 @@
 #include <algorithm> // TSK033 skip/zero TLV payloads
 #include <array>
 #include <cerrno>
+#include <chrono>    // TSK036_PBKDF2_Argon2_Migration_Path adaptive calibration
 #include <cstring>
 #include <fstream>
-#include <iomanip>  // TSK029
-#include <iterator> // TSK024_Key_Rotation_and_Lifecycle_Management
-#include <limits>   // TSK024_Key_Rotation_and_Lifecycle_Management
+#include <functional> // TSK036_PBKDF2_Argon2_Migration_Path progress callbacks
+#include <iomanip>    // TSK029
+#include <iterator>   // TSK024_Key_Rotation_and_Lifecycle_Management
+#include <limits>     // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <random>
 #include <span>
-#include <sstream>    // TSK033 version formatting
+#include <sstream>      // TSK033 version formatting
 #include <string_view>
 #include <vector>
+#include <optional>     // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV control
 
 #include "qv/common.h"
 #include "qv/core/nonce.h"
@@ -23,6 +26,10 @@
 #include "qv/orchestrator/event_bus.h" // TSK024_Key_Rotation_and_Lifecycle_Management
 #include "qv/security/zeroizer.h"
 
+#if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2 // TSK036_PBKDF2_Argon2_Migration_Path
+#include <argon2.h>
+#endif
+
 using namespace qv::orchestrator;
 
 namespace {
@@ -31,13 +38,31 @@ namespace {
   constexpr uint32_t kHeaderVersion = VolumeManager::kLatestHeaderVersion;                  // TSK033 align serialization with published target
   constexpr uint16_t kTlvTypePbkdf2 = 0x1001;                                              // TSK013
   constexpr uint16_t kTlvTypeHybridSalt = 0x1002;                                          // TSK013
+  constexpr uint16_t kTlvTypeArgon2 = 0x1003;                                              // TSK036_PBKDF2_Argon2_Migration_Path
   constexpr uint16_t kTlvTypeEpoch = 0x4E4F; // matches EpochTLV
   constexpr uint16_t kTlvTypePqcKem = 0x7051;
   constexpr uint16_t kTlvTypeReservedV2 = 0x7F02; // TSK033 reserved for ACL metadata staging
   constexpr uint32_t kDefaultFlags = 0;
-  constexpr uint32_t kDefaultPbkdfIterations = 200'000; // TSK013
+  constexpr uint32_t kDefaultPbkdfIterations = 600'000; // TSK036_PBKDF2_Argon2_Migration_Path baseline
+  constexpr uint32_t kBenchmarkIterations = 100'000;    // TSK036_PBKDF2_Argon2_Migration_Path calibration sample size
   constexpr size_t kPbkdfSaltSize = 16;
   constexpr size_t kHybridSaltSize = 32;
+  constexpr std::chrono::milliseconds kDefaultTargetDuration{500}; // TSK036_PBKDF2_Argon2_Migration_Path
+  constexpr uint32_t kMinPbkdfIterations = 50'000;                 // TSK036_PBKDF2_Argon2_Migration_Path floor
+  constexpr uint32_t kMaxPbkdfIterations = 8'000'000;              // TSK036_PBKDF2_Argon2_Migration_Path ceiling
+
+  using PasswordKdf = VolumeManager::PasswordKdf;                                   // TSK036_PBKDF2_Argon2_Migration_Path
+  using ProgressCallback = VolumeManager::ProgressCallback;                         // TSK036_PBKDF2_Argon2_Migration_Path
+
+  struct Argon2Config { // TSK036_PBKDF2_Argon2_Migration_Path serialized TLV payload
+    uint32_t version{1};
+    uint32_t time_cost{3};
+    uint32_t memory_cost_kib{64u * 1024u};
+    uint32_t parallelism{4};
+    uint32_t hash_length{32};
+    uint32_t target_ms{static_cast<uint32_t>(kDefaultTargetDuration.count())};
+    std::array<uint8_t, kPbkdfSaltSize> salt{};
+  };
 
 #if defined(_MSC_VER)
   constexpr uint16_t ToLittleEndian16(uint16_t value) {
@@ -107,7 +132,8 @@ namespace {
 
   std::array<uint8_t, 32> DerivePasswordKey(std::span<const uint8_t> password,
                                             const std::array<uint8_t, kPbkdfSaltSize>& salt,
-                                            uint32_t iterations) { // TSK013
+                                            uint32_t iterations,
+                                            ProgressCallback progress = {}) { // TSK036_PBKDF2_Argon2_Migration_Path
     std::array<uint8_t, 32> output{};
     std::array<uint8_t, 20> block{};
     std::memcpy(block.data(), salt.data(), salt.size());
@@ -116,22 +142,58 @@ namespace {
     block[18] = 0;
     block[19] = 1;
 
+    iterations = std::max<uint32_t>(iterations, 1u);                       // TSK036_PBKDF2_Argon2_Migration_Path guard zero
+
     auto u = qv::crypto::HMAC_SHA256::Compute(password,
                                               std::span<const uint8_t>(block.data(), block.size()));
     output = u;
     auto iter = u;
+    if (progress) {
+      progress(1, iterations);
+    }
     for (uint32_t i = 1; i < iterations; ++i) {
       iter = qv::crypto::HMAC_SHA256::Compute(password,
                                               std::span<const uint8_t>(iter.data(), iter.size()));
       for (size_t j = 0; j < output.size(); ++j) {
         output[j] ^= iter[j];
       }
+
+      if (progress && (i + 1) % 10'000 == 0) {
+        progress(i + 1, iterations);
+      }
     }
 
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(iter.data(), iter.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(u.data(), u.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(block.data(), block.size()));
+    if (progress && iterations % 10'000 != 0) {
+      progress(iterations, iterations);
+    }
     return output;
+  }
+
+  std::array<uint8_t, 32> DerivePasswordKeyArgon2id(std::span<const uint8_t> password,
+                                                    const Argon2Config& config) { // TSK036_PBKDF2_Argon2_Migration_Path
+#if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
+    std::array<uint8_t, 32> output{};
+    if (config.hash_length != output.size()) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unsupported Argon2 hash length"};
+    }
+    int rc = argon2id_hash_raw(static_cast<uint32_t>(config.time_cost),
+                               static_cast<uint32_t>(config.memory_cost_kib),
+                               static_cast<uint32_t>(config.parallelism),
+                               password.data(), password.size(), config.salt.data(), config.salt.size(),
+                               output.data(), output.size());
+    if (rc != ARGON2_OK) {
+      throw qv::Error{qv::ErrorDomain::Crypto, rc, "Argon2id derivation failed"};
+    }
+    return output;
+#else
+    (void)password;
+    (void)config;
+    throw qv::Error{qv::ErrorDomain::Dependency, 0,
+                    "Argon2id support not available in this build"};
+#endif
   }
 
   std::array<uint8_t, 32> DeriveHeaderMacKey(
@@ -200,12 +262,15 @@ namespace {
     AppendRaw(out, le);
   }
 
-  struct ParsedHeader {               // TSK024_Key_Rotation_and_Lifecycle_Management
-    VolumeHeader header{};            // TSK024_Key_Rotation_and_Lifecycle_Management
-    uint32_t header_version{0};       // TSK024_Key_Rotation_and_Lifecycle_Management
-    uint32_t pbkdf_iterations{0};     // TSK024_Key_Rotation_and_Lifecycle_Management
+  struct ParsedHeader {                        // TSK024_Key_Rotation_and_Lifecycle_Management
+    VolumeHeader header{};                     // TSK024_Key_Rotation_and_Lifecycle_Management
+    uint32_t header_version{0};                // TSK024_Key_Rotation_and_Lifecycle_Management
+    PasswordKdf algorithm{PasswordKdf::kPbkdf2}; // TSK036_PBKDF2_Argon2_Migration_Path
+    uint32_t pbkdf_iterations{0};              // TSK024_Key_Rotation_and_Lifecycle_Management
     std::array<uint8_t, kPbkdfSaltSize>
-        pbkdf_salt{}; // TSK024_Key_Rotation_and_Lifecycle_Management
+        pbkdf_salt{}; // TSK036_PBKDF2_Argon2_Migration_Path shared salt storage
+    Argon2Config argon2{};                     // TSK036_PBKDF2_Argon2_Migration_Path
+    bool have_argon2{false};                   // TSK036_PBKDF2_Argon2_Migration_Path
     std::array<uint8_t, kHybridSaltSize>
         hybrid_salt{};                      // TSK024_Key_Rotation_and_Lifecycle_Management
     qv::core::EpochTLV epoch_tlv{};         // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -235,8 +300,9 @@ namespace {
   }
 
   std::vector<uint8_t> SerializeHeaderPayload(
-      const VolumeHeader& header, uint32_t pbkdf_iterations,
-      const std::array<uint8_t, kPbkdfSaltSize>& pbkdf_salt,
+      const VolumeHeader& header, PasswordKdf algorithm, uint32_t pbkdf_iterations,
+      const std::array<uint8_t, kPbkdfSaltSize>& password_salt,
+      const std::optional<Argon2Config>& argon2,
       const std::array<uint8_t, kHybridSaltSize>& hybrid_salt, const qv::core::EpochTLV& epoch,
       const qv::core::PQC_KEM_TLV& kem_blob,
       const ReservedV2Tlv& reserved) { // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -245,13 +311,26 @@ namespace {
 
     AppendRaw(serialized, header); // TSK024_Key_Rotation_and_Lifecycle_Management
 
-    AppendUint16(serialized, kTlvTypePbkdf2); // TSK024_Key_Rotation_and_Lifecycle_Management
-    AppendUint16(serialized,
-                 static_cast<uint16_t>(
-                     4 + pbkdf_salt.size()));   // TSK024_Key_Rotation_and_Lifecycle_Management
-    AppendUint32(serialized, pbkdf_iterations); // TSK024_Key_Rotation_and_Lifecycle_Management
-    serialized.insert(serialized.end(), pbkdf_salt.begin(),
-                      pbkdf_salt.end()); // TSK024_Key_Rotation_and_Lifecycle_Management
+    if (algorithm == PasswordKdf::kPbkdf2) { // TSK036_PBKDF2_Argon2_Migration_Path
+      AppendUint16(serialized, kTlvTypePbkdf2);
+      AppendUint16(serialized, static_cast<uint16_t>(4 + password_salt.size()));
+      AppendUint32(serialized, pbkdf_iterations);
+      serialized.insert(serialized.end(), password_salt.begin(), password_salt.end());
+    } else if (algorithm == PasswordKdf::kArgon2id) { // TSK036_PBKDF2_Argon2_Migration_Path
+      if (!argon2) {
+        throw qv::Error{qv::ErrorDomain::Internal, 0, "Missing Argon2 configuration"};
+      }
+      AppendUint16(serialized, kTlvTypeArgon2);
+      constexpr uint16_t kArgon2PayloadSize = static_cast<uint16_t>(sizeof(uint32_t) * 6 + kPbkdfSaltSize);
+      AppendUint16(serialized, kArgon2PayloadSize);
+      AppendUint32(serialized, argon2->version);
+      AppendUint32(serialized, argon2->time_cost);
+      AppendUint32(serialized, argon2->memory_cost_kib);
+      AppendUint32(serialized, argon2->parallelism);
+      AppendUint32(serialized, argon2->hash_length);
+      AppendUint32(serialized, argon2->target_ms);
+      serialized.insert(serialized.end(), argon2->salt.begin(), argon2->salt.end());
+    }
 
     AppendUint16(serialized, kTlvTypeHybridSalt); // TSK024_Key_Rotation_and_Lifecycle_Management
     AppendUint16(
@@ -287,6 +366,35 @@ namespace {
     }
 
     return serialized; // TSK024_Key_Rotation_and_Lifecycle_Management
+  }
+
+  uint32_t DeterminePbkdfIterations(std::span<const uint8_t> password,
+                                     const std::array<uint8_t, kPbkdfSaltSize>& salt,
+                                     const VolumeManager::KdfPolicy& policy) { // TSK036_PBKDF2_Argon2_Migration_Path
+    if (policy.iteration_override) {
+      return std::clamp<uint32_t>(*policy.iteration_override, kMinPbkdfIterations, kMaxPbkdfIterations);
+    }
+    auto baseline = std::max<uint32_t>(kBenchmarkIterations, 1u);
+    auto start = std::chrono::steady_clock::now();
+    auto sample = DerivePasswordKey(password, salt, baseline);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(sample.data(), sample.size()));
+    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+    if (elapsed_ns <= 0) {
+      return kDefaultPbkdfIterations;
+    }
+    auto target_ns = std::max<int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(policy.target_duration).count(), 1);
+    long double per_iter_ns = static_cast<long double>(elapsed_ns) / static_cast<long double>(baseline);
+    if (per_iter_ns <= 0.0L) {
+      return kDefaultPbkdfIterations;
+    }
+    auto computed = static_cast<uint64_t>(static_cast<long double>(target_ns) / per_iter_ns);
+    if (computed == 0) {
+      computed = kMinPbkdfIterations;
+    }
+    computed = std::clamp<uint64_t>(computed, kMinPbkdfIterations, kMaxPbkdfIterations);
+    return static_cast<uint32_t>(computed);
   }
 
   ParsedHeader
@@ -352,6 +460,32 @@ namespace {
         }
         std::memcpy(parsed.pbkdf_salt.data(), value + sizeof(uint32_t), salt_bytes);
         have_pbkdf = true;
+        parsed.algorithm = PasswordKdf::kPbkdf2; // TSK036_PBKDF2_Argon2_Migration_Path
+        break;
+      }
+      case kTlvTypeArgon2: { // TSK036_PBKDF2_Argon2_Migration_Path
+        constexpr size_t kExpectedLength = sizeof(uint32_t) * 6 + kPbkdfSaltSize;
+        if (length != kExpectedLength) {
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "Argon2 TLV malformed"};
+        }
+        Argon2Config cfg{};
+        std::memcpy(&cfg.version, value, sizeof(cfg.version));
+        std::memcpy(&cfg.time_cost, value + sizeof(uint32_t), sizeof(cfg.time_cost));
+        std::memcpy(&cfg.memory_cost_kib, value + sizeof(uint32_t) * 2, sizeof(cfg.memory_cost_kib));
+        std::memcpy(&cfg.parallelism, value + sizeof(uint32_t) * 3, sizeof(cfg.parallelism));
+        std::memcpy(&cfg.hash_length, value + sizeof(uint32_t) * 4, sizeof(cfg.hash_length));
+        std::memcpy(&cfg.target_ms, value + sizeof(uint32_t) * 5, sizeof(cfg.target_ms));
+        cfg.version = qv::ToLittleEndian(cfg.version);
+        cfg.time_cost = qv::ToLittleEndian(cfg.time_cost);
+        cfg.memory_cost_kib = qv::ToLittleEndian(cfg.memory_cost_kib);
+        cfg.parallelism = qv::ToLittleEndian(cfg.parallelism);
+        cfg.hash_length = qv::ToLittleEndian(cfg.hash_length);
+        cfg.target_ms = qv::ToLittleEndian(cfg.target_ms);
+        std::memcpy(cfg.salt.data(), value + sizeof(uint32_t) * 6, cfg.salt.size());
+        parsed.argon2 = cfg;
+        parsed.have_argon2 = true;
+        parsed.algorithm = PasswordKdf::kArgon2id;
+        std::copy(cfg.salt.begin(), cfg.salt.end(), parsed.pbkdf_salt.begin());
         break;
       }
       case kTlvTypeHybridSalt: {
@@ -413,7 +547,7 @@ namespace {
     if (offset != payload_size) {
       throw qv::Error{qv::ErrorDomain::Validation, 0, "Unexpected trailing bytes in header"};
     }
-    if (!have_pbkdf || !have_hybrid || !have_epoch || !have_pqc) {
+    if ((!have_pbkdf && !parsed.have_argon2) || !have_hybrid || !have_epoch || !have_pqc) {
       throw qv::Error{qv::ErrorDomain::Validation, 0, "Required TLV missing"};
     }
 
@@ -555,6 +689,32 @@ namespace {
   }
 } // namespace
 
+VolumeManager::VolumeManager() { // TSK036_PBKDF2_Argon2_Migration_Path
+#if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
+  kdf_policy_.algorithm = PasswordKdf::kArgon2id;
+#else
+  kdf_policy_.algorithm = PasswordKdf::kPbkdf2;
+#endif
+  kdf_policy_.target_duration = kDefaultTargetDuration;
+}
+
+VolumeManager::VolumeManager(KdfPolicy policy) : kdf_policy_(policy) { // TSK036_PBKDF2_Argon2_Migration_Path
+  if (kdf_policy_.target_duration.count() <= 0) {
+    kdf_policy_.target_duration = kDefaultTargetDuration;
+  }
+}
+
+void VolumeManager::SetKdfPolicy(const KdfPolicy& policy) { // TSK036_PBKDF2_Argon2_Migration_Path
+  kdf_policy_ = policy;
+  if (kdf_policy_.target_duration.count() <= 0) {
+    kdf_policy_.target_duration = kDefaultTargetDuration;
+  }
+}
+
+const VolumeManager::KdfPolicy& VolumeManager::GetKdfPolicy() const { // TSK036_PBKDF2_Argon2_Migration_Path
+  return kdf_policy_;
+}
+
 std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Create(const std::filesystem::path& container, const std::string& password) {
   if (std::filesystem::exists(container)) {
@@ -570,16 +730,28 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   VolumeHeader header{}; // TSK013
   header.uuid = GenerateUuidV4();
 
-  std::array<uint8_t, kPbkdfSaltSize> pbkdf_salt{};
-  FillRandom(pbkdf_salt);
+  std::array<uint8_t, kPbkdfSaltSize> password_salt{};
+  FillRandom(password_salt);
 
   std::array<uint8_t, kHybridSaltSize> hybrid_salt{};
   FillRandom(hybrid_salt);
 
   std::vector<uint8_t> password_bytes(password.begin(), password.end());
   VectorWipeGuard password_guard(password_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
-  auto classical_key = DerivePasswordKey({password_bytes.data(), password_bytes.size()}, pbkdf_salt,
-                                         kDefaultPbkdfIterations);
+  std::optional<Argon2Config> argon2_config; // TSK036_PBKDF2_Argon2_Migration_Path
+  uint32_t pbkdf_iterations = 0;             // TSK036_PBKDF2_Argon2_Migration_Path
+  std::array<uint8_t, 32> classical_key{};   // TSK036_PBKDF2_Argon2_Migration_Path
+  std::span<const uint8_t> password_span(password_bytes.data(), password_bytes.size());
+  if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
+    Argon2Config cfg{};
+    cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
+    std::copy(password_salt.begin(), password_salt.end(), cfg.salt.begin());
+    classical_key = DerivePasswordKeyArgon2id(password_span, cfg);
+    argon2_config = cfg;
+  } else {
+    pbkdf_iterations = DeterminePbkdfIterations(password_span, password_salt, kdf_policy_);
+    classical_key = DerivePasswordKey(password_span, password_salt, pbkdf_iterations, kdf_policy_.progress);
+  }
   qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
   if (!password_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(password_bytes.data(), password_bytes.size()));
@@ -606,7 +778,8 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
 
   ReservedV2Tlv reserved_v2{};
   auto payload = SerializeHeaderPayload(
-      header, kDefaultPbkdfIterations, pbkdf_salt, hybrid_salt, epoch, creation.kem_blob,
+      header, kdf_policy_.algorithm, pbkdf_iterations, password_salt, argon2_config, hybrid_salt,
+      epoch, creation.kem_blob,
       reserved_v2); // TSK024_Key_Rotation_and_Lifecycle_Management
 
   auto mac =
@@ -640,8 +813,14 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   created.message = "New encrypted volume created";
   created.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
   created.fields.emplace_back("uuid", FormatUuid(header.uuid), FieldPrivacy::kPublic);
-  created.fields.emplace_back("pbkdf_iterations", std::to_string(kDefaultPbkdfIterations),
-                              FieldPrivacy::kPublic, true);
+  if (kdf_policy_.algorithm == PasswordKdf::kPbkdf2) {
+    created.fields.emplace_back("pbkdf_iterations", std::to_string(pbkdf_iterations),
+                                FieldPrivacy::kPublic, true);
+  } else {
+    created.fields.emplace_back("kdf", "argon2id", FieldPrivacy::kPublic, true);
+    created.fields.emplace_back("argon2_memory_kib", std::to_string(argon2_config->memory_cost_kib),
+                                FieldPrivacy::kPublic, true);
+  }
   qv::orchestrator::EventBus::Instance().Publish(created);
 
   return ConstantTimeMount::VolumeHandle{1};
@@ -693,8 +872,13 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
 
   std::vector<uint8_t> current_bytes(current_password.begin(), current_password.end());
   VectorWipeGuard current_guard(current_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
-  auto classical_key = DerivePasswordKey({current_bytes.data(), current_bytes.size()},
-                                         parsed.pbkdf_salt, parsed.pbkdf_iterations);
+  std::array<uint8_t, 32> classical_key{}; // TSK036_PBKDF2_Argon2_Migration_Path
+  std::span<const uint8_t> current_span(current_bytes.data(), current_bytes.size());
+  if (parsed.algorithm == PasswordKdf::kArgon2id) {
+    classical_key = DerivePasswordKeyArgon2id(current_span, parsed.argon2);
+  } else {
+    classical_key = DerivePasswordKey(current_span, parsed.pbkdf_salt, parsed.pbkdf_iterations);
+  }
   qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
   if (!current_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(current_bytes.data(), current_bytes.size()));
@@ -735,16 +919,28 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   const uint32_t new_epoch = old_epoch + 1;      // TSK024_Key_Rotation_and_Lifecycle_Management
 
   std::array<uint8_t, kPbkdfSaltSize>
-      new_pbkdf_salt{}; // TSK024_Key_Rotation_and_Lifecycle_Management
+      new_password_salt{}; // TSK036_PBKDF2_Argon2_Migration_Path
   std::array<uint8_t, kHybridSaltSize>
       new_hybrid_salt{}; // TSK024_Key_Rotation_and_Lifecycle_Management
-  FillRandom(new_pbkdf_salt);
+  FillRandom(new_password_salt);
   FillRandom(new_hybrid_salt);
 
   std::vector<uint8_t> new_bytes(new_password.begin(), new_password.end());
   VectorWipeGuard new_guard(new_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
-  auto new_classical_key = DerivePasswordKey({new_bytes.data(), new_bytes.size()}, new_pbkdf_salt,
-                                             kDefaultPbkdfIterations);
+  std::optional<Argon2Config> new_argon2; // TSK036_PBKDF2_Argon2_Migration_Path
+  uint32_t new_iterations = 0;            // TSK036_PBKDF2_Argon2_Migration_Path
+  std::array<uint8_t, 32> new_classical_key{};
+  std::span<const uint8_t> new_span(new_bytes.data(), new_bytes.size());
+  if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
+    Argon2Config cfg{};
+    cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
+    std::copy(new_password_salt.begin(), new_password_salt.end(), cfg.salt.begin());
+    new_classical_key = DerivePasswordKeyArgon2id(new_span, cfg);
+    new_argon2 = cfg;
+  } else {
+    new_iterations = DeterminePbkdfIterations(new_span, new_password_salt, kdf_policy_);
+    new_classical_key = DerivePasswordKey(new_span, new_password_salt, new_iterations, kdf_policy_.progress);
+  }
   qv::security::Zeroizer::ScopeWiper new_classical_guard(new_classical_key.data(),
                                                          new_classical_key.size());
   if (!new_bytes.empty()) {
@@ -775,10 +971,10 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   qv::security::Zeroizer::ScopeWiper derived_index_guard(derived_keys.index.data(),
                                                          derived_keys.index.size());
 
-  auto payload =
-      SerializeHeaderPayload(parsed.header, kDefaultPbkdfIterations, new_pbkdf_salt,
-                             new_hybrid_salt, new_epoch_tlv, creation.kem_blob,
-                             parsed.reserved_v2); // TSK024_Key_Rotation_and_Lifecycle_Management
+  auto payload = SerializeHeaderPayload(parsed.header, kdf_policy_.algorithm, new_iterations,
+                                        new_password_salt, new_argon2, new_hybrid_salt,
+                                        new_epoch_tlv, creation.kem_blob,
+                                        parsed.reserved_v2); // TSK024_Key_Rotation_and_Lifecycle_Management
 
   auto new_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(new_mac_key.data(), new_mac_key.size()),
@@ -834,6 +1030,15 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   event.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
   event.fields.emplace_back("old_epoch", std::to_string(old_epoch), FieldPrivacy::kPublic, true);
   event.fields.emplace_back("new_epoch", std::to_string(new_epoch), FieldPrivacy::kPublic, true);
+  if (kdf_policy_.algorithm == PasswordKdf::kPbkdf2) {
+    event.fields.emplace_back("pbkdf_iterations", std::to_string(new_iterations), FieldPrivacy::kPublic, true);
+  } else {
+    event.fields.emplace_back("kdf", "argon2id", FieldPrivacy::kPublic, true);
+    if (new_argon2) {
+      event.fields.emplace_back("argon2_memory_kib", std::to_string(new_argon2->memory_cost_kib),
+                                FieldPrivacy::kPublic, true);
+    }
+  }
   event.fields.emplace_back("key_material_destroyed", "true", FieldPrivacy::kPublic);
   if (backup_public_key) {
     event.fields.emplace_back("backup_escrow",
@@ -869,8 +1074,13 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
 
   std::vector<uint8_t> password_bytes(password.begin(), password.end());
   VectorWipeGuard password_guard(password_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
-  auto classical_key = DerivePasswordKey({password_bytes.data(), password_bytes.size()},
-                                         parsed.pbkdf_salt, parsed.pbkdf_iterations); // TSK033
+  std::array<uint8_t, 32> classical_key{}; // TSK036_PBKDF2_Argon2_Migration_Path
+  std::span<const uint8_t> password_span(password_bytes.data(), password_bytes.size());
+  if (parsed.algorithm == PasswordKdf::kArgon2id) {
+    classical_key = DerivePasswordKeyArgon2id(password_span, parsed.argon2);
+  } else {
+    classical_key = DerivePasswordKey(password_span, parsed.pbkdf_salt, parsed.pbkdf_iterations);
+  }
   qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
   if (!password_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(password_bytes.data(), password_bytes.size()));
@@ -927,8 +1137,13 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   }
 
   parsed.header.version = qv::ToLittleEndian(target_version); // TSK033 bump version field
-  auto payload = SerializeHeaderPayload(parsed.header, parsed.pbkdf_iterations, parsed.pbkdf_salt,
-                                        parsed.hybrid_salt, parsed.epoch_tlv, parsed.kem_blob,
+  std::optional<Argon2Config> existing_argon2;
+  if (parsed.have_argon2) {
+    existing_argon2 = parsed.argon2;
+  }
+  auto payload = SerializeHeaderPayload(parsed.header, parsed.algorithm, parsed.pbkdf_iterations,
+                                        parsed.pbkdf_salt, existing_argon2, parsed.hybrid_salt,
+                                        parsed.epoch_tlv, parsed.kem_blob,
                                         reserved); // TSK033 rebuild header TLVs
   auto new_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(mac_key.data(), mac_key.size()),
