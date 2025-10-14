@@ -715,6 +715,43 @@ const VolumeManager::KdfPolicy& VolumeManager::GetKdfPolicy() const { // TSK036_
   return kdf_policy_;
 }
 
+VolumeManager::ChunkEncryptionResult VolumeManager::EncryptChunk(
+    std::span<const uint8_t> plaintext, uint32_t epoch, int64_t chunk_index,
+    uint64_t logical_offset, uint32_t chunk_size, qv::core::NonceGenerator& nonce_gen,
+    std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> data_key) { // TSK040_AAD_Binding_and_Chunk_Authentication
+  auto nonce_record = nonce_gen.NextAuthenticated();                       // TSK040
+  auto envelope = qv::core::MakeChunkAAD(epoch, chunk_index, logical_offset,
+                                         chunk_size, nonce_record.mac);     // TSK040
+  auto enc_result = qv::crypto::AES256_GCM_Encrypt(                         // TSK040
+      plaintext, qv::AsBytesConst(envelope),
+      std::span<const uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE>(
+          nonce_record.nonce.data(), nonce_record.nonce.size()),
+      data_key);
+
+  ChunkEncryptionResult sealed{};                                           // TSK040
+  sealed.nonce = nonce_record.nonce;                                        // TSK040
+  sealed.tag = enc_result.tag;                                              // TSK040
+  sealed.nonce_chain_mac = nonce_record.mac;                                // TSK040
+  sealed.ciphertext = std::move(enc_result.ciphertext);                     // TSK040
+  return sealed;                                                            // TSK040
+}
+
+std::vector<uint8_t> VolumeManager::DecryptChunk(
+    const ChunkEncryptionResult& sealed_chunk, uint32_t epoch, int64_t chunk_index,
+    uint64_t logical_offset, uint32_t chunk_size,
+    std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> data_key) { // TSK040_AAD_Binding_and_Chunk_Authentication
+  auto envelope = qv::core::MakeChunkAAD(epoch, chunk_index, logical_offset,
+                                         chunk_size, sealed_chunk.nonce_chain_mac); // TSK040
+  return qv::crypto::AES256_GCM_Decrypt(                                            // TSK040
+      std::span<const uint8_t>(sealed_chunk.ciphertext.data(), sealed_chunk.ciphertext.size()),
+      qv::AsBytesConst(envelope),
+      std::span<const uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE>(sealed_chunk.nonce.data(),
+                                                                   sealed_chunk.nonce.size()),
+      std::span<const uint8_t, qv::crypto::AES256_GCM::TAG_SIZE>(sealed_chunk.tag.data(),
+                                                                 sealed_chunk.tag.size()),
+      data_key);
+}
+
 std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Create(const std::filesystem::path& container, const std::string& password) {
   if (std::filesystem::exists(container)) {
