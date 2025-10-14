@@ -12,6 +12,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional> // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV tracking
+#include <future> // TSK038_Resource_Limits_and_DoS_Prevention crypto timeout
 #include <thread>
 #include <vector>
 #include <span>
@@ -280,12 +281,17 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
   parsed.flags = FromLittleEndian32(parsed.header.flags);
   bool version_ok = parsed.version == kHeaderVersion;
 
-    size_t offset = sizeof(VolumeHeader);
-    if (offset > bytes.size()) { // TSK030
-      parsed.valid = false;      // TSK030
-      return parsed;             // TSK030
-    }
-    while (bytes.size() - offset >= 4) {
+  size_t offset = sizeof(VolumeHeader);
+  size_t tlv_count = 0; // TSK038_Resource_Limits_and_DoS_Prevention
+  if (offset > bytes.size()) { // TSK030
+    parsed.valid = false;      // TSK030
+    return parsed;             // TSK030
+  }
+  while (bytes.size() - offset >= 4) {
+      if (++tlv_count > 64) { // TSK038_Resource_Limits_and_DoS_Prevention
+        parsed.valid = false; // TSK038_Resource_Limits_and_DoS_Prevention
+        return parsed; // TSK038_Resource_Limits_and_DoS_Prevention
+      }
       uint16_t type_le = 0;
       uint16_t length_le = 0;
       std::memcpy(&type_le, bytes.data() + offset, sizeof(type_le));
@@ -670,6 +676,15 @@ void ConstantTimeMount::ConstantTimePadding(std::chrono::nanoseconds duration) {
 std::optional<ConstantTimeMount::VolumeHandle>
 ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
                                 const std::string& password) {
+  auto attempt_start = std::chrono::steady_clock::now(); // TSK038_Resource_Limits_and_DoS_Prevention
+  constexpr auto kMaxAttemptDuration = std::chrono::seconds(5); // TSK038_Resource_Limits_and_DoS_Prevention
+  constexpr uintmax_t kMaxContainerSize = 100ull * 1024ull * 1024ull; // TSK038_Resource_Limits_and_DoS_Prevention
+
+  std::error_code size_ec; // TSK038_Resource_Limits_and_DoS_Prevention
+  auto container_size = std::filesystem::file_size(container, size_ec); // TSK038_Resource_Limits_and_DoS_Prevention
+  if (size_ec || container_size > kMaxContainerSize) { // TSK038_Resource_Limits_and_DoS_Prevention
+    return std::nullopt; // TSK038_Resource_Limits_and_DoS_Prevention
+  }
   std::array<uint8_t, kTotalHeaderBytes> buf{}; // TSK013
   bool io_ok = false;
   {
@@ -689,25 +704,57 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   auto parsed = ParseHeader(std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
 
   auto classical_key = DerivePasswordKey(password, parsed);
+  auto parsed_for_kdf = parsed; // TSK038_Resource_Limits_and_DoS_Prevention
+  auto classical_key_copy = classical_key; // TSK038_Resource_Limits_and_DoS_Prevention
   std::array<uint8_t, 32> hybrid_key{};
   bool pqc_ok = false;
-  try {
-    std::span<const uint8_t> hybrid_salt(parsed.hybrid_salt.data(), parsed.hybrid_salt.size());
-    std::span<const uint8_t> epoch_span;
-    if (parsed.have_epoch) {
-      epoch_span = std::span<const uint8_t>(parsed.epoch_tlv_bytes.data(), parsed.epoch_tlv_bytes.size());
+  auto kdf_task = std::packaged_task<std::array<uint8_t, 32>()>( // TSK038_Resource_Limits_and_DoS_Prevention
+      [parsed_for_kdf, classical_key_copy]() mutable {
+        try {
+          std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(), parsed_for_kdf.hybrid_salt.size());
+          std::span<const uint8_t> epoch_span; // TSK038_Resource_Limits_and_DoS_Prevention
+          if (parsed_for_kdf.have_epoch) { // TSK038_Resource_Limits_and_DoS_Prevention
+            epoch_span = std::span<const uint8_t>(parsed_for_kdf.epoch_tlv_bytes.data(),
+                                                  parsed_for_kdf.epoch_tlv_bytes.size());
+          }
+          auto result = qv::core::PQCHybridKDF::Mount(std::span<const uint8_t, 32>(classical_key_copy),
+                                                      parsed_for_kdf.pqc,
+                                                      hybrid_salt,
+                                                      std::span<const uint8_t, 16>(parsed_for_kdf.header.uuid),
+                                                      parsed_for_kdf.version,
+                                                      epoch_span); // TSK038_Resource_Limits_and_DoS_Prevention
+          qv::security::Zeroizer::Wipe(
+              std::span<uint8_t>(classical_key_copy.data(), classical_key_copy.size())); // TSK038_Resource_Limits_and_DoS_Prevention
+          return result;
+        } catch (...) {
+          qv::security::Zeroizer::Wipe(
+              std::span<uint8_t>(classical_key_copy.data(), classical_key_copy.size())); // TSK038_Resource_Limits_and_DoS_Prevention
+          throw;
+        }
+      });
+  auto hybrid_future = kdf_task.get_future(); // TSK038_Resource_Limits_and_DoS_Prevention
+  std::thread(std::move(kdf_task)).detach(); // TSK038_Resource_Limits_and_DoS_Prevention
+
+  auto status = hybrid_future.wait_for(std::chrono::seconds(30)); // TSK038_Resource_Limits_and_DoS_Prevention
+  if (status == std::future_status::ready) { // TSK038_Resource_Limits_and_DoS_Prevention
+    try {
+      hybrid_key = hybrid_future.get();
+      pqc_ok = true;
+    } catch (const AuthenticationFailureError&) {
+      pqc_ok = false;
+    } catch (const std::exception&) {
+      pqc_ok = false;
     }
-    hybrid_key = qv::core::PQCHybridKDF::Mount(std::span<const uint8_t, 32>(classical_key),
-                                               parsed.pqc,
-                                               hybrid_salt,
-                                               std::span<const uint8_t, 16>(parsed.header.uuid),
-                                               parsed.version,
-                                               epoch_span);
-    pqc_ok = true;
-  } catch (const AuthenticationFailureError&) {
-    pqc_ok = false;
-  } catch (const std::exception&) {
-    pqc_ok = false;
+  } else {
+    pqc_ok = false; // TSK038_Resource_Limits_and_DoS_Prevention
+    qv::orchestrator::Event kdf_timeout{}; // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.event_id = "pqc_kdf_timeout"; // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.message = "Hybrid KDF exceeded timeout"; // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.fields.emplace_back("container_path", container.generic_string(),
+                                    qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention
+    qv::orchestrator::EventBus::Instance().Publish(kdf_timeout); // TSK038_Resource_Limits_and_DoS_Prevention
   }
 
   auto mac_key = DeriveHeaderMacKey(hybrid_key, parsed);
@@ -725,6 +772,21 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+
+  auto elapsed = std::chrono::steady_clock::now() - attempt_start; // TSK038_Resource_Limits_and_DoS_Prevention
+  if (elapsed > kMaxAttemptDuration) { // TSK038_Resource_Limits_and_DoS_Prevention
+    qv::orchestrator::Event timeout_event{}; // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.event_id = "mount_timeout_exceeded"; // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.message = "Mount attempt exceeded time limit"; // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.fields.emplace_back("container_path", container.generic_string(),
+                                      qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.fields.emplace_back("duration_ns", std::to_string(elapsed.count()),
+                                      qv::orchestrator::FieldPrivacy::kPublic, true); // TSK038_Resource_Limits_and_DoS_Prevention
+    qv::orchestrator::EventBus::Instance().Publish(timeout_event); // TSK038_Resource_Limits_and_DoS_Prevention
+    return std::nullopt; // TSK038_Resource_Limits_and_DoS_Prevention
+  }
 
   if (mask != 0u) {
     return VolumeHandle{1};
