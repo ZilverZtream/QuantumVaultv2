@@ -9,7 +9,7 @@ AES256_GCM::EncryptionResult AES256_GCM_Encrypt(
     std::span<const uint8_t> aad,
     std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
     std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) {
-  // TSK004, TSK014
+  // TSK004, TSK014, TSK040_AAD_Binding_and_Chunk_Authentication
   auto provider = GetCryptoProviderShared();
   return provider->EncryptAES256GCM(plaintext, aad, nonce, key);
 }

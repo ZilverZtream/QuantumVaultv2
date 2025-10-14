@@ -233,4 +233,20 @@ namespace qv::core {
         nonce_chain_mac);
   }
 
+  inline AADEnvelope MakeMetadataAAD(
+      uint32_t epoch, int64_t record_index, uint64_t logical_offset, uint32_t record_size,
+      std::span<const uint8_t, 32> nonce_chain_mac) { // TSK040_AAD_Binding_and_Chunk_Authentication metadata scope
+    return MakeAADEnvelope(
+        MakeAADData(epoch, record_index, logical_offset, record_size, kAADContextMetadata),
+        nonce_chain_mac);
+  }
+
+  inline AADEnvelope MakeManifestAAD(
+      uint32_t epoch, int64_t record_index, uint64_t logical_offset, uint32_t record_size,
+      std::span<const uint8_t, 32> nonce_chain_mac) { // TSK040_AAD_Binding_and_Chunk_Authentication manifest scope
+    return MakeAADEnvelope(
+        MakeAADData(epoch, record_index, logical_offset, record_size, kAADContextManifest),
+        nonce_chain_mac);
+  }
+
 } // namespace qv::core

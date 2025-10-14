@@ -233,6 +233,12 @@ endfunction()
   qv_apply_test_opts(qv_aad_test) # TSK014
   add_test(NAME qv_aad_authentication COMMAND qv_aad_test) # TSK014
 
+  add_executable(qv_chunk_auth_test tests/test_chunk_auth.cpp) # TSK040_AAD_Binding_and_Chunk_Authentication
+  target_include_directories(qv_chunk_auth_test PUBLIC include) # TSK040
+  target_link_libraries(qv_chunk_auth_test PRIVATE qv_core) # TSK040
+  qv_apply_test_opts(qv_chunk_auth_test) # TSK040
+  add_test(NAME qv_chunk_auth COMMAND qv_chunk_auth_test) # TSK040
+
   add_executable(qv_error_handling_test tests/test_error_handling.cpp) # TSK034
   target_include_directories(qv_error_handling_test PUBLIC include) # TSK034
   target_link_libraries(qv_error_handling_test PRIVATE qv_core Threads::Threads) # TSK034
