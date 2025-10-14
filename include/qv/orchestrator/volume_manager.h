@@ -56,6 +56,9 @@ namespace qv::orchestrator {
     Migrate(const std::filesystem::path& container, uint32_t target_version,
             const std::string& password); // TSK033 header migration entrypoint
 
+    static void ValidateHeaderForBackup(
+        const std::filesystem::path& container); // TSK082_Backup_Verification_and_Schema
+
     struct ChunkEncryptionResult { // TSK040_AAD_Binding_and_Chunk_Authentication bundle integrity inputs
       std::array<uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE> nonce{};          // TSK040
       std::array<uint8_t, qv::crypto::AES256_GCM::TAG_SIZE> tag{};              // TSK040
