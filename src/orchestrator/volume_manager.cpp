@@ -927,6 +927,26 @@ VolumeManager::Mount(const std::filesystem::path& container, const std::string& 
   return handle;
 }
 
+void VolumeManager::ValidateHeaderForBackup(
+    const std::filesystem::path& container) { // TSK082_Backup_Verification_and_Schema
+  std::ifstream in(container, std::ios::binary);
+  if (!in) {
+    const int err = errno;
+    throw qv::Error{qv::ErrorDomain::IO, err,
+                    "Failed to open backup container for validation: " +
+                        container.string()};
+  }
+
+  std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+  if (blob.empty()) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Backup container is empty"};
+  }
+
+  (void)ParseHeader(blob); // TSK082_Backup_Verification_and_Schema reuse existing parser
+}
+
 QV_SENSITIVE_BEGIN
 QV_SENSITIVE_FUNCTION std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Rekey(const std::filesystem::path& container, const std::string& current_password,

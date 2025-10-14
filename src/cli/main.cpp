@@ -12,6 +12,7 @@
 #include <fstream> // TSK028_Secure_Deletion_and_Data_Remanence
 #include <iomanip> // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <iostream>
+#include <memory>   // TSK082_Backup_Verification_and_Schema
 #include <optional>
 #include <random>  // TSK028_Secure_Deletion_and_Data_Remanence
 #include <span>    // TSK028_Secure_Deletion_and_Data_Remanence
@@ -20,6 +21,8 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#include <openssl/evp.h> // TSK082_Backup_Verification_and_Schema
 
 #ifndef QV_SENSITIVE_FUNCTION  // TSK028A_Memory_Wiping_Gaps
 #if defined(_MSC_VER)
@@ -748,29 +751,117 @@ namespace {
     return oss.str();
   }
 
-  std::string ComputeSha256Hex(
-      const std::filesystem::path& path) { // TSK032_Backup_Recovery_and_Disaster_Recovery
-    std::ifstream in(path, std::ios::binary);
+  class ScopedPathCleanup { // TSK082_Backup_Verification_and_Schema staged file guard
+  public:
+    explicit ScopedPathCleanup(std::filesystem::path path) noexcept
+        : path_(std::move(path)) {}
+
+    ScopedPathCleanup(const ScopedPathCleanup&) = delete;
+    ScopedPathCleanup& operator=(const ScopedPathCleanup&) = delete;
+
+    ScopedPathCleanup(ScopedPathCleanup&& other) noexcept
+        : path_(std::move(other.path_)) {
+      other.path_.clear();
+    }
+
+    ScopedPathCleanup& operator=(ScopedPathCleanup&& other) noexcept {
+      if (this != &other) {
+        if (!path_.empty()) {
+          std::error_code ec;
+          std::filesystem::remove(path_, ec);
+        }
+        path_ = std::move(other.path_);
+        other.path_.clear();
+      }
+      return *this;
+    }
+
+    ~ScopedPathCleanup() {
+      if (!path_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+      }
+    }
+
+    void Release() noexcept { path_.clear(); }
+
+  private:
+    std::filesystem::path path_;
+  };
+
+  std::array<uint8_t, 32> CopyFileWithSha256(
+      const std::filesystem::path& source, const std::filesystem::path& destination) {
+    std::ifstream in(source, std::ios::binary);
     if (!in.is_open()) {
-      throw qv::Error{qv::ErrorDomain::IO, errno,
-                      "Failed to open file for hashing: " + SanitizePath(path)};
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to open file for backup: " + SanitizePath(source)};
     }
-    in.seekg(0, std::ios::end);
-    auto size = static_cast<std::streamoff>(in.tellg());
-    in.seekg(0, std::ios::beg);
-    if (size < 0) {
-      throw qv::Error{qv::ErrorDomain::IO, errno,
-                      "Failed to determine file size for hashing: " + SanitizePath(path)};
+
+    std::ofstream out(destination, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to create staged backup file: " + SanitizePath(destination)};
     }
-    std::vector<uint8_t> buffer(static_cast<size_t>(size));
-    in.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
-    if (!in) {
-      throw qv::Error{qv::ErrorDomain::IO, errno,
-                      "Failed to read file for hashing: " + SanitizePath(path)};
+
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+        EVP_MD_CTX_new(), &EVP_MD_CTX_free); // TSK082_Backup_Verification_and_Schema
+    if (!ctx) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Failed to initialize hashing context"};
     }
-    auto digest = qv::crypto::SHA256_Hash(buffer);
-    return BytesToHexLower(std::span<const uint8_t>(digest.data(), digest.size()));
+    if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Failed to initialize SHA-256 context"};
+    }
+
+    std::array<char, 1 << 15> buffer{}; // 32 KiB chunks // TSK082_Backup_Verification_and_Schema
+    while (in) {
+      in.read(buffer.data(), buffer.size());
+      std::streamsize read = in.gcount();
+      if (read > 0) {
+        if (EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<size_t>(read)) != 1) {
+          throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                          "Failed while computing SHA-256"};
+        }
+        out.write(buffer.data(), read);
+        if (!out) {
+          const int err = errno;
+          throw qv::Error{qv::ErrorDomain::IO, err,
+                          "Failed to write staged backup file: " +
+                              SanitizePath(destination)};
+        }
+      }
+    }
+
+    if (!in.eof()) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed while reading source for backup: " + SanitizePath(source)};
+    }
+
+    out.flush();
+    if (!out) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to flush staged backup file: " + SanitizePath(destination)};
+    }
+
+    std::array<uint8_t, 32> digest{};
+    unsigned int digest_len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), digest.data(), &digest_len) != 1) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Failed to finalize SHA-256"};
+    }
+    if (digest_len != digest.size()) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Unexpected SHA-256 length"};
+    }
+
+    return digest;
   }
+
 
   std::string CurrentISO8601() { // TSK032_Backup_Recovery_and_Disaster_Recovery
     auto now = std::chrono::system_clock::now();
@@ -784,6 +875,19 @@ namespace {
     std::ostringstream oss;
     oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
     return oss.str();
+  }
+
+  std::string FormatHeaderVersion(uint32_t version) { // TSK082_Backup_Verification_and_Schema
+    std::ostringstream oss;
+    const uint32_t major = (version >> 16) & 0xFFFFu;
+    const uint32_t minor = (version >> 8) & 0xFFu;
+    const uint32_t patch = version & 0xFFu;
+    oss << major << '.' << minor << '.' << patch;
+    return oss.str();
+  }
+
+  std::string AppVersionString() { // TSK082_Backup_Verification_and_Schema align with header schema
+    return FormatHeaderVersion(qv::orchestrator::VolumeManager::kLatestHeaderVersion);
   }
 
   void SecureZero(std::string& s) {
@@ -1522,53 +1626,109 @@ namespace {
                       "Failed to prepare backup directory: " + SanitizePath(output_dir)};
     }
 
-    auto container_backup = output_dir / container.filename();
+#if !defined(_WIN32)
     try {
-      std::filesystem::copy_file(container, container_backup,
-                                 std::filesystem::copy_options::overwrite_existing);
+      std::filesystem::permissions(
+          output_dir,
+          std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+              std::filesystem::perms::owner_exec,
+          std::filesystem::perm_options::replace);
     } catch (const std::filesystem::filesystem_error& err) {
       throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
-                      "Failed to copy container for backup: " + SanitizePath(container_backup)};
+                      "Failed to secure backup directory: " + SanitizePath(output_dir)};
     }
+#endif
+
+    auto container_backup = output_dir / container.filename();
+    auto staged_container = container_backup;
+    staged_container += ".tmp";
+    {
+      std::error_code ec;
+      std::filesystem::remove(staged_container, ec);
+    }
+    ScopedPathCleanup container_guard(staged_container);
+    const auto container_digest = CopyFileWithSha256(container, staged_container);
+    qv::orchestrator::VolumeManager::ValidateHeaderForBackup(staged_container);
 
     std::optional<std::filesystem::path> nonce_backup;
+    std::optional<std::array<uint8_t, 32>> nonce_digest;
+    std::optional<ScopedPathCleanup> nonce_guard;
+    std::filesystem::path staged_nonce;
+
     auto nonce_log_path = MetadataNonceLogPath(container);
     if (std::filesystem::exists(nonce_log_path)) {
       nonce_backup = output_dir / "nonce.log";
-      try {
-        std::filesystem::copy_file(nonce_log_path, *nonce_backup,
-                                   std::filesystem::copy_options::overwrite_existing);
-      } catch (const std::filesystem::filesystem_error& err) {
-        throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
-                        "Failed to copy nonce log for backup: " + SanitizePath(*nonce_backup)};
+      staged_nonce = output_dir / "nonce.log.tmp";
+      {
+        std::error_code ec;
+        std::filesystem::remove(staged_nonce, ec);
       }
+      nonce_guard.emplace(staged_nonce);
+      nonce_digest = CopyFileWithSha256(nonce_log_path, staged_nonce);
     }
 
-    const auto container_hash = ComputeSha256Hex(container_backup);
-    std::optional<std::string> nonce_hash;
-    if (nonce_backup) {
-      nonce_hash = ComputeSha256Hex(*nonce_backup);
+    {
+      std::error_code ec;
+      std::filesystem::remove(container_backup, ec);
+    }
+    std::filesystem::rename(staged_container, container_backup);
+    container_guard.Release();
+
+    if (nonce_backup && nonce_guard) {
+      {
+        std::error_code ec;
+        std::filesystem::remove(*nonce_backup, ec);
+      }
+      std::filesystem::rename(staged_nonce, *nonce_backup);
+      nonce_guard->Release();
     }
 
     auto manifest_path = output_dir / "manifest.json";
-    std::ofstream manifest(manifest_path, std::ios::trunc);
+    auto manifest_tmp = manifest_path;
+    manifest_tmp += ".tmp";
+    {
+      std::error_code ec;
+      std::filesystem::remove(manifest_tmp, ec);
+    }
+    ScopedPathCleanup manifest_guard(manifest_tmp);
+    std::ofstream manifest(manifest_tmp, std::ios::binary | std::ios::trunc);
     if (!manifest.is_open()) {
       throw qv::Error{qv::ErrorDomain::IO, errno,
-                      "Failed to write manifest: " + SanitizePath(manifest_path)};
+                      "Failed to write manifest: " + SanitizePath(manifest_tmp)};
     }
+    constexpr int kManifestVersion = 1; // TSK082_Backup_Verification_and_Schema schema marker
+    const auto container_hash_hex =
+        BytesToHexLower(std::span<const uint8_t>(container_digest.data(), container_digest.size()));
     manifest << "{\n";
+    manifest << "  \"manifest_version\": " << kManifestVersion << ",\n";
+    manifest << "  \"app_version\": \"" << AppVersionString() << "\",\n";
     manifest << "  \"container_path\": \"" << container_backup.filename().string() << "\",\n";
-    manifest << "  \"container_sha256\": \"" << container_hash << "\",\n";
-    if (nonce_backup && nonce_hash) {
+    manifest << "  \"container_sha256\": \"" << container_hash_hex << "\",\n";
+    if (nonce_backup && nonce_digest) {
+      const auto nonce_hash_hex = BytesToHexLower(
+          std::span<const uint8_t>(nonce_digest->data(), nonce_digest->size()));
       manifest << "  \"nonce_log_path\": \"" << nonce_backup->filename().string() << "\",\n";
-      manifest << "  \"nonce_log_sha256\": \"" << *nonce_hash << "\",\n";
+      manifest << "  \"nonce_log_sha256\": \"" << nonce_hash_hex << "\",\n";
     } else {
       manifest << "  \"nonce_log_path\": null,\n";
       manifest << "  \"nonce_log_sha256\": null,\n";
     }
     manifest << "  \"created_at\": \"" << CurrentISO8601() << "\"\n";
     manifest << "}\n";
+    manifest.flush();
+    if (!manifest) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to finalize manifest: " + SanitizePath(manifest_tmp)};
+    }
     manifest.close();
+
+    {
+      std::error_code ec;
+      std::filesystem::remove(manifest_path, ec);
+    }
+    std::filesystem::rename(manifest_tmp, manifest_path);
+    manifest_guard.Release();
 
     std::cout << "Backup created at " << SanitizePath(output_dir) << std::endl;
     return kExitOk;
