@@ -173,7 +173,7 @@ private:
 
 // TSK004, TSK013
 constexpr std::array<uint8_t, 8> kHeaderMagic = {'Q','V','A','U','L','T','\0','\0'};
-constexpr uint32_t kHeaderVersion = 0x00040100;   // TSK013
+constexpr uint32_t kHeaderVersion = 0x00040101;   // TSK013, TSK068_Atomic_Header_Writes durability bump
 constexpr uint32_t kFallbackIterations = 4096;
 constexpr uint64_t kMinTargetNs = std::chrono::milliseconds(75).count();
 constexpr uint64_t kConfiguredP99Ns = std::chrono::milliseconds(160).count();
