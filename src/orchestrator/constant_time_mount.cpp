@@ -1028,8 +1028,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     qv::orchestrator::Event kdf_timeout{}; // TSK038_Resource_Limits_and_DoS_Prevention
     kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
     kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
-    kdf_timeout.event_id = "pqc_kdf_timeout"; // TSK038_Resource_Limits_and_DoS_Prevention
-    kdf_timeout.message = "Hybrid KDF exceeded timeout"; // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.event_id = "mount_key_timeout"; // TSK080_Error_Info_Redaction_in_Release
+    kdf_timeout.message = "Key agreement exceeded timeout"; // TSK080_Error_Info_Redaction_in_Release
     kdf_timeout.fields.emplace_back("container_path", container.generic_string(),
                                     qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention
     qv::orchestrator::EventBus::Instance().Publish(kdf_timeout); // TSK038_Resource_Limits_and_DoS_Prevention
