@@ -6,11 +6,30 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/types.h>
 #include <fuse3/fuse.h>
+#endif  // defined(__linux__)
+
+#if defined(_WIN32)
+#include <cstddef>
+// Provide minimal POSIX-compatible types for Windows builds.
+#ifndef _TIMESPEC_DEFINED
+#define _TIMESPEC_DEFINED
+struct timespec {
+  long long tv_sec;
+  long tv_nsec;
+};
+#endif  // _TIMESPEC_DEFINED
+using uid_t = unsigned int;
+using gid_t = unsigned int;
+#endif  // defined(_WIN32)
 
 #include "qv/storage/block_device.h"
 
@@ -34,6 +53,22 @@ struct DirectoryEntry {
   timespec mtime{};
 };
 
+struct NodeMetadata {
+  bool is_directory{false};
+  uint64_t size{0};
+  uint32_t mode{0};
+  timespec modification_time{};
+  timespec change_time{};
+  uint32_t uid{0};
+  uint32_t gid{0};
+};
+
+struct DirectoryListingEntry {
+  std::string name;
+  bool is_directory{false};
+  NodeMetadata metadata{};
+};
+
 class VolumeFilesystem {
   std::shared_ptr<storage::BlockDevice> device_;
   std::shared_ptr<DirectoryEntry> root_;
@@ -50,6 +85,7 @@ class VolumeFilesystem {
 public:
   explicit VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device);
 
+#if defined(__linux__)
   // Filesystem operations
   int GetAttr(const char* path, struct stat* stbuf);
   int ReadDir(const char* path, void* buf, fuse_fill_dir_t filler);
@@ -61,6 +97,27 @@ public:
   int Mkdir(const char* path, mode_t mode);
   int Rmdir(const char* path);
   int Truncate(const char* path, off_t size);
+#endif  // defined(__linux__)
+
+  // Generic helpers shared by platform adapters. // TSK063_WinFsp_Windows_Driver_Integration
+  uint64_t TotalSizeBytes() const;
+  uint64_t FreeSpaceBytes() const;
+  std::optional<NodeMetadata> StatPath(const std::string& path);
+  std::vector<DirectoryListingEntry> ListDirectoryEntries(const std::string& path);
+  std::vector<uint8_t> ReadFileRange(const std::string& path, uint64_t offset, size_t length);
+  size_t WriteFileRange(const std::string& path, uint64_t offset,
+                        std::span<const uint8_t> data);
+  void CreateFileNode(const std::string& path, uint32_t mode, uint32_t uid, uint32_t gid);
+  void CreateDirectoryNode(const std::string& path, uint32_t mode, uint32_t uid,
+                           uint32_t gid);
+  void RemoveFileNode(const std::string& path);
+  void RemoveDirectoryNode(const std::string& path);
+  void TruncateFileNode(const std::string& path, uint64_t size);
+  void RenameNode(const std::string& from, const std::string& to, bool replace_existing);
+  void UpdateTimestamps(const std::string& path, std::optional<timespec> modification,
+                        std::optional<timespec> change);
+
+  std::shared_ptr<storage::BlockDevice> BlockDeviceHandle() const { return device_; }
 
 private:
   FileEntry* FindFile(const std::string& path);

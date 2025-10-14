@@ -41,6 +41,7 @@
 #include <io.h>       // TSK028_Secure_Deletion_and_Data_Remanence
 #include <windows.h>
 #include <wincrypt.h> // TSK035_Platform_Specific_Security_Integration
+#include "qv/platform/winfsp_adapter.h"  // TSK063_WinFsp_Windows_Driver_Integration
 #else // _WIN32
 #include <cerrno>
 #include <fcntl.h>    // TSK028_Secure_Deletion_and_Data_Remanence
@@ -78,6 +79,20 @@ namespace {
     g_fuse_running.store(false);                                           // TSK062_FUSE_Filesystem_Integration_Linux
     if (g_active_fuse_adapter) {                                           // TSK062_FUSE_Filesystem_Integration_Linux
       g_active_fuse_adapter->RequestUnmount();                             // TSK062_FUSE_Filesystem_Integration_Linux
+    }
+  }
+#elif defined(_WIN32) && defined(QV_HAVE_WINFSP)
+  std::atomic_bool g_winfsp_running{true};                                 // TSK063_WinFsp_Windows_Driver_Integration
+
+  BOOL WINAPI WinFspSignalHandler(DWORD signal) {                          // TSK063_WinFsp_Windows_Driver_Integration
+    switch (signal) {
+      case CTRL_C_EVENT:
+      case CTRL_BREAK_EVENT:
+      case CTRL_CLOSE_EVENT:
+        g_winfsp_running.store(false);
+        return TRUE;
+      default:
+        return FALSE;
     }
   }
 #endif
@@ -1250,6 +1265,76 @@ namespace {
     g_active_fuse_adapter = nullptr;
     adapter.Unmount();
     return kExitOk;
+  }
+#elif defined(_WIN32) && defined(QV_HAVE_WINFSP)
+  int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
+                  qv::orchestrator::VolumeManager& vm,
+                  const SecurityIntegrationFlags& security_flags) {
+    if (!std::filesystem::exists(container)) {
+      throw qv::Error{qv::ErrorDomain::IO,
+                      qv::errors::io::kContainerMissing,  // TSK020
+                      "Container not found: " + SanitizePath(container)};
+    }
+
+    std::wstring mount_target = mountpoint.wstring();
+    if (mount_target.empty()) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Mount point must specify a drive letter or share"};
+    }
+
+    bool cached = false;
+    std::string password;
+    if ((security_flags.use_os_store || security_flags.use_tpm_seal)) {
+      if (auto persisted = LoadPersistedCredential(container, security_flags)) {
+        password = *persisted;
+        cached = true;
+      }
+    }
+    if (!cached) {
+      password = ReadPassword("Password: ");
+    }
+
+    auto handle = vm.Mount(container, password);
+    SecureZero(password);
+    if (!handle) {
+      const char* message =
+#ifdef NDEBUG
+          "Authentication failed or volume unavailable.";
+#else
+          "Authentication failed.";
+#endif
+      std::cerr << message << std::endl;
+      return kExitAuth;
+    }
+    if (!handle->device) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
+    }
+
+    qv::platform::WinFspAdapter adapter(handle->device);
+    adapter.Mount(mount_target);
+    g_winfsp_running.store(true);
+    SetConsoleCtrlHandler(WinFspSignalHandler, TRUE);
+
+    std::wcout << L"Mounted at " << mount_target << std::endl;
+    std::wcout << L"Press Ctrl+C to unmount..." << std::endl;
+
+    while (g_winfsp_running.load()) {
+      Sleep(200);
+    }
+
+    SetConsoleCtrlHandler(WinFspSignalHandler, FALSE);
+    adapter.Unmount();
+    return kExitOk;
+#elif defined(_WIN32)
+  int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
+                  qv::orchestrator::VolumeManager& vm,
+                  const SecurityIntegrationFlags& security_flags) {
+    (void)container;
+    (void)mountpoint;
+    (void)vm;
+    (void)security_flags;
+    std::cerr << "WinFsp integration not available in this build." << std::endl;
+    return kExitUsage;
   }
 #else
   int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
