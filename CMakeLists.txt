@@ -337,6 +337,14 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_constant_time_mount.cpp")
   add_test(NAME qv_constant_time_mount COMMAND qv_constant_time_mount_test)
 endif()
 
+if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_volume_rekey.cpp")
+  add_executable(qv_volume_rekey_test tests/test_volume_rekey.cpp) # TSK071_Epoch_Overflow_Safety coverage
+  target_include_directories(qv_volume_rekey_test PUBLIC include)
+  target_link_libraries(qv_volume_rekey_test PRIVATE qv_orchestrator qv_core)
+  qv_apply_test_opts(qv_volume_rekey_test)
+  add_test(NAME qv_volume_rekey COMMAND qv_volume_rekey_test)
+endif()
+
 if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_io_util.cpp")
   add_executable(qv_io_util_test tests/test_io_util.cpp) # TSK068_Atomic_Header_Writes durability regression
   target_include_directories(qv_io_util_test PUBLIC include)
