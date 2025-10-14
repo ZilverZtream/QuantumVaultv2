@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <atomic>
 #include <array>     // TSK035_Platform_Specific_Security_Integration
 #include <cerrno>    // TSK028_Secure_Deletion_and_Data_Remanence
 #include <charconv>  // TSK029
 #include <chrono>    // TSK032_Backup_Recovery_and_Disaster_Recovery
+#include <csignal>
 #include <cstddef>   // TSK028_Secure_Deletion_and_Data_Remanence
 #include <cstring>   // TSK035_Platform_Specific_Security_Integration
 #include <ctime>     // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -19,6 +21,10 @@
 #include <system_error>
 #include <vector>
 
+#if defined(__linux__)
+#include <thread>
+#endif
+
 #include "qv/common.h" // TSK029
 #include "qv/core/nonce.h"
 #include "qv/crypto/sha256.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -26,6 +32,9 @@
 #include "qv/orchestrator/constant_time_mount.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/orchestrator/event_bus.h"           // TSK027
 #include "qv/orchestrator/volume_manager.h"
+#if defined(__linux__)
+#include "qv/platform/fuse_adapter.h" // TSK062_FUSE_Filesystem_Integration_Linux
+#endif
 
 #ifdef _WIN32
 #include <fcntl.h>    // TSK028_Secure_Deletion_and_Data_Remanence
@@ -60,6 +69,18 @@ namespace {
     bool use_os_store = false;
     bool use_tpm_seal = false;
   };
+
+#if defined(__linux__)
+  std::atomic_bool g_fuse_running{true};                                   // TSK062_FUSE_Filesystem_Integration_Linux
+  qv::platform::FUSEAdapter* g_active_fuse_adapter = nullptr;              // TSK062_FUSE_Filesystem_Integration_Linux
+
+  void FuseSignalHandler(int) {                                            // TSK062_FUSE_Filesystem_Integration_Linux
+    g_fuse_running.store(false);                                           // TSK062_FUSE_Filesystem_Integration_Linux
+    if (g_active_fuse_adapter) {                                           // TSK062_FUSE_Filesystem_Integration_Linux
+      g_active_fuse_adapter->RequestUnmount();                             // TSK062_FUSE_Filesystem_Integration_Linux
+    }
+  }
+#endif
 
 #if defined(_WIN32) || defined(__APPLE__) || (defined(QV_HAVE_LIBSECRET) && QV_HAVE_LIBSECRET)
   constexpr bool kSupportsOsCredentialStore = true; // TSK035_Platform_Specific_Security_Integration
@@ -114,7 +135,7 @@ namespace {
     std::cerr << "QuantumVault (skeleton)\n";
     std::cerr << "Usage:\n";
     std::cerr << "  qv create <container>\n";
-    std::cerr << "  qv mount  <container>\n";
+    std::cerr << "  qv mount  <container> <mountpoint>\n";
     std::cerr
         << "  qv rekey  [--backup-key=<path>] <container>\n"; // TSK024_Key_Rotation_and_Lifecycle_Management
     std::cerr << "  qv migrate [--migrate-to=<version>] <container>\n"; // TSK033
@@ -1165,12 +1186,18 @@ namespace {
     return kExitOk;
   }
 
-  int HandleMount(const std::filesystem::path& container, qv::orchestrator::VolumeManager& vm,
+#if defined(__linux__)
+  int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
+                  qv::orchestrator::VolumeManager& vm,
                   const SecurityIntegrationFlags& security_flags) {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing, // TSK020
                       "Container not found: " + SanitizePath(container)};
+    }
+    if (!std::filesystem::exists(mountpoint) || !std::filesystem::is_directory(mountpoint)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Mount point unavailable: " + SanitizePath(mountpoint)};
     }
     auto lock_path = container;
     lock_path += ".locked"; // TSK026
@@ -1202,9 +1229,40 @@ namespace {
       std::cerr << message << std::endl;
       return kExitAuth;
     }
-    std::cout << "Mounted." << std::endl;
+    if (!handle->device) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
+    }
+
+    qv::platform::FUSEAdapter adapter(handle->device);
+    adapter.Mount(mountpoint);
+    g_active_fuse_adapter = &adapter;
+    g_fuse_running.store(true);
+    std::signal(SIGINT, FuseSignalHandler);
+    std::signal(SIGTERM, FuseSignalHandler);
+
+    std::cout << "Mounted " << SanitizePath(container) << " at " << SanitizePath(mountpoint) << std::endl;
+    std::cout << "Press Ctrl+C to unmount..." << std::endl;
+
+    while (g_fuse_running.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    g_active_fuse_adapter = nullptr;
+    adapter.Unmount();
     return kExitOk;
   }
+#else
+  int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
+                  qv::orchestrator::VolumeManager& vm,
+                  const SecurityIntegrationFlags& security_flags) {
+    (void)container;
+    (void)mountpoint;
+    (void)vm;
+    (void)security_flags;
+    std::cerr << "Mount is only supported on Linux builds." << std::endl;
+    return kExitUsage;
+  }
+#endif
 
   int HandleRekey(
       const std::filesystem::path& container, std::optional<std::filesystem::path> backup_key,
@@ -1648,11 +1706,13 @@ int main(int argc, char** argv) {
       return HandleCreate(argv[index], vm, security_flags);
     }
     if (cmd == "mount") {
-      if (argc - index != 1) {
+      if (argc - index != 2) {
         PrintUsage();
         return kExitUsage;
       }
-      return HandleMount(argv[index], vm, security_flags);
+      std::filesystem::path container_path = argv[index];
+      std::filesystem::path mount_path = argv[index + 1];
+      return HandleMount(container_path, mount_path, vm, security_flags);
     }
     if (cmd == "rekey") {
       if (argc - index < 1 || argc - index > 2) {
