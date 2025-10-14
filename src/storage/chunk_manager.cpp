@@ -8,6 +8,26 @@
 #include "qv/crypto/aes_gcm.h"
 #include "qv/security/zeroizer.h"
 
+#ifndef QV_SENSITIVE_FUNCTION  // TSK028A_Memory_Wiping_Gaps
+#if defined(_MSC_VER)
+#define QV_SENSITIVE_BEGIN __pragma(optimize("", off))
+#define QV_SENSITIVE_END __pragma(optimize("", on))
+#define QV_SENSITIVE_FUNCTION __declspec(noinline)
+#elif defined(__clang__)
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION [[clang::optnone]] __attribute__((noinline))
+#elif defined(__GNUC__)
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION __attribute__((noinline, optimize("O0")))
+#else
+#define QV_SENSITIVE_BEGIN
+#define QV_SENSITIVE_END
+#define QV_SENSITIVE_FUNCTION
+#endif
+#endif  // QV_SENSITIVE_FUNCTION TSK028A_Memory_Wiping_Gaps
+
 namespace qv::storage {
 
 namespace {
@@ -163,10 +183,13 @@ std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
   return plaintext;
 }
 
-void ChunkManager::PersistChunk(int64_t chunk_index, const std::vector<uint8_t>& data) {
+QV_SENSITIVE_BEGIN
+QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
+                                                      const std::vector<uint8_t>& data) {
   auto nonce_record = nonce_generator_.NextAuthenticated();
   auto nonce = MakeNonce(nonce_record, chunk_index);
   std::array<uint8_t, kChunkPayloadSize> plaintext{};
+  qv::security::Zeroizer::ScopeWiper plaintext_guard(plaintext.data(), plaintext.size()); // TSK028A_Memory_Wiping_Gaps
   std::fill(plaintext.begin(), plaintext.end(), 0);
   auto logical_offset = static_cast<uint64_t>(chunk_index) * kChunkPayloadSize;
   auto copy_size = std::min<size_t>(data.size(), plaintext.size());
@@ -205,6 +228,7 @@ void ChunkManager::PersistChunk(int64_t chunk_index, const std::vector<uint8_t>&
 
   qv::security::Zeroizer::Wipe(plaintext);
 }
+QV_SENSITIVE_END
 
 void ChunkManager::HandleSequentialRead(int64_t chunk_index) {
   std::unique_lock lock(sequential_mutex_);
