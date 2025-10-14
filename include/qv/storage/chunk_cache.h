@@ -34,6 +34,8 @@ class ChunkCache {
 
   void MarkClean(int64_t chunk_idx);
 
+  void Invalidate(int64_t chunk_idx);  // TSK076_Cache_Coherency
+
   void Flush(std::function<void(int64_t, const std::vector<uint8_t>&)> write_fn);
 
   void SetWriteBackCallback(std::function<void(int64_t, const std::vector<uint8_t>&)> callback);
@@ -47,6 +49,8 @@ class ChunkCache {
   void TouchLocked(int64_t chunk_idx, const std::shared_ptr<CachedChunk>& chunk);
 
   EvictedChunk EvictLRULocked();
+
+  void EraseLocked(int64_t chunk_idx);  // TSK076_Cache_Coherency
 
   size_t max_size_;
   size_t current_size_{0};

@@ -9,12 +9,22 @@ namespace qv::storage {
 ChunkCache::ChunkCache(size_t max_size) : max_size_(max_size) {}
 
 std::shared_ptr<CachedChunk> ChunkCache::Get(int64_t chunk_idx) {
-  std::unique_lock lock(mutex_);
+  std::shared_ptr<CachedChunk> chunk;
+  {
+    std::shared_lock read_lock(mutex_);  // TSK076_Cache_Coherency
+    auto it = cache_.find(chunk_idx);
+    if (it == cache_.end()) {
+      return nullptr;
+    }
+    chunk = it->second;
+  }
+
+  std::unique_lock write_lock(mutex_);
   auto it = cache_.find(chunk_idx);
   if (it == cache_.end()) {
     return nullptr;
   }
-  auto chunk = it->second;
+  chunk = it->second;
   TouchLocked(chunk_idx, chunk);
   return chunk;
 }
@@ -27,14 +37,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
   {
     std::unique_lock lock(mutex_);
 
-    if (auto existing = cache_.find(chunk_idx); existing != cache_.end()) {
-      current_size_ -= existing->second->data.size();
-      if (auto lru_it = lru_map_.find(chunk_idx); lru_it != lru_map_.end()) {
-        lru_list_.erase(lru_it->second);
-        lru_map_.erase(lru_it);
-      }
-      cache_.erase(existing);
-    }
+    EraseLocked(chunk_idx);  // TSK076_Cache_Coherency
 
     while (current_size_ + data.size() > max_size_ && !cache_.empty()) {
       auto evicted = EvictLRULocked();
@@ -84,20 +87,32 @@ void ChunkCache::MarkClean(int64_t chunk_idx) {
   }
 }
 
+void ChunkCache::Invalidate(int64_t chunk_idx) {  // TSK076_Cache_Coherency
+  std::unique_lock lock(mutex_);
+  EraseLocked(chunk_idx);
+}
+
 void ChunkCache::Flush(std::function<void(int64_t, const std::vector<uint8_t>&)> write_fn) {
-  std::vector<std::shared_ptr<CachedChunk>> dirty_chunks;
+  struct DirtyEntry {
+    int64_t index;
+    std::shared_ptr<CachedChunk> chunk;
+  };
+  std::vector<DirtyEntry> dirty_chunks;  // TSK076_Cache_Coherency
   {
     std::unique_lock lock(mutex_);
     for (auto& [idx, chunk] : cache_) {
       if (chunk->dirty) {
         chunk->dirty = false;
-        dirty_chunks.push_back(chunk);
+        dirty_chunks.push_back(DirtyEntry{idx, chunk});
       }
     }
   }
 
-  for (const auto& chunk : dirty_chunks) {
-    write_fn(chunk->chunk_idx, chunk->data);
+  std::sort(dirty_chunks.begin(), dirty_chunks.end(),
+            [](const DirtyEntry& lhs, const DirtyEntry& rhs) { return lhs.index < rhs.index; });
+
+  for (const auto& entry : dirty_chunks) {
+    write_fn(entry.index, entry.chunk->data);
   }
 }
 
@@ -135,6 +150,17 @@ ChunkCache::EvictedChunk ChunkCache::EvictLRULocked() {
   }
 
   return evicted;
+}
+
+void ChunkCache::EraseLocked(int64_t chunk_idx) {  // TSK076_Cache_Coherency
+  if (auto existing = cache_.find(chunk_idx); existing != cache_.end()) {
+    current_size_ -= existing->second->data.size();
+    if (auto lru_it = lru_map_.find(chunk_idx); lru_it != lru_map_.end()) {
+      lru_list_.erase(lru_it->second);
+      lru_map_.erase(lru_it);
+    }
+    cache_.erase(existing);
+  }
 }
 
 }  // namespace qv::storage
