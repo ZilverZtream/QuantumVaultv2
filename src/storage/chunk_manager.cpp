@@ -153,6 +153,18 @@ void ChunkManager::Flush() {
 
 std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
   auto record = device_.ReadChunk(chunk_index);
+  if (record.ciphertext.size() != kChunkPayloadSize) {  // TSK078_Chunk_Integrity_and_Bounds
+    throw Error{ErrorDomain::Validation, 0, "Ciphertext payload size mismatch"};
+  }
+  if (record.header.chunk_index != chunk_index) {  // TSK078_Chunk_Integrity_and_Bounds
+    throw Error{ErrorDomain::Validation, 0, "Chunk index mismatch"};
+  }
+  if (record.header.epoch != epoch_) {  // TSK078_Chunk_Integrity_and_Bounds
+    throw Error{ErrorDomain::Validation, 0, "Chunk epoch mismatch"};
+  }
+  if (record.header.data_size > kChunkPayloadSize) {  // TSK078_Chunk_Integrity_and_Bounds
+    throw Error{ErrorDomain::Validation, 0, "Header data size exceeds payload capacity"};
+  }
   auto cipher = static_cast<qv::crypto::CipherType>(record.header.cipher_id);
   if (!qv::crypto::CipherAvailable(cipher) && cipher != qv::crypto::CipherType::AES_256_GCM) {
     throw Error{ErrorDomain::Crypto, 0, "Cipher unavailable for chunk"};
