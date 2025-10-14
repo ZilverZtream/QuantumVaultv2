@@ -291,104 +291,111 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
   bool version_ok = parsed.version == kHeaderVersion;
 
   size_t offset = sizeof(VolumeHeader);
-  size_t tlv_count = 0; // TSK038_Resource_Limits_and_DoS_Prevention
-  if (offset > bytes.size()) { // TSK030
-    parsed.valid = false;      // TSK030
-    return parsed;             // TSK030
-  }
-  while (bytes.size() - offset >= 4) {
-      if (++tlv_count > 64) { // TSK038_Resource_Limits_and_DoS_Prevention
-        parsed.valid = false; // TSK038_Resource_Limits_and_DoS_Prevention
-        return parsed; // TSK038_Resource_Limits_and_DoS_Prevention
-      }
-      uint16_t type_le = 0;
-      uint16_t length_le = 0;
-      std::memcpy(&type_le, bytes.data() + offset, sizeof(type_le));
-      std::memcpy(&length_le, bytes.data() + offset + sizeof(type_le), sizeof(length_le));
-      uint16_t type = FromLittleEndian16(type_le);
-      size_t length = static_cast<size_t>(FromLittleEndian16(length_le));
-      offset += 4;
-      if (offset > bytes.size()) {           // TSK030
-        parsed.valid = false;                // TSK030
-        return parsed;                       // TSK030
-      }
-      if (length > bytes.size() || offset > bytes.size() - length) { // TSK030
-        parsed.valid = false;                                         // TSK030
-        return parsed;                                                // TSK030
-      }
-      auto payload = bytes.subspan(offset, length);
-      switch (type) {
+  size_t tlv_count = 0;                 // TSK038_Resource_Limits_and_DoS_Prevention
+  bool parse_ok = offset <= bytes.size(); // TSK070
+  while (parse_ok && (bytes.size() - offset) >= 4) {
+    ++tlv_count;
+    if (tlv_count > 64) {          // TSK038_Resource_Limits_and_DoS_Prevention
+      parse_ok = false;            // TSK038_Resource_Limits_and_DoS_Prevention
+      break;                       // TSK070
+    }
+    uint16_t type_le = 0;
+    uint16_t length_le = 0;
+    std::memcpy(&type_le, bytes.data() + offset, sizeof(type_le));
+    std::memcpy(&length_le, bytes.data() + offset + sizeof(type_le), sizeof(length_le));
+    uint16_t type = FromLittleEndian16(type_le);
+    size_t length = static_cast<size_t>(FromLittleEndian16(length_le));
+    offset += 4;
+    if (offset > bytes.size()) {         // TSK030
+      parse_ok = false;                  // TSK030, TSK070
+      break;                             // TSK070
+    }
+    size_t available = bytes.size() - offset; // TSK070
+    if (length > available) {                 // TSK030
+      parse_ok = false;                       // TSK030, TSK070
+    }
+    size_t safe_length = std::min(length, available); // TSK070
+    auto payload = bytes.subspan(offset, safe_length);
+    switch (type) {
       case kTlvTypePbkdf2: {
-        if (length != 4 + kPbkdfSaltSize) {
-          parsed.have_pbkdf = false;
-          break;
+        const size_t expected = 4 + kPbkdfSaltSize; // TSK070
+        bool length_ok = safe_length == expected;   // TSK070
+        parse_ok = parse_ok && length_ok;           // TSK070
+        if (length_ok) {
+          uint32_t iter_le = 0;
+          std::memcpy(&iter_le, payload.data(), sizeof(iter_le));
+          parsed.pbkdf_iterations = FromLittleEndian32(iter_le);
+          std::memcpy(parsed.pbkdf_salt.data(), payload.data() + sizeof(iter_le), kPbkdfSaltSize);
+          if (parsed.pbkdf_iterations == 0 || parsed.pbkdf_iterations >= (1u << 24)) {
+            parsed.pbkdf_iterations = kFallbackIterations;
+          } else {
+            parsed.have_pbkdf = true;
+          }
+          parsed.algorithm = PasswordKdf::kPbkdf2; // TSK036_PBKDF2_Argon2_Migration_Path
         }
-        uint32_t iter_le = 0;
-        std::memcpy(&iter_le, payload.data(), sizeof(iter_le));
-        parsed.pbkdf_iterations = FromLittleEndian32(iter_le);
-        std::memcpy(parsed.pbkdf_salt.data(), payload.data() + sizeof(iter_le), kPbkdfSaltSize);
-        if (parsed.pbkdf_iterations == 0 || parsed.pbkdf_iterations >= (1u << 24)) {
-          parsed.pbkdf_iterations = kFallbackIterations;
-        } else {
-          parsed.have_pbkdf = true;
-        }
-        parsed.algorithm = PasswordKdf::kPbkdf2; // TSK036_PBKDF2_Argon2_Migration_Path
         break;
       }
       case kTlvTypeArgon2: { // TSK036_PBKDF2_Argon2_Migration_Path
-        if (length != sizeof(uint32_t) * 6 + kPbkdfSaltSize) {
-          parsed.have_argon2 = false;
-          break;
+        const size_t expected = sizeof(uint32_t) * 6 + kPbkdfSaltSize; // TSK070
+        bool length_ok = safe_length == expected;                      // TSK070
+        parse_ok = parse_ok && length_ok;                              // TSK070
+        if (length_ok) {
+          std::memcpy(&parsed.argon2.version, payload.data(), sizeof(parsed.argon2.version));
+          std::memcpy(&parsed.argon2.time_cost, payload.data() + sizeof(uint32_t), sizeof(parsed.argon2.time_cost));
+          std::memcpy(&parsed.argon2.memory_cost_kib, payload.data() + sizeof(uint32_t) * 2,
+                      sizeof(parsed.argon2.memory_cost_kib));
+          std::memcpy(&parsed.argon2.parallelism, payload.data() + sizeof(uint32_t) * 3,
+                      sizeof(parsed.argon2.parallelism));
+          std::memcpy(&parsed.argon2.hash_length, payload.data() + sizeof(uint32_t) * 4,
+                      sizeof(parsed.argon2.hash_length));
+          std::memcpy(&parsed.argon2.target_ms, payload.data() + sizeof(uint32_t) * 5,
+                      sizeof(parsed.argon2.target_ms));
+          parsed.argon2.version = FromLittleEndian32(parsed.argon2.version);
+          parsed.argon2.time_cost = FromLittleEndian32(parsed.argon2.time_cost);
+          parsed.argon2.memory_cost_kib = FromLittleEndian32(parsed.argon2.memory_cost_kib);
+          parsed.argon2.parallelism = FromLittleEndian32(parsed.argon2.parallelism);
+          parsed.argon2.hash_length = FromLittleEndian32(parsed.argon2.hash_length);
+          parsed.argon2.target_ms = FromLittleEndian32(parsed.argon2.target_ms);
+          std::memcpy(parsed.argon2.salt.data(), payload.data() + sizeof(uint32_t) * 6,
+                      parsed.argon2.salt.size());
+          std::copy(parsed.argon2.salt.begin(), parsed.argon2.salt.end(), parsed.pbkdf_salt.begin());
+          parsed.have_argon2 = true;
+          parsed.algorithm = PasswordKdf::kArgon2id;
         }
-        std::memcpy(&parsed.argon2.version, payload.data(), sizeof(parsed.argon2.version));
-        std::memcpy(&parsed.argon2.time_cost, payload.data() + sizeof(uint32_t), sizeof(parsed.argon2.time_cost));
-        std::memcpy(&parsed.argon2.memory_cost_kib, payload.data() + sizeof(uint32_t) * 2,
-                    sizeof(parsed.argon2.memory_cost_kib));
-        std::memcpy(&parsed.argon2.parallelism, payload.data() + sizeof(uint32_t) * 3,
-                    sizeof(parsed.argon2.parallelism));
-        std::memcpy(&parsed.argon2.hash_length, payload.data() + sizeof(uint32_t) * 4,
-                    sizeof(parsed.argon2.hash_length));
-        std::memcpy(&parsed.argon2.target_ms, payload.data() + sizeof(uint32_t) * 5,
-                    sizeof(parsed.argon2.target_ms));
-        parsed.argon2.version = FromLittleEndian32(parsed.argon2.version);
-        parsed.argon2.time_cost = FromLittleEndian32(parsed.argon2.time_cost);
-        parsed.argon2.memory_cost_kib = FromLittleEndian32(parsed.argon2.memory_cost_kib);
-        parsed.argon2.parallelism = FromLittleEndian32(parsed.argon2.parallelism);
-        parsed.argon2.hash_length = FromLittleEndian32(parsed.argon2.hash_length);
-        parsed.argon2.target_ms = FromLittleEndian32(parsed.argon2.target_ms);
-        std::memcpy(parsed.argon2.salt.data(), payload.data() + sizeof(uint32_t) * 6,
-                    parsed.argon2.salt.size());
-        std::copy(parsed.argon2.salt.begin(), parsed.argon2.salt.end(), parsed.pbkdf_salt.begin());
-        parsed.have_argon2 = true;
-        parsed.algorithm = PasswordKdf::kArgon2id;
         break;
       }
       case kTlvTypeHybridSalt: {
-        if (length == kHybridSaltSize) {
+        bool length_ok = safe_length == kHybridSaltSize; // TSK070
+        parse_ok = parse_ok && length_ok;                // TSK070
+        if (length_ok) {
           std::memcpy(parsed.hybrid_salt.data(), payload.data(), kHybridSaltSize);
           parsed.have_hybrid = true;
         }
         break;
       }
       case kTlvTypeEpoch: {
-        if (length == sizeof(uint32_t)) {
+        bool length_ok = safe_length == sizeof(uint32_t); // TSK070
+        parse_ok = parse_ok && length_ok;                 // TSK070
+        if (length_ok) {
           uint32_t epoch_le = 0;
           std::memcpy(&epoch_le, payload.data(), sizeof(epoch_le));
           parsed.epoch = FromLittleEndian32(epoch_le);
           parsed.have_epoch = true;
-          if (sizeof(qv::core::EpochTLV) > bytes.size() ||               // TSK030
-              offset < 4 ||                                             // TSK030
-              (offset - 4) > bytes.size() - sizeof(qv::core::EpochTLV)) { // TSK030
-            parsed.valid = false;                                       // TSK030
-            return parsed;                                              // TSK030
+          bool epoch_ok = (offset >= 4) &&
+                          ((offset - 4) <= bytes.size() - sizeof(qv::core::EpochTLV)); // TSK070
+          parse_ok = parse_ok && epoch_ok;                                              // TSK070
+          if (epoch_ok) {
+            std::memcpy(parsed.epoch_tlv_bytes.data(), bytes.data() + offset - 4,
+                        sizeof(qv::core::EpochTLV));
           }
-          std::memcpy(parsed.epoch_tlv_bytes.data(), bytes.data() + offset - 4,
-                      sizeof(qv::core::EpochTLV));
         }
         break;
       }
       case kTlvTypePqc: {
-        if (length == sizeof(qv::core::PQC_KEM_TLV) - 4) {
+        const size_t expected = sizeof(qv::core::PQC_KEM_TLV) - 4; // TSK070
+        bool length_ok = safe_length == expected;                 // TSK070
+        parse_ok = parse_ok && length_ok;                         // TSK070
+        if (length_ok) {
           parsed.pqc.type = type;
           parsed.pqc.length = length;
           uint16_t version_le = 0;
@@ -414,11 +421,21 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         // TSK033: Skip unknown TLVs to maintain forward compatibility
         break;
     }
-    offset += length;
+    size_t next_offset = offset + length; // TSK070
+    if (next_offset < offset) {           // overflow guard TSK070
+      parse_ok = false;                   // TSK070
+      offset = bytes.size();              // TSK070
+    } else if (next_offset > bytes.size()) {
+      parse_ok = false;                   // TSK070
+      offset = bytes.size();              // TSK070
+    } else {
+      offset = next_offset;               // TSK070
+    }
   }
 
-  parsed.valid = magic_ok && version_ok && (parsed.have_pbkdf || parsed.have_argon2) &&
-                parsed.have_hybrid && parsed.have_pqc;
+  parsed.valid = parse_ok && magic_ok && version_ok &&
+                 (parsed.have_pbkdf || parsed.have_argon2) && parsed.have_hybrid &&
+                 parsed.have_pqc; // TSK070
   return parsed;
 }
 
@@ -694,23 +711,18 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
 
   std::error_code size_ec; // TSK038_Resource_Limits_and_DoS_Prevention
   auto container_size = std::filesystem::file_size(container, size_ec); // TSK038_Resource_Limits_and_DoS_Prevention
-  if (size_ec || container_size > kMaxContainerSize) { // TSK038_Resource_Limits_and_DoS_Prevention
-    return std::nullopt; // TSK038_Resource_Limits_and_DoS_Prevention
-  }
-  if (container_size < kTotalHeaderBytes) { // TSK069_DoS_Resource_Exhaustion_Guards ensure header completeness
-    return std::nullopt;
-  }
+  bool size_known = !size_ec;                                           // TSK070
+  bool within_limit = size_known && container_size <= kMaxContainerSize; // TSK070
+  bool header_sized = within_limit && container_size >= kTotalHeaderBytes; // TSK070
+
   std::array<uint8_t, kTotalHeaderBytes> buf{}; // TSK013
-  bool io_ok = false;
+  bool io_ok = false;                           // TSK070
   {
     std::ifstream in(container, std::ios::binary);
     if (in) {
       in.read(reinterpret_cast<char*>(buf.data()), buf.size());
       io_ok = static_cast<size_t>(in.gcount()) == buf.size();
     }
-  }
-  if (!io_ok) { // TSK069_DoS_Resource_Exhaustion_Guards reject partial header reads
-    return std::nullopt;
   }
 
   std::array<uint8_t, kSerializedHeaderBytes> header_bytes{};
@@ -721,48 +733,54 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
 
   auto parsed = ParseHeader(std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
 
-  auto classical_key = DerivePasswordKey(password, parsed);
-  auto parsed_for_kdf = parsed; // TSK038_Resource_Limits_and_DoS_Prevention
+  std::array<uint8_t, 32> classical_key{}; // TSK070
+  bool classical_ok = true;               // TSK070
+  try {
+    classical_key = DerivePasswordKey(password, parsed); // TSK070
+  } catch (const std::exception&) {                      // TSK070
+    classical_ok = false;                                 // TSK070
+  }
+
+  auto parsed_for_kdf = parsed;      // TSK038_Resource_Limits_and_DoS_Prevention
   auto classical_key_copy = classical_key; // TSK038_Resource_Limits_and_DoS_Prevention
-  std::array<uint8_t, 32> hybrid_key{};
-  bool pqc_ok = false;
-  auto kdf_task = std::packaged_task<std::array<uint8_t, 32>()>( // TSK038_Resource_Limits_and_DoS_Prevention
+  struct HybridKdfResult {                  // TSK070
+    std::array<uint8_t, 32> key{};          // TSK070
+    bool success{false};                    // TSK070
+  };                                        // TSK070
+  auto kdf_task = std::packaged_task<HybridKdfResult>( // TSK038_Resource_Limits_and_DoS_Prevention
       [parsed_for_kdf, classical_key_copy]() mutable {
-        try {
-          std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(), parsed_for_kdf.hybrid_salt.size());
-          std::span<const uint8_t> epoch_span; // TSK038_Resource_Limits_and_DoS_Prevention
-          if (parsed_for_kdf.have_epoch) { // TSK038_Resource_Limits_and_DoS_Prevention
-            epoch_span = std::span<const uint8_t>(parsed_for_kdf.epoch_tlv_bytes.data(),
-                                                  parsed_for_kdf.epoch_tlv_bytes.size());
-          }
-          auto result = qv::core::PQCHybridKDF::Mount(std::span<const uint8_t, 32>(classical_key_copy),
-                                                      parsed_for_kdf.pqc,
-                                                      hybrid_salt,
-                                                      std::span<const uint8_t, 16>(parsed_for_kdf.header.uuid),
-                                                      parsed_for_kdf.version,
-                                                      epoch_span); // TSK038_Resource_Limits_and_DoS_Prevention
-          qv::security::Zeroizer::Wipe(
-              std::span<uint8_t>(classical_key_copy.data(), classical_key_copy.size())); // TSK038_Resource_Limits_and_DoS_Prevention
-          return result;
-        } catch (...) {
-          qv::security::Zeroizer::Wipe(
-              std::span<uint8_t>(classical_key_copy.data(), classical_key_copy.size())); // TSK038_Resource_Limits_and_DoS_Prevention
-          throw;
+        HybridKdfResult result{};                                             // TSK070
+        std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(), parsed_for_kdf.hybrid_salt.size());
+        std::span<const uint8_t> epoch_span;                                  // TSK038_Resource_Limits_and_DoS_Prevention
+        if (parsed_for_kdf.have_epoch) {                                      // TSK038_Resource_Limits_and_DoS_Prevention
+          epoch_span = std::span<const uint8_t>(parsed_for_kdf.epoch_tlv_bytes.data(),
+                                                parsed_for_kdf.epoch_tlv_bytes.size());
         }
+        try {
+          result.key = qv::core::PQCHybridKDF::Mount( // TSK038_Resource_Limits_and_DoS_Prevention
+              std::span<const uint8_t, 32>(classical_key_copy), parsed_for_kdf.pqc, hybrid_salt,
+              std::span<const uint8_t, 16>(parsed_for_kdf.header.uuid), parsed_for_kdf.version,
+              epoch_span);
+          result.success = true; // TSK070
+        } catch (const qv::AuthenticationFailureError&) {
+          result.success = false; // TSK070
+        } catch (const std::exception&) {
+          result.success = false; // TSK070
+        }
+        qv::security::Zeroizer::Wipe(
+            std::span<uint8_t>(classical_key_copy.data(), classical_key_copy.size())); // TSK038_Resource_Limits_and_DoS_Prevention
+        return result;                                                                      // TSK070
       });
   auto hybrid_future = kdf_task.get_future(); // TSK038_Resource_Limits_and_DoS_Prevention
-  std::thread(std::move(kdf_task)).detach(); // TSK038_Resource_Limits_and_DoS_Prevention
+  std::thread(std::move(kdf_task)).detach();  // TSK038_Resource_Limits_and_DoS_Prevention
 
+  std::array<uint8_t, 32> hybrid_key{}; // TSK070
+  bool pqc_ok = false;                  // TSK070
   auto status = hybrid_future.wait_for(std::chrono::seconds(30)); // TSK038_Resource_Limits_and_DoS_Prevention
-  if (status == std::future_status::ready) { // TSK038_Resource_Limits_and_DoS_Prevention
-    try {
-      hybrid_key = hybrid_future.get();
-      pqc_ok = true;
-    } catch (const AuthenticationFailureError&) {
-      pqc_ok = false;
-    } catch (const std::exception&) {
-      pqc_ok = false;
-    }
+  if (status == std::future_status::ready) {                      // TSK038_Resource_Limits_and_DoS_Prevention
+    auto hybrid_result = hybrid_future.get();                     // TSK070
+    hybrid_key = hybrid_result.key;                               // TSK070
+    pqc_ok = hybrid_result.success;                               // TSK070
   } else {
     pqc_ok = false; // TSK038_Resource_Limits_and_DoS_Prevention
     qv::orchestrator::Event kdf_timeout{}; // TSK038_Resource_Limits_and_DoS_Prevention
@@ -781,8 +799,9 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
       std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
   bool mac_ok = qv::crypto::ct::CompareEqual(stored_mac, computed_mac);
 
-  bool result = io_ok && parsed.valid && pqc_ok && mac_ok;                // TSK022
-  uint32_t mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, result);      // TSK022
+  bool result = size_known && within_limit && header_sized && io_ok && parsed.valid && classical_ok &&
+                pqc_ok && mac_ok;                                                // TSK070
+  uint32_t mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, result);              // TSK022, TSK070
   std::atomic_signal_fence(std::memory_order_seq_cst);                   // TSK022
   volatile uint32_t guard_mask = mask;                                   // TSK022
   (void)guard_mask;                                                      // TSK022
