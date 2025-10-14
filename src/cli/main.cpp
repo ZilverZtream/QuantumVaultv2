@@ -86,6 +86,9 @@
 
 namespace {
 
+  constexpr const char kGenericAuthFailureMessage[] =
+      "Authentication failed or volume unavailable."; // TSK080_Error_Info_Redaction_in_Release
+
   struct SecurityIntegrationFlags { // TSK035_Platform_Specific_Security_Integration
     bool use_os_store = false;
     bool use_tpm_seal = false;
@@ -1071,7 +1074,7 @@ namespace {
     return "Error";
   }
 
-  std::string DescribeError(const qv::Error& err) {
+  std::string DescribeErrorDetailed(const qv::Error& err) { // TSK080_Error_Info_Redaction_in_Release
     if (!qv::IsFrameworkErrorCode(err.domain, err.code)) {
       return std::string(err.what());
     }
@@ -1124,11 +1127,10 @@ namespace {
     return std::string(err.what());
   }
 
-  std::string UserFacingMessage(const qv::Error& err) { // TSK027
-#ifdef NDEBUG
-    switch (err.domain) {
+  std::string_view GenericDomainMessage(qv::ErrorDomain domain) { // TSK080_Error_Info_Redaction_in_Release
+    switch (domain) {
     case qv::ErrorDomain::Security:
-      return "Authentication failed or volume unavailable.";
+      return kGenericAuthFailureMessage;
     case qv::ErrorDomain::Validation:
       return "Request could not be processed.";
     case qv::ErrorDomain::IO:
@@ -1141,6 +1143,49 @@ namespace {
     default:
       return "Operation failed.";
     }
+  }
+
+  std::string MakeReferenceTag(std::string_view detail) { // TSK080_Error_Info_Redaction_in_Release
+    if (detail.empty()) {
+      return {};
+    }
+    std::vector<uint8_t> bytes(detail.begin(), detail.end());
+    auto digest = qv::crypto::SHA256_Hash(bytes);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    constexpr size_t kPrefixBytes = 6;
+    for (size_t i = 0; i < kPrefixBytes && i < digest.size(); ++i) {
+      oss << std::setw(2) << static_cast<int>(digest[i]);
+    }
+    return oss.str();
+  }
+
+  std::string DescribeErrorRedacted(const qv::Error& err) { // TSK080_Error_Info_Redaction_in_Release
+    std::string_view base = GenericDomainMessage(err.domain);
+    std::string result(base);
+    std::string_view detail = std::string_view(err.what());
+    if (!detail.empty()) {
+      auto ref = MakeReferenceTag(detail);
+      if (!ref.empty()) {
+        result.append(" [ref:#");
+        result.append(ref);
+        result.push_back(']');
+      }
+    }
+    return result;
+  }
+
+  std::string DescribeError(const qv::Error& err) { // TSK080_Error_Info_Redaction_in_Release
+#ifdef NDEBUG
+    return DescribeErrorRedacted(err);
+#else
+    return DescribeErrorDetailed(err);
+#endif
+  }
+
+  std::string UserFacingMessage(const qv::Error& err) { // TSK027
+#ifdef NDEBUG
+    return std::string(GenericDomainMessage(err.domain));
 #else
     return DescribeError(err);
 #endif
@@ -1258,13 +1303,7 @@ namespace {
       auto handle = vm.Mount(container, password);
       if (!handle) {
         SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
-        const char* message =
-#ifdef NDEBUG
-            "Authentication failed or volume unavailable.";
-#else
-            "Authentication failed.";
-#endif
-        std::cerr << message << std::endl;
+        std::cerr << kGenericAuthFailureMessage << std::endl; // TSK080_Error_Info_Redaction_in_Release
         return kExitAuth;
       }
       SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
@@ -1329,13 +1368,7 @@ namespace {
       auto handle = vm.Mount(container, password);
       if (!handle) {
         SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
-        const char* message =
-#ifdef NDEBUG
-            "Authentication failed or volume unavailable.";
-#else
-            "Authentication failed.";
-#endif
-        std::cerr << message << std::endl;
+        std::cerr << kGenericAuthFailureMessage << std::endl; // TSK080_Error_Info_Redaction_in_Release
         return kExitAuth;
       }
       SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
@@ -1956,11 +1989,7 @@ int main(int argc, char** argv) {
     return kExitUsage;
   } catch (const qv::AuthenticationFailureError& err) {
     (void)err;
-#ifdef NDEBUG
-    std::cerr << "Authentication failed or volume unavailable." << std::endl;
-#else
-    std::cerr << "Authentication failed: " << err.what() << std::endl;
-#endif
+    std::cerr << kGenericAuthFailureMessage << std::endl; // TSK080_Error_Info_Redaction_in_Release
     return kExitAuth;
   } catch (const qv::Error& err) {
     ReportError(err);
