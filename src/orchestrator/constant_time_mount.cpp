@@ -697,6 +697,9 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   if (size_ec || container_size > kMaxContainerSize) { // TSK038_Resource_Limits_and_DoS_Prevention
     return std::nullopt; // TSK038_Resource_Limits_and_DoS_Prevention
   }
+  if (container_size < kTotalHeaderBytes) { // TSK069_DoS_Resource_Exhaustion_Guards ensure header completeness
+    return std::nullopt;
+  }
   std::array<uint8_t, kTotalHeaderBytes> buf{}; // TSK013
   bool io_ok = false;
   {
@@ -705,6 +708,9 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
       in.read(reinterpret_cast<char*>(buf.data()), buf.size());
       io_ok = static_cast<size_t>(in.gcount()) == buf.size();
     }
+  }
+  if (!io_ok) { // TSK069_DoS_Resource_Exhaustion_Guards reject partial header reads
+    return std::nullopt;
   }
 
   std::array<uint8_t, kSerializedHeaderBytes> header_bytes{};
