@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex> // TSK067_Nonce_Safety
 
 #include "qv/common.h"
 #include "qv/core/nonce.h"
@@ -186,6 +187,7 @@ std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
 QV_SENSITIVE_BEGIN
 QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
                                                       const std::vector<uint8_t>& data) {
+  std::lock_guard<std::mutex> persist_lock(persist_mutex_); // TSK067_Nonce_Safety
   auto nonce_record = nonce_generator_.NextAuthenticated();
   auto nonce = MakeNonce(nonce_record, chunk_index);
   std::array<uint8_t, kChunkPayloadSize> plaintext{};

@@ -42,6 +42,7 @@ private:
   ChunkCache cache_;
   std::unique_ptr<ReadAheadManager> read_ahead_;
   std::mutex sequential_mutex_;
+  std::mutex persist_mutex_; // TSK067_Nonce_Safety
   int64_t last_read_chunk_{-1};
   uint64_t sequential_read_count_{0};
   int64_t read_ahead_window_end_{-1};

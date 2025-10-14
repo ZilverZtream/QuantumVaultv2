@@ -1,6 +1,7 @@
 #include "qv/storage/chunk_cache.h"
 
 #include <algorithm>
+#include <mutex> // TSK067_Nonce_Safety
 
 namespace qv::storage {
 
