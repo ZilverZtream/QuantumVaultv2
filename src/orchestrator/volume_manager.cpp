@@ -14,6 +14,7 @@
 #include <span>
 #include <sstream>      // TSK033 version formatting
 #include <string_view>
+#include <system_error> // TSK074_Migration_Rollback_and_Backup non-throwing filesystem ops
 #include <vector>
 #include <optional>     // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV control
 
@@ -54,6 +55,25 @@
 using namespace qv::orchestrator;
 
 namespace {
+
+  class ScopedPathRemoval { // TSK074_Migration_Rollback_and_Backup cleanup staged files on failure
+   public:
+    explicit ScopedPathRemoval(std::filesystem::path path) noexcept
+        : path_(std::move(path)) {}
+    ScopedPathRemoval(const ScopedPathRemoval&) = delete;
+    ScopedPathRemoval& operator=(const ScopedPathRemoval&) = delete;
+    ~ScopedPathRemoval() noexcept {
+      if (!path_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+      }
+    }
+
+    void Release() noexcept { path_.clear(); }
+
+   private:
+    std::filesystem::path path_;
+  };
 
   constexpr std::array<char, 8> kVolumeMagic = {'Q', 'V', 'A', 'U', 'L', 'T', '\0', '\0'}; // TSK013
   constexpr uint32_t kHeaderVersion = VolumeManager::kLatestHeaderVersion;                  // TSK033 align serialization with published target
@@ -1237,8 +1257,112 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
       std::span<const uint8_t>(payload.data(), payload.size()));
   payload.insert(payload.end(), new_mac.begin(), new_mac.end());
 
+  auto payload_span =
+      std::span<const uint8_t>(payload.data(), payload.size()); // TSK074_Migration_Rollback_and_Backup reuse views
+
+  auto migration_temp = container;
+  migration_temp += ".migrate.tmp"; // TSK074_Migration_Rollback_and_Backup staged header checkpoint
+  std::error_code temp_ec;
+  std::filesystem::remove(migration_temp, temp_ec); // TSK074_Migration_Rollback_and_Backup clear stale stage
+  ScopedPathRemoval staged_guard(migration_temp);    // TSK074_Migration_Rollback_and_Backup ensure cleanup
+
   try {
-    AtomicReplace(container, std::span<const uint8_t>(payload.data(), payload.size()));
+    AtomicReplace(migration_temp, payload_span);
+  } catch (const qv::Error& err) {
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+    throw qv::Error{err.domain(), err.code(),
+                    "Failed to stage migrated container header"}; // TSK074_Migration_Rollback_and_Backup
+  }
+
+  std::vector<uint8_t> staged_blob; // TSK074_Migration_Rollback_and_Backup
+  {
+    std::ifstream staged_in(migration_temp, std::ios::binary);
+    if (!staged_in) {
+      const int err = errno;
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to open staged migration header"}; // TSK074_Migration_Rollback_and_Backup
+    }
+    staged_blob.assign(std::istreambuf_iterator<char>(staged_in),
+                       std::istreambuf_iterator<char>());
+    if (staged_in.bad()) {
+      const int err = errno;
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to read staged migration header"}; // TSK074_Migration_Rollback_and_Backup
+    }
+  }
+  if (staged_blob != payload) {
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Staged migration header mismatch"}; // TSK074_Migration_Rollback_and_Backup
+  }
+
+  try {
+    auto staged_parsed = ParseHeader(staged_blob);
+    if (staged_parsed.header_version != target_version) {
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+      qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Staged migration header version mismatch"}; // TSK074_Migration_Rollback_and_Backup
+    }
+  } catch (const qv::Error& err) {
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+    throw qv::Error{err.domain(), err.code(),
+                    "Failed to validate staged migration header"}; // TSK074_Migration_Rollback_and_Backup
+  }
+
+  auto version_hex = [](uint32_t version) { // TSK074_Migration_Rollback_and_Backup reusable hex formatter
+    std::ostringstream oss;
+    oss << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << version;
+    return oss.str();
+  };
+  auto format_version = [&](uint32_t version) {
+    return std::string("0x") + version_hex(version);
+  }; // TSK074_Migration_Rollback_and_Backup unify reporting
+
+  auto metadata_dir = MetadataDirFor(container); // TSK074_Migration_Rollback_and_Backup backup location
+  std::error_code metadata_ec;
+  std::filesystem::create_directories(metadata_dir, metadata_ec);
+  if (metadata_ec) {
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+    throw qv::Error{qv::ErrorDomain::IO, metadata_ec.value(),
+                    "Failed to prepare metadata directory: " + metadata_dir.string()};
+  }
+
+  auto container_name = container.filename().string();
+  if (container_name.empty()) {
+    container_name = "volume";
+  }
+  std::ostringstream backup_name;
+  backup_name << container_name << ".pre_migration.v" << version_hex(current_version) << ".bin";
+  auto backup_path = metadata_dir / backup_name.str();
+
+  try {
+    AtomicReplace(backup_path, std::span<const uint8_t>(blob.data(), blob.size()));
+  } catch (const qv::Error& err) {
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+    throw qv::Error{err.domain(), err.code(),
+                    "Failed to persist migration backup"}; // TSK074_Migration_Rollback_and_Backup
+  }
+
+  try {
+    AtomicReplace(container, payload_span);
   } catch (const qv::Error& err) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
@@ -1247,15 +1371,12 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
                     "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
   }
 
+  std::filesystem::remove(migration_temp, temp_ec); // TSK074_Migration_Rollback_and_Backup best-effort cleanup
+  staged_guard.Release();                            // TSK074_Migration_Rollback_and_Backup prevent double remove
+
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
-
-  auto format_version = [](uint32_t version) { // TSK033 helper for diagnostics
-    std::ostringstream oss;
-    oss << "0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << version;
-    return oss.str();
-  };
 
   qv::orchestrator::Event event{}; // TSK033
   event.category = EventCategory::kLifecycle;
