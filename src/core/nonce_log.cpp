@@ -10,7 +10,8 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex> // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
-#include <limits> // TSK095_Memory_Safety_and_Buffer_Bounds overflow guards
+#include <limits>      // TSK095_Memory_Safety_and_Buffer_Bounds overflow guards
+#include <type_traits> // TSK100_Integer_Overflow_and_Arithmetic checked casts
 #include <system_error>
 #include <vector>
 
@@ -78,6 +79,23 @@ namespace {
   }
 
   uint32_t ComputeFNV1a(std::span<const uint8_t> data); // TSK021_Nonce_Log_Durability_and_Crash_Safety forward decl
+
+  template <typename Target, typename Source>
+  Target CheckedUnsignedCast(Source value, const char* context) { // TSK100_Integer_Overflow_and_Arithmetic cast guard
+    static_assert(std::is_unsigned_v<Target>);
+    static_assert(std::is_unsigned_v<Source>);
+    if (value > std::numeric_limits<Target>::max()) {
+      throw Error{ErrorDomain::Validation, 0, context};
+    }
+    return static_cast<Target>(value);
+  }
+
+  size_t CheckedAdd(size_t lhs, size_t rhs, const char* context) { // TSK100_Integer_Overflow_and_Arithmetic addition guard
+    if (lhs > std::numeric_limits<size_t>::max() - rhs) {
+      throw Error{ErrorDomain::Validation, 0, context};
+    }
+    return lhs + rhs;
+  }
 
 #ifdef _WIN32
   int NativeOpen(const std::filesystem::path& path, int flags, int mode) {
@@ -582,12 +600,22 @@ void NonceLog::ReloadUnlocked() {
 
   const size_t committed_size = data.size() - kCommitMagic.size();
 
-  const size_t trailer_size = kTrailerMagic.size() + 8;
-  if (committed_size < trailer_size + kHeaderMagic.size() + 4 + kMacSize) {
+  const size_t trailer_size = CheckedAdd(kTrailerMagic.size(), size_t{8},
+                                         "Nonce log trailer size overflow"); // TSK100_Integer_Overflow_and_Arithmetic trailer guard
+  size_t minimum_payload = CheckedAdd(trailer_size, kHeaderMagic.size(),
+                                      "Nonce log minimum payload overflow (header)"); // TSK100_Integer_Overflow_and_Arithmetic
+  minimum_payload = CheckedAdd(minimum_payload, sizeof(uint32_t),
+                               "Nonce log minimum payload overflow (version)");     // TSK100_Integer_Overflow_and_Arithmetic
+  minimum_payload = CheckedAdd(minimum_payload, kMacSize,
+                               "Nonce log minimum payload overflow (mac)");         // TSK100_Integer_Overflow_and_Arithmetic
+  if (committed_size < minimum_payload) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log too small"};
   }
 
   const size_t payload_size = committed_size - trailer_size;
+  if (payload_size > data.size()) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log payload overflow"}; // TSK100_Integer_Overflow_and_Arithmetic pointer guard
+  }
   const uint8_t* payload = data.data();
   const uint8_t* payload_end = data.data() + payload_size;                    // TSK030
   const uint8_t* trailer_ptr = data.data() + payload_size;
@@ -655,12 +683,24 @@ void NonceLog::ReloadUnlocked() {
     throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};
   }
   const size_t entries_bytes = static_cast<size_t>(payload_end - payload);    // TSK030
-  if (entries_bytes % kEntrySize != 0) {
+  const size_t header_overhead = CheckedAdd(CheckedAdd(kHeaderMagic.size(), sizeof(uint32_t),
+                                                       "Nonce log header overhead overflow"),
+                                            kMacSize,
+                                            "Nonce log MAC overhead overflow"); // TSK100_Integer_Overflow_and_Arithmetic header guard
+  if (entries_bytes < header_overhead) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log entries truncated"};
+  }
+  const size_t entry_bytes = entries_bytes - header_overhead;
+  if (entry_bytes % kEntrySize != 0) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log entry misalignment"};
   }
 
-  const uint32_t computed_count = static_cast<uint32_t>(entries_bytes / kEntrySize);
-  if (stored_count != computed_count) {
+  const size_t computed_count = entry_bytes / kEntrySize;
+  if (computed_count > std::numeric_limits<uint32_t>::max()) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log entry count overflow"}; // TSK100_Integer_Overflow_and_Arithmetic count guard
+  }
+  const uint32_t computed_count32 = static_cast<uint32_t>(computed_count);
+  if (stored_count != computed_count32) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log entry count mismatch"};
   }
 
@@ -674,7 +714,7 @@ void NonceLog::ReloadUnlocked() {
   entries_.reserve(computed_count);
   std::array<uint8_t, kMacSize> prev{};
 
-  for (uint32_t i = 0; i < computed_count; ++i) {
+  for (uint32_t i = 0; i < computed_count32; ++i) {
     uint64_t counter_be;
     ensure_payload(sizeof(counter_be));                                       // TSK030
     std::memcpy(&counter_be, payload, sizeof(counter_be));
@@ -707,7 +747,9 @@ void NonceLog::PersistUnlocked() {
 
   uint32_t checksum = ComputeFNV1a(buffer);
   std::vector<uint8_t> file_bytes = buffer;
-  AppendTrailer(file_bytes, checksum, static_cast<uint32_t>(entries_.size()));
+  const uint32_t entry_count =
+      CheckedUnsignedCast<uint32_t>(entries_.size(), "Nonce log entry count overflow"); // TSK100_Integer_Overflow_and_Arithmetic cast guard
+  AppendTrailer(file_bytes, checksum, entry_count);
   file_bytes.insert(file_bytes.end(), kCommitMagic.begin(), kCommitMagic.end()); // TSK021_Nonce_Log_Durability_and_Crash_Safety
 
   auto wal_path = WalPathFor(path_); // TSK021_Nonce_Log_Durability_and_Crash_Safety
@@ -784,12 +826,22 @@ size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
   EnsureIntegrityMarker(data);
 
   const size_t committed_size = data.size() - kCommitMagic.size();
-  const size_t trailer_size = kTrailerMagic.size() + 8;
-  if (committed_size < trailer_size + kHeaderMagic.size() + 4 + kMacSize) {
+  const size_t trailer_size = CheckedAdd(kTrailerMagic.size(), size_t{8},
+                                         "Nonce log trailer size overflow"); // TSK100_Integer_Overflow_and_Arithmetic trailer guard
+  size_t minimum_payload = CheckedAdd(trailer_size, kHeaderMagic.size(),
+                                      "Nonce log minimum payload overflow (header)"); // TSK100_Integer_Overflow_and_Arithmetic
+  minimum_payload = CheckedAdd(minimum_payload, sizeof(uint32_t),
+                               "Nonce log minimum payload overflow (version)");     // TSK100_Integer_Overflow_and_Arithmetic
+  minimum_payload = CheckedAdd(minimum_payload, kMacSize,
+                               "Nonce log minimum payload overflow (mac)");         // TSK100_Integer_Overflow_and_Arithmetic
+  if (committed_size < minimum_payload) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log too small"};
   }
 
   const size_t payload_size = committed_size - trailer_size;
+  if (payload_size > data.size()) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log payload overflow"}; // TSK100_Integer_Overflow_and_Arithmetic pointer guard
+  }
   const uint8_t* payload = data.data();
   const uint8_t* payload_end = data.data() + payload_size;
   const uint8_t* trailer_ptr = data.data() + payload_size;
@@ -829,8 +881,16 @@ size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
   uint32_t stored_count = qv::ToLittleEndian(stored_count_le);
 
   const size_t entries_bytes = static_cast<size_t>(payload_end - payload);
-  const size_t entry_slots = entries_bytes / kEntrySize;
-  const size_t trailing_bytes = entries_bytes % kEntrySize;
+  const size_t header_overhead = CheckedAdd(CheckedAdd(kHeaderMagic.size(), sizeof(uint32_t),
+                                                       "Nonce log header overhead overflow"),
+                                            kMacSize,
+                                            "Nonce log MAC overhead overflow"); // TSK100_Integer_Overflow_and_Arithmetic header guard
+  if (entries_bytes < header_overhead) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log entries truncated"};
+  }
+  const size_t entry_bytes = entries_bytes - header_overhead;
+  const size_t entry_slots = entry_bytes / kEntrySize;
+  const size_t trailing_bytes = entry_bytes % kEntrySize;
 
   std::vector<LogEntry> valid_entries;
   valid_entries.reserve(entry_slots);
