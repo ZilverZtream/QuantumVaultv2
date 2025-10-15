@@ -27,6 +27,7 @@
 #include <array>     // TSK072_CryptoProvider_Init_and_KAT AES-GCM vectors
 #include <memory>
 #include <mutex>
+#include <new> // TSK110_Initialization_and_Cleanup_Order placement new for runtime reset
 #include <iostream> // TSK023_Production_Crypto_Provider_Complete_Integration runtime logging
 #include <stdexcept>
 #include <string>
@@ -73,11 +74,21 @@ struct RuntimeState { // TSK072_CryptoProvider_Init_and_KAT cache runtime metada
   std::once_flag once;
   HardwareCapabilities caps{};
   bool kat_passed{false};
+
+  void ResetForTesting() { // TSK110_Initialization_and_Cleanup_Order allow test re-entry
+    this->~RuntimeState();
+    new (this) RuntimeState();
+  }
 };
 
 RuntimeState& MutableRuntimeState() {
   static RuntimeState state{}; // TSK072_CryptoProvider_Init_and_KAT global runtime guard
   return state;
+}
+
+std::mutex& RuntimeStateMutex() {
+  static std::mutex mutex; // TSK110_Initialization_and_Cleanup_Order serialize init/reset
+  return mutex;
 }
 
 HardwareCapabilities DetectHardwareCapabilities() {
@@ -286,6 +297,7 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
 
 void EnsureCryptoRuntimeConfigured() {
   auto& state = MutableRuntimeState();
+  std::lock_guard<std::mutex> guard(RuntimeStateMutex()); // TSK110_Initialization_and_Cleanup_Order guard reset race
   std::call_once(state.once, [&state]() {
 #if QV_HAVE_SODIUM
     if (sodium_init() < 0) {
@@ -471,6 +483,15 @@ CryptoProvider& GetCryptoProvider() {
 void SetCryptoProvider(std::shared_ptr<CryptoProvider> provider) {
   std::lock_guard<std::mutex> lock(ProviderMutex());
   ProviderInstance() = std::move(provider);
+}
+
+void ResetCryptoProviderForTesting() { // TSK110_Initialization_and_Cleanup_Order clear singleton state
+  {
+    std::lock_guard<std::mutex> lock(ProviderMutex());
+    ProviderInstance().reset();
+  }
+  std::lock_guard<std::mutex> state_lock(RuntimeStateMutex());
+  MutableRuntimeState().ResetForTesting();
 }
 
 }  // namespace qv::crypto

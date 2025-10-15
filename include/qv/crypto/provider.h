@@ -61,6 +61,7 @@ std::shared_ptr<CryptoProvider> GetCryptoProviderShared();
 CryptoProvider& GetCryptoProvider();
 void SetCryptoProvider(std::shared_ptr<CryptoProvider> provider);
 void EnsureCryptoProviderInitialized(); // TSK072_CryptoProvider_Init_and_KAT runtime initialization hook
+void ResetCryptoProviderForTesting();    // TSK110_Initialization_and_Cleanup_Order test-only reset hook
 
 }  // namespace qv::crypto
 

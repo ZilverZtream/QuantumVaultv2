@@ -27,4 +27,6 @@ private:
   std::vector<std::filesystem::path> search_paths_;
   std::vector<std::unique_ptr<LoadedPlugin>> loaded_;
 };
+
+void ResetPluginSubsystemForTesting(); // TSK110_Initialization_and_Cleanup_Order orchestrator reset hook
 } // namespace qv::orchestrator

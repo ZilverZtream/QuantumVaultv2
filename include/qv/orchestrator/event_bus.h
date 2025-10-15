@@ -139,4 +139,6 @@ namespace qv::orchestrator {
     static constexpr size_t kMaxSyslogBatchSize = 32;     // TSK081_EventBus_Throughput_and_Batching batch size
   };
 
+  void ResetEventBusForTesting(); // TSK110_Initialization_and_Cleanup_Order test-only teardown
+
 } // namespace qv::orchestrator
