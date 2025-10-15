@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex> // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
+#include <limits> // TSK095_Memory_Safety_and_Buffer_Bounds overflow guards
 #include <system_error>
 #include <vector>
 
@@ -323,6 +324,12 @@ namespace {
     WalReplayState state;
     size_t offset = 0;
     while (offset + kWalHeaderSize <= wal_bytes.size()) {
+      if (offset > wal_bytes.size()) { // TSK095_Memory_Safety_and_Buffer_Bounds
+        throw Error{ErrorDomain::Validation, 0, "Nonce WAL offset exceeds buffer"};
+      }
+      if (kWalHeaderSize > wal_bytes.size() - offset) { // TSK095_Memory_Safety_and_Buffer_Bounds
+        throw Error{ErrorDomain::Validation, 0, "Nonce WAL truncated"};
+      }
       const uint8_t* base = wal_bytes.data() + offset;
       if (!std::equal(kWalMagic.begin(), kWalMagic.end(), base)) {
         throw Error{ErrorDomain::Validation, 0, "Nonce WAL magic mismatch"};
@@ -348,15 +355,26 @@ namespace {
       base += sizeof(checksum_le);
       uint32_t checksum = qv::ToLittleEndian(checksum_le);
       size_t header_consumed = kWalHeaderSize;
-      if (offset + header_consumed + payload_size > wal_bytes.size()) {
+      if (payload_size > std::numeric_limits<size_t>::max()) { // TSK095_Memory_Safety_and_Buffer_Bounds
+        throw Error{ErrorDomain::Validation, 0, "Nonce WAL payload too large"};
+      }
+      size_t payload_length = static_cast<size_t>(payload_size);
+      if (header_consumed > wal_bytes.size() - offset ||
+          payload_length > wal_bytes.size() - offset - header_consumed) { // TSK095_Memory_Safety_and_Buffer_Bounds
         throw Error{ErrorDomain::Validation, 0, "Nonce WAL truncated"};
       }
-      std::span<const uint8_t> payload{wal_bytes.data() + offset + header_consumed,
-                                       static_cast<size_t>(payload_size)};
+      const size_t payload_offset = offset + header_consumed;
+      std::span<const uint8_t> payload{wal_bytes.data() + payload_offset, payload_length};
       if (ComputeFNV1a(payload) != checksum) {
         throw Error{ErrorDomain::Validation, 0, "Nonce WAL checksum mismatch"};
       }
-      offset += header_consumed + static_cast<size_t>(payload_size);
+      size_t record_advance = header_consumed + payload_length;               // TSK095_Memory_Safety_and_Buffer_Bounds
+      // overflow guard TSK095_Memory_Safety_and_Buffer_Bounds
+      if (record_advance < header_consumed ||
+          offset > std::numeric_limits<size_t>::max() - record_advance) {
+        throw Error{ErrorDomain::Validation, 0, "Nonce WAL offset overflow"};
+      }
+      offset += record_advance;
       if (type == WalRecordType::kBegin) {
         state.has_pending = true;
         state.pending.assign(payload.begin(), payload.end());
@@ -575,14 +593,23 @@ void NonceLog::ReloadUnlocked() {
   const uint8_t* trailer_ptr = data.data() + payload_size;
   const uint8_t* committed_end = data.data() + committed_size;                // TSK030
 
+  auto ensure_range = [](const uint8_t* cursor, const uint8_t* limit,
+                         size_t needed) -> bool { // TSK095_Memory_Safety_and_Buffer_Bounds
+    if (cursor > limit) {
+      return false;
+    }
+    size_t remaining = static_cast<size_t>(limit - cursor);
+    return needed <= remaining;
+  };
+
   auto ensure_payload = [&](size_t needed) {                                  // TSK030
-    if (needed > static_cast<size_t>(payload_end - payload)) {                // TSK030
+    if (!ensure_range(payload, payload_end, needed)) {                        // TSK095_Memory_Safety_and_Buffer_Bounds
       throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};        // TSK030
     }
   };
 
   auto ensure_trailer = [&](size_t needed) {                                  // TSK030
-    if (needed > static_cast<size_t>(committed_end - trailer_ptr)) {          // TSK030
+    if (!ensure_range(trailer_ptr, committed_end, needed)) {                  // TSK095_Memory_Safety_and_Buffer_Bounds
       throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};        // TSK030
     }
   };
@@ -624,6 +651,9 @@ void NonceLog::ReloadUnlocked() {
   std::copy(payload, payload + kMacSize, key_.begin());
   payload += kMacSize;
 
+  if (payload > payload_end) {                                                // TSK095_Memory_Safety_and_Buffer_Bounds
+    throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};
+  }
   const size_t entries_bytes = static_cast<size_t>(payload_end - payload);    // TSK030
   if (entries_bytes % kEntrySize != 0) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log entry misalignment"};
