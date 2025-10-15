@@ -7,6 +7,7 @@
 #include <fstream>
 #include <span>
 #include <system_error> // TSK098_Exception_Safety_and_Resource_Leaks
+#include <limits>       // TSK100_Integer_Overflow_and_Arithmetic overflow guards
 #include <vector>
 
 namespace qv::storage {
@@ -172,7 +173,12 @@ std::streampos BlockDevice::OffsetForChunk(int64_t chunk_index) const {
   if (chunk_index < 0) {
     throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};
   }
-  return static_cast<std::streampos>(static_cast<uint64_t>(chunk_index) * record_size_);
+  const uint64_t u_index = static_cast<uint64_t>(chunk_index);
+  if (record_size_ != 0 && u_index > std::numeric_limits<uint64_t>::max() / record_size_) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"}; // TSK100_Integer_Overflow_and_Arithmetic guard chunk offset
+  }
+  const uint64_t offset = u_index * record_size_;
+  return static_cast<std::streampos>(offset);
 }
 
 void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t> ciphertext) {

@@ -2,7 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
-#include <mutex> // TSK067_Nonce_Safety
+#include <limits> // TSK100_Integer_Overflow_and_Arithmetic bounds checks
+#include <mutex>  // TSK067_Nonce_Safety
 
 #include "qv/common.h"
 #include "qv/core/nonce.h"
@@ -267,6 +268,9 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
   std::fill(plaintext.begin(), plaintext.end(), 0);
   auto logical_offset = static_cast<uint64_t>(chunk_index) * kChunkPayloadSize;
   auto copy_size = std::min<size_t>(data.size(), plaintext.size());
+  if (copy_size > std::numeric_limits<uint32_t>::max()) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk payload too large"}; // TSK100_Integer_Overflow_and_Arithmetic guard cast
+  }
   std::copy_n(data.begin(), copy_size, plaintext.begin());
   auto context = MakeChunkContext(cipher_, static_cast<uint8_t>(expected_tag_size),
                                   static_cast<uint8_t>(expected_nonce_size));      // TSK083
