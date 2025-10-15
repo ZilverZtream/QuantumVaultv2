@@ -151,13 +151,13 @@ void BlockDevice::EnsureOpenUnlocked() {
     std::ofstream create(path_, std::ios::binary | std::ios::trunc);
     if (!create) {
       throw Error{ErrorDomain::IO, 0,
-                  "Failed to create container file: " + PathToUtf8String(path_)};
+                  "Failed to create container file"}; // TSK103_Logging_and_Information_Disclosure generic error
     }
   }
   file_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
   if (!file_) {
     throw Error{ErrorDomain::IO, 0,
-                "Failed to open container file: " + PathToUtf8String(path_)};
+                "Failed to open container file"}; // TSK103_Logging_and_Information_Disclosure generic error
   }
 }
 
