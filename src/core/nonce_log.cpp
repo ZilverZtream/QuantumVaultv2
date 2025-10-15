@@ -6,13 +6,17 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>      // TSK101_File_IO_Persistence_and_Atomicity retry backoff
+#include <exception>   // TSK101_File_IO_Persistence_and_Atomicity log cleanup errors
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <mutex> // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
+#include <iostream> // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
 #include <limits>      // TSK095_Memory_Safety_and_Buffer_Bounds overflow guards
-#include <type_traits> // TSK100_Integer_Overflow_and_Arithmetic checked casts
+#include <mutex>        // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
 #include <system_error>
+#include <thread>      // TSK101_File_IO_Persistence_and_Atomicity retry backoff
+#include <type_traits> // TSK100_Integer_Overflow_and_Arithmetic checked casts
 #include <vector>
 
 // TSK021_Nonce_Log_Durability_and_Crash_Safety introduce explicit fsync helpers and
@@ -139,20 +143,48 @@ namespace {
   }
 #endif
 
+  bool ShouldRetryFsync(int err) { // TSK101_File_IO_Persistence_and_Atomicity classify retryable failures
+#ifdef _WIN32
+    return err == EINTR || err == EAGAIN;
+#else
+    return err == EINTR || err == EAGAIN || err == EBUSY;
+#endif
+  }
+
   void WriteAll(int fd, std::span<const uint8_t> bytes) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
     size_t offset = 0;
     while (offset < bytes.size()) {
       ssize_t written = NativeWrite(fd, bytes.data() + offset, bytes.size() - offset);
       if (written < 0) {
-        throw Error{ErrorDomain::IO, errno, "Failed to write nonce log snapshot"};
+        int err = errno;
+        if (err == EINTR) { // TSK101_File_IO_Persistence_and_Atomicity retry interrupted writes
+          continue;
+        }
+        throw Error{ErrorDomain::IO, err, "Failed to write nonce log snapshot"};
+      }
+      if (written == 0) {
+        throw Error{ErrorDomain::IO, 0, "Failed to write nonce log snapshot"}; // TSK101_File_IO_Persistence_and_Atomicity short write
       }
       offset += static_cast<size_t>(written);
     }
   }
 
   void SyncFileDescriptor(int fd) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    if (NativeFsync(fd) != 0) {
-      throw Error{ErrorDomain::IO, errno, "Failed to fsync nonce log"};
+    constexpr int kMaxRetries = 4; // TSK101_File_IO_Persistence_and_Atomicity retry fsync
+    std::chrono::milliseconds backoff{5};
+    for (int attempt = 0;; ++attempt) {
+      if (NativeFsync(fd) == 0) {
+        return;
+      }
+      int err = errno;
+      if (err == EINTR) {
+        continue;
+      }
+      if (attempt >= kMaxRetries || !ShouldRetryFsync(err)) {
+        throw Error{ErrorDomain::IO, err, "Failed to fsync nonce log"};
+      }
+      std::this_thread::sleep_for(backoff);
+      backoff *= 2;
     }
   }
 
@@ -168,7 +200,20 @@ namespace {
       ::close(dir_fd);
     }
 #else
-    (void)dir;
+    HANDLE handle = ::CreateFileW(
+        dir.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr); // TSK101_File_IO_Persistence_and_Atomicity ensure metadata flush
+    if (handle == INVALID_HANDLE_VALUE) {
+      throw Error{ErrorDomain::IO, static_cast<int>(::GetLastError()),
+                  "Failed to fsync nonce log directory"};
+    }
+    if (!::FlushFileBuffers(handle)) {
+      auto err = static_cast<int>(::GetLastError());
+      ::CloseHandle(handle);
+      throw Error{ErrorDomain::IO, err, "Failed to fsync nonce log directory"};
+    }
+    ::CloseHandle(handle);
 #endif
   }
 
@@ -202,7 +247,10 @@ namespace {
     ~TempFileGuard() noexcept {
       try {
         Cleanup();
+      } catch (const std::exception& ex) {
+        std::cerr << "TempFileGuard cleanup threw: " << ex.what() << '\n'; // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
       } catch (...) {
+        std::cerr << "TempFileGuard cleanup encountered unknown failure\n"; // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
       }
     }
 
@@ -235,7 +283,10 @@ namespace {
         }
       }
       std::error_code remove_ec;
-      std::filesystem::remove(path_, remove_ec);
+      if (!std::filesystem::remove(path_, remove_ec) && remove_ec) { // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
+        std::cerr << "TempFileGuard cleanup failed for " << path_ << ": "
+                  << remove_ec.message() << '\n';
+      }
       path_.clear();
     }
 
@@ -318,16 +369,23 @@ namespace {
     std::filesystem::rename(temp_path, path, rename_ec);
     if (rename_ec) {
       std::error_code remove_ec;
-      std::filesystem::remove(path, remove_ec);
-      if (remove_ec) {
+      if (!std::filesystem::remove(path, remove_ec) && remove_ec) {
         throw Error{ErrorDomain::IO, remove_ec.value(),
                     "Failed to replace nonce log " + qv::PathToUtf8String(path)};
       }
-      std::filesystem::rename(temp_path, path);
-      temp_guard.Release();
-    } else {
-      temp_guard.Release();
+      std::error_code retry_ec;
+      std::filesystem::rename(temp_path, path, retry_ec);
+      if (retry_ec) {
+        throw Error{ErrorDomain::IO, retry_ec.value(),
+                    "Failed to replace nonce log " + qv::PathToUtf8String(path)}; // TSK101_File_IO_Persistence_and_Atomicity ensure rename success
+      }
     }
+    std::error_code verify_ec;
+    if (!std::filesystem::exists(path, verify_ec) || verify_ec) { // TSK101_File_IO_Persistence_and_Atomicity verify rename
+      throw Error{ErrorDomain::IO, verify_ec ? verify_ec.value() : 0,
+                  "Failed to replace nonce log " + qv::PathToUtf8String(path)};
+    }
+    temp_guard.Release();
 #ifndef _WIN32
     SyncDirectory(ResolveDirectory(path));
 #endif
