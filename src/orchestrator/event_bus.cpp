@@ -540,18 +540,27 @@ std::optional<std::string> BuildEventJson(const Event& event, const std::string&
     }
   }
   for (const auto& field : event.fields) {
+    auto privacy = field.privacy;
+    if (privacy == FieldPrivacy::kPublic) {
+      const bool is_sensitive_path =
+          (field.key == "container_path" || field.key == "container" ||
+           field.key == "plugin_path");
+      if (is_sensitive_path) {
+        privacy = FieldPrivacy::kHash; // TSK103_Logging_and_Information_Disclosure enforce hashed paths
+      }
+    }
     if (!AppendWithLimit(payload, ",\"", max_bytes) ||
         !AppendEscapedWithLimit(payload, field.key, max_bytes) ||
         !AppendWithLimit(payload, "\":", max_bytes)) {
       return std::nullopt;
     }
     std::string sanitized = field.value;
-    if (field.privacy == FieldPrivacy::kRedact) {
+    if (privacy == FieldPrivacy::kRedact) {
       sanitized = "[REDACTED]"; // TSK029 ensure sensitive data is masked
-    } else if (field.privacy == FieldPrivacy::kHash) {
+    } else if (privacy == FieldPrivacy::kHash) {
       sanitized = HashForTelemetry(sanitized);
     }
-    if (field.numeric && field.privacy == FieldPrivacy::kPublic) {
+    if (field.numeric && privacy == FieldPrivacy::kPublic) {
       if (!AppendWithLimit(payload, sanitized, max_bytes)) {
         return std::nullopt;
       }

@@ -1101,9 +1101,9 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
     event.event_id = state.locked ? "volume_mount_locked" : "volume_mount_failure"; // TSK026
     event.message = state.locked ? "Volume locked after repeated authentication failures"
                                  : "Volume mount authentication failed"; // TSK026
-    event.fields.emplace_back("container_hash",                                     // TSK026
-                              HashForTelemetry(qv::PathToUtf8String(sanitized_container)),
-                              FieldPrivacy::kHash);
+    event.fields.emplace_back("container_path",                                    // TSK026
+                              qv::PathToUtf8String(sanitized_container),
+                              FieldPrivacy::kHash);                                 // TSK103_Logging_and_Information_Disclosure hashed path
     event.fields.emplace_back("consecutive_failures", std::to_string(state.failures),
                               FieldPrivacy::kPublic, true); // TSK026
     event.fields.emplace_back("cooldown_seconds", std::to_string(state.enforced_delay.count()),
@@ -1211,8 +1211,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
     kdf_timeout.event_id = "mount_key_timeout"; // TSK080_Error_Info_Redaction_in_Release
     kdf_timeout.message = "Key agreement exceeded timeout"; // TSK080_Error_Info_Redaction_in_Release
-    kdf_timeout.fields.emplace_back("container_path", container.generic_string(),
-                                    qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                    qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention, TSK103_Logging_and_Information_Disclosure
     qv::orchestrator::EventBus::Instance().Publish(kdf_timeout); // TSK038_Resource_Limits_and_DoS_Prevention
   }
 
@@ -1248,8 +1248,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     timeout_event.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
     timeout_event.event_id = "mount_timeout_exceeded"; // TSK038_Resource_Limits_and_DoS_Prevention
     timeout_event.message = "Mount attempt exceeded time limit"; // TSK038_Resource_Limits_and_DoS_Prevention
-    timeout_event.fields.emplace_back("container_path", container.generic_string(),
-                                      qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                      qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention, TSK103_Logging_and_Information_Disclosure
     timeout_event.fields.emplace_back("duration_ns", std::to_string(elapsed.count()),
                                       qv::orchestrator::FieldPrivacy::kPublic, true); // TSK038_Resource_Limits_and_DoS_Prevention
     qv::orchestrator::EventBus::Instance().Publish(timeout_event); // TSK038_Resource_Limits_and_DoS_Prevention
@@ -1284,15 +1284,7 @@ void ConstantTimeMount::LogTiming(const Attempt& a, const Attempt& b) {
   event.category = qv::orchestrator::EventCategory::kTelemetry;
   event.severity = qv::orchestrator::EventSeverity::kInfo;
   event.event_id = "ct_mount_timing";
-  event.message = "Constant-time mount timing sample";
-  event.fields.emplace_back("attempt_a_duration_ns", std::to_string(a.duration.count()),
-                            qv::orchestrator::FieldPrivacy::kPublic, true);
-  event.fields.emplace_back("attempt_b_duration_ns", std::to_string(b.duration.count()),
-                            qv::orchestrator::FieldPrivacy::kPublic, true);
-  event.fields.emplace_back("attempt_a_padding_ns", std::to_string(a.pad.count()),
-                            qv::orchestrator::FieldPrivacy::kPublic, true);
-  event.fields.emplace_back("attempt_b_padding_ns", std::to_string(b.pad.count()),
-                            qv::orchestrator::FieldPrivacy::kPublic, true);
+  event.message = "Constant-time mount timing statistics"; // TSK103_Logging_and_Information_Disclosure aggregate only
   event.fields.emplace_back("target_ns", std::to_string(snap.target_ns),
                             qv::orchestrator::FieldPrivacy::kPublic, true);
   event.fields.emplace_back("p95_ns", std::to_string(snap.p95_ns),
