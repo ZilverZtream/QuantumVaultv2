@@ -25,6 +25,7 @@ namespace qv::orchestrator {
     };
 
     using ProgressCallback = std::function<void(uint32_t current, uint32_t total)>; // TSK036_PBKDF2_Argon2_Migration_Path
+                                                                                   // TSK097_Cryptographic_Key_Management optional timing callback leaks progress metadata
 
     struct KdfPolicy { // TSK036_PBKDF2_Argon2_Migration_Path
       PasswordKdf algorithm{PasswordKdf::kPbkdf2};

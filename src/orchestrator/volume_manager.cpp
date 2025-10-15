@@ -27,6 +27,7 @@
 #include "qv/error.h"
 #include "qv/orchestrator/event_bus.h" // TSK024_Key_Rotation_and_Lifecycle_Management
 #include "qv/orchestrator/io_util.h"   // TSK068_Atomic_Header_Writes atomic persistence
+#include "qv/security/secure_buffer.h" // TSK097_Cryptographic_Key_Management secure allocator for secrets
 #include "qv/security/zeroizer.h"
 
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2 // TSK036_PBKDF2_Argon2_Migration_Path
@@ -194,7 +195,9 @@ namespace {
                                             uint32_t iterations,
                                             ProgressCallback progress = {}) { // TSK036_PBKDF2_Argon2_Migration_Path
     std::array<uint8_t, 32> output{};
+    qv::security::Zeroizer::ScopeWiper<uint8_t> output_guard(std::span<uint8_t>(output.data(), output.size())); // TSK097_Cryptographic_Key_Management ensure final wipe on failure
     std::array<uint8_t, 20> block{};
+    qv::security::Zeroizer::ScopeWiper<uint8_t> block_guard(std::span<uint8_t>(block.data(), block.size())); // TSK097_Cryptographic_Key_Management wipe salt block
     std::memcpy(block.data(), salt.data(), salt.size());
     block[16] = 0;
     block[17] = 0;
@@ -205,9 +208,11 @@ namespace {
 
     auto u = qv::crypto::HMAC_SHA256::Compute(password,
                                               std::span<const uint8_t>(block.data(), block.size()));
+    qv::security::Zeroizer::ScopeWiper<uint8_t> u_guard(std::span<uint8_t>(u.data(), u.size())); // TSK097_Cryptographic_Key_Management wipe intermediate HMAC
     output = u;
     auto iter = u;
-    if (progress) {
+    qv::security::Zeroizer::ScopeWiper<uint8_t> iter_guard(std::span<uint8_t>(iter.data(), iter.size())); // TSK097_Cryptographic_Key_Management wipe PBKDF2 accumulator
+    if (progress) { // TSK097_Cryptographic_Key_Management optional callback leaks timing; use only for UX feedback
       progress(1, iterations);
     }
     for (uint32_t i = 1; i < iterations; ++i) {
@@ -217,17 +222,15 @@ namespace {
         output[j] ^= iter[j];
       }
 
-      if (progress && (i + 1) % 10'000 == 0) {
+      if (progress && (i + 1) % 10'000 == 0) { // TSK097_Cryptographic_Key_Management throttle observable timing updates
         progress(i + 1, iterations);
       }
     }
 
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(iter.data(), iter.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(u.data(), u.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(block.data(), block.size()));
-    if (progress && iterations % 10'000 != 0) {
+    if (progress && iterations % 10'000 != 0) { // TSK097_Cryptographic_Key_Management final optional timing leak acknowledgement
       progress(iterations, iterations);
     }
+    output_guard.Release();
     return output;
   }
 
@@ -835,20 +838,16 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   std::array<uint8_t, kHybridSaltSize> hybrid_salt{};
   FillRandom(hybrid_salt);
 
-  std::vector<uint8_t> password_bytes(password.begin(), password.end());
-  VectorWipeGuard password_guard(password_bytes); // TSK028_Secure_Deletion_and_Data_Remanence, TSK028A_Memory_Wiping_Gaps
   std::optional<Argon2Config> argon2_config; // TSK036_PBKDF2_Argon2_Migration_Path
   uint32_t pbkdf_iterations = 0;             // TSK036_PBKDF2_Argon2_Migration_Path
   std::array<uint8_t, 32> classical_key{};   // TSK036_PBKDF2_Argon2_Migration_Path
-  std::span<const uint8_t> password_span(password_bytes.data(), password_bytes.size());
-  const auto wipe_password_bytes = [&]() noexcept {
-    if (!password_bytes.empty()) {
-      qv::security::Zeroizer::Wipe(
-          std::span<uint8_t>(password_bytes.data(), password_bytes.size()));  // TSK028A_Memory_Wiping_Gaps
-      password_bytes.clear();
+  {
+    qv::security::SecureBuffer<uint8_t> password_bytes(password.size()); // TSK097_Cryptographic_Key_Management secure password copy
+    if (password_bytes.size() > 0) {
+      std::memcpy(password_bytes.data(), reinterpret_cast<const uint8_t*>(password.data()), password.size());
     }
-  };
-  try {
+    qv::security::Zeroizer::ScopeWiper<uint8_t> password_guard(password_bytes.AsSpan()); // TSK097_Cryptographic_Key_Management scoped wipe
+    std::span<const uint8_t> password_span(password_bytes.AsSpan());
     if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
       Argon2Config cfg{};
       cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
@@ -859,12 +858,8 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
       pbkdf_iterations = DeterminePbkdfIterations(password_span, password_salt, kdf_policy_);
       classical_key = DerivePasswordKey(password_span, password_salt, pbkdf_iterations, kdf_policy_.progress);
     }
-    wipe_password_bytes();
-  } catch (...) {
-    wipe_password_bytes();
-    throw;
   }
-  qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
+  qv::security::Zeroizer::ScopeWiper<uint8_t> classical_guard(classical_key.data(), classical_key.size());
 
   qv::core::EpochTLV epoch{};
   epoch.type = ToLittleEndian16(kTlvTypeEpoch);
@@ -876,6 +871,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
       std::span<const uint8_t, 32>(classical_key),
       std::span<const uint8_t>(hybrid_salt.data(), hybrid_salt.size()),
       std::span<const uint8_t, 16>(header.uuid), kHeaderVersion, epoch_bytes);
+  qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size())); // TSK097_Cryptographic_Key_Management wipe immediately after last use
   qv::security::Zeroizer::ScopeWiper creation_guard(creation.hybrid_key.data(),
                                                     creation.hybrid_key.size());
 
@@ -996,19 +992,21 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   auto parsed = ParseHeader(blob); // TSK024_Key_Rotation_and_Lifecycle_Management
 
-  std::vector<uint8_t> current_bytes(current_password.begin(), current_password.end());
-  VectorWipeGuard current_guard(current_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
   std::array<uint8_t, 32> classical_key{}; // TSK036_PBKDF2_Argon2_Migration_Path
-  std::span<const uint8_t> current_span(current_bytes.data(), current_bytes.size());
-  if (parsed.algorithm == PasswordKdf::kArgon2id) {
-    classical_key = DerivePasswordKeyArgon2id(current_span, parsed.argon2);
-  } else {
-    classical_key = DerivePasswordKey(current_span, parsed.pbkdf_salt, parsed.pbkdf_iterations);
+  {
+    qv::security::SecureBuffer<uint8_t> current_bytes(current_password.size()); // TSK097_Cryptographic_Key_Management secure current password copy
+    if (current_bytes.size() > 0) {
+      std::memcpy(current_bytes.data(), reinterpret_cast<const uint8_t*>(current_password.data()), current_password.size());
+    }
+    qv::security::Zeroizer::ScopeWiper<uint8_t> current_guard(current_bytes.AsSpan()); // TSK097_Cryptographic_Key_Management scoped wipe
+    std::span<const uint8_t> current_span(current_bytes.AsSpan());
+    if (parsed.algorithm == PasswordKdf::kArgon2id) {
+      classical_key = DerivePasswordKeyArgon2id(current_span, parsed.argon2);
+    } else {
+      classical_key = DerivePasswordKey(current_span, parsed.pbkdf_salt, parsed.pbkdf_iterations);
+    }
   }
-  qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
-  if (!current_bytes.empty()) {
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(current_bytes.data(), current_bytes.size()));
-  }
+  qv::security::Zeroizer::ScopeWiper<uint8_t> classical_guard(classical_key.data(), classical_key.size());
 
   auto hybrid_key = qv::core::PQCHybridKDF::Mount(
       std::span<const uint8_t, 32>(classical_key.data(), classical_key.size()), parsed.kem_blob,
@@ -1016,6 +1014,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
       std::span<const uint8_t, 16>(parsed.header.uuid), parsed.header_version,
       qv::AsBytesConst(parsed.epoch_tlv)); // TSK024_Key_Rotation_and_Lifecycle_Management
   qv::security::Zeroizer::ScopeWiper hybrid_guard(hybrid_key.data(), hybrid_key.size());
+  qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size())); // TSK097_Cryptographic_Key_Management wipe after PQC mount
 
   auto mac_key = DeriveHeaderMacKey(
       std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid);
@@ -1079,27 +1078,29 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   FillRandom(new_password_salt);
   FillRandom(new_hybrid_salt);
 
-  std::vector<uint8_t> new_bytes(new_password.begin(), new_password.end());
-  VectorWipeGuard new_guard(new_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
   std::optional<Argon2Config> new_argon2; // TSK036_PBKDF2_Argon2_Migration_Path
   uint32_t new_iterations = 0;            // TSK036_PBKDF2_Argon2_Migration_Path
   std::array<uint8_t, 32> new_classical_key{};
-  std::span<const uint8_t> new_span(new_bytes.data(), new_bytes.size());
-  if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
-    Argon2Config cfg{};
-    cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
-    std::copy(new_password_salt.begin(), new_password_salt.end(), cfg.salt.begin());
-    new_classical_key = DerivePasswordKeyArgon2id(new_span, cfg);
-    new_argon2 = cfg;
-  } else {
-    new_iterations = DeterminePbkdfIterations(new_span, new_password_salt, kdf_policy_);
-    new_classical_key = DerivePasswordKey(new_span, new_password_salt, new_iterations, kdf_policy_.progress);
+  {
+    qv::security::SecureBuffer<uint8_t> new_bytes(new_password.size()); // TSK097_Cryptographic_Key_Management secure new password copy
+    if (new_bytes.size() > 0) {
+      std::memcpy(new_bytes.data(), reinterpret_cast<const uint8_t*>(new_password.data()), new_password.size());
+    }
+    qv::security::Zeroizer::ScopeWiper<uint8_t> new_guard(new_bytes.AsSpan()); // TSK097_Cryptographic_Key_Management scoped wipe
+    std::span<const uint8_t> new_span(new_bytes.AsSpan());
+    if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
+      Argon2Config cfg{};
+      cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
+      std::copy(new_password_salt.begin(), new_password_salt.end(), cfg.salt.begin());
+      new_classical_key = DerivePasswordKeyArgon2id(new_span, cfg);
+      new_argon2 = cfg;
+    } else {
+      new_iterations = DeterminePbkdfIterations(new_span, new_password_salt, kdf_policy_);
+      new_classical_key = DerivePasswordKey(new_span, new_password_salt, new_iterations, kdf_policy_.progress);
+    }
   }
-  qv::security::Zeroizer::ScopeWiper new_classical_guard(new_classical_key.data(),
-                                                         new_classical_key.size());
-  if (!new_bytes.empty()) {
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(new_bytes.data(), new_bytes.size()));
-  }
+  qv::security::Zeroizer::ScopeWiper<uint8_t> new_classical_guard(new_classical_key.data(),
+                                                                  new_classical_key.size());
 
   auto new_epoch_tlv =
       qv::core::MakeEpochTlv(new_epoch); // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -1219,19 +1220,21 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   auto parsed = ParseHeader(blob); // TSK033 reuse validated parser
 
-  std::vector<uint8_t> password_bytes(password.begin(), password.end());
-  VectorWipeGuard password_guard(password_bytes); // TSK028_Secure_Deletion_and_Data_Remanence
   std::array<uint8_t, 32> classical_key{}; // TSK036_PBKDF2_Argon2_Migration_Path
-  std::span<const uint8_t> password_span(password_bytes.data(), password_bytes.size());
-  if (parsed.algorithm == PasswordKdf::kArgon2id) {
-    classical_key = DerivePasswordKeyArgon2id(password_span, parsed.argon2);
-  } else {
-    classical_key = DerivePasswordKey(password_span, parsed.pbkdf_salt, parsed.pbkdf_iterations);
+  {
+    qv::security::SecureBuffer<uint8_t> password_bytes(password.size()); // TSK097_Cryptographic_Key_Management secure password copy
+    if (password_bytes.size() > 0) {
+      std::memcpy(password_bytes.data(), reinterpret_cast<const uint8_t*>(password.data()), password.size());
+    }
+    qv::security::Zeroizer::ScopeWiper<uint8_t> password_guard(password_bytes.AsSpan()); // TSK097_Cryptographic_Key_Management scoped wipe
+    std::span<const uint8_t> password_span(password_bytes.AsSpan());
+    if (parsed.algorithm == PasswordKdf::kArgon2id) {
+      classical_key = DerivePasswordKeyArgon2id(password_span, parsed.argon2);
+    } else {
+      classical_key = DerivePasswordKey(password_span, parsed.pbkdf_salt, parsed.pbkdf_iterations);
+    }
   }
-  qv::security::Zeroizer::ScopeWiper classical_guard(classical_key.data(), classical_key.size());
-  if (!password_bytes.empty()) {
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(password_bytes.data(), password_bytes.size()));
-  }
+  qv::security::Zeroizer::ScopeWiper<uint8_t> classical_guard(classical_key.data(), classical_key.size());
 
   auto hybrid_key = qv::core::PQCHybridKDF::Mount(
       std::span<const uint8_t, 32>(classical_key.data(), classical_key.size()), parsed.kem_blob,
@@ -1239,6 +1242,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
       std::span<const uint8_t, 16>(parsed.header.uuid), parsed.header_version,
       qv::AsBytesConst(parsed.epoch_tlv)); // TSK033 authenticate existing header state
   qv::security::Zeroizer::ScopeWiper hybrid_guard(hybrid_key.data(), hybrid_key.size());
+  qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size())); // TSK097_Cryptographic_Key_Management wipe after PQC mount
 
   auto mac_key = DeriveHeaderMacKey(
       std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid); // TSK033
