@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iostream> // TSK098_Exception_Safety_and_Resource_Leaks
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -49,6 +50,87 @@ using namespace qv::orchestrator;
 namespace {
 
 #if !defined(_WIN32)
+  class FileDescriptor { // TSK098_Exception_Safety_and_Resource_Leaks
+   public:
+    FileDescriptor() = default;
+    explicit FileDescriptor(int fd) : fd_(fd) {}
+
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+    FileDescriptor(FileDescriptor&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+
+    FileDescriptor& operator=(FileDescriptor&& other) noexcept {
+      if (this != &other) {
+        reset();
+        fd_ = std::exchange(other.fd_, -1);
+      }
+      return *this;
+    }
+
+    ~FileDescriptor() { reset(); }
+
+    int get() const { return fd_; }
+    explicit operator bool() const { return fd_ >= 0; }
+
+    int Release() { return std::exchange(fd_, -1); }
+
+    void reset(int new_fd = -1) {
+      if (fd_ >= 0) {
+        ::close(fd_);
+      }
+      fd_ = new_fd;
+    }
+
+    void SetCloExec() {
+      if (fd_ < 0) {
+        return;
+      }
+      int flags = ::fcntl(fd_, F_GETFD);
+      if (flags >= 0) {
+        ::fcntl(fd_, F_SETFD, flags | FD_CLOEXEC);
+      }
+    }
+
+   private:
+    int fd_{-1};
+  };
+
+  class SocketPair { // TSK098_Exception_Safety_and_Resource_Leaks
+   public:
+    SocketPair() {
+      int sockets[2] = {-1, -1};
+#if defined(SOCK_CLOEXEC)
+      if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+#else
+      if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+#endif
+        throw Error{ErrorDomain::IO, errno, "socketpair failed"};
+      }
+      parent_.reset(sockets[0]);
+      child_.reset(sockets[1]);
+#if !defined(SOCK_CLOEXEC)
+      parent_.SetCloExec();
+      child_.SetCloExec();
+#endif
+    }
+
+    SocketPair(const SocketPair&) = delete;
+    SocketPair& operator=(const SocketPair&) = delete;
+
+    SocketPair(SocketPair&&) = default;
+    SocketPair& operator=(SocketPair&&) = default;
+
+    ~SocketPair() = default;
+
+    FileDescriptor TakeParent() { return std::move(parent_); }
+    FileDescriptor TakeChild() { return std::move(child_); }
+
+   private:
+    FileDescriptor parent_;
+    FileDescriptor child_;
+  };
+
   constexpr size_t kMaxPluginStringLength = 4096;            // TSK025_Plugin_Sandboxing_and_Resource_Limits
   constexpr uint32_t kPluginHandshakeMessageType = 0x51565048u; // "QVPH"
   constexpr uint32_t kPluginCommandMessageType = 0x5156434du;   // "QVCM"
@@ -411,7 +493,7 @@ namespace {
     return true;
   }
 
-  [[noreturn]] void PluginSubprocess(int channel, const std::filesystem::path& path) {
+  [[noreturn]] void PluginSubprocess(FileDescriptor channel, const std::filesystem::path& path) {
     SetPluginResourceLimits();
 
 #if defined(__linux__)
@@ -423,71 +505,83 @@ namespace {
 
     ApplyPluginSandboxBeforeLoad(); // TSK077
 
-    DynLib library;
-    if (!library.Open(path)) {
-      SendHandshake(channel, -1, nullptr);
-      _exit(EXIT_FAILURE);
-    }
+    int exit_code = EXIT_FAILURE;
+    {
+      DynLib library;
 
-    auto init = reinterpret_cast<QV_Plugin_Init>(library.Symbol("qv_plugin_init"));
-    auto shutdown = reinterpret_cast<QV_Plugin_Shutdown>(library.Symbol("qv_plugin_shutdown"));
-    auto get_info = reinterpret_cast<QV_Plugin_GetInfo>(library.Symbol("qv_plugin_get_info"));
+      auto set_exit = [&exit_code](int code) { exit_code = code; };
 
-    if (!init || !shutdown || !get_info) {
-      SendHandshake(channel, -2, nullptr);
-      _exit(EXIT_FAILURE);
-    }
+      try {
+        if (!library.Open(path)) {
+          SendHandshake(channel.get(), -1, nullptr);
+          set_exit(EXIT_FAILURE);
+        } else {
+          auto init = reinterpret_cast<QV_Plugin_Init>(library.Symbol("qv_plugin_init"));
+          auto shutdown = reinterpret_cast<QV_Plugin_Shutdown>(library.Symbol("qv_plugin_shutdown"));
+          auto get_info = reinterpret_cast<QV_Plugin_GetInfo>(library.Symbol("qv_plugin_get_info"));
 
-    QV_PluginInfo info = get_info();
-    if (!SendHandshake(channel, 0, &info)) {
-      _exit(EXIT_FAILURE);
-    }
+          if (!init || !shutdown || !get_info) {
+            SendHandshake(channel.get(), -2, nullptr);
+            set_exit(EXIT_FAILURE);
+          } else {
+            QV_PluginInfo info = get_info();
+            if (!SendHandshake(channel.get(), 0, &info)) {
+              set_exit(EXIT_FAILURE);
+            } else {
+              ApplyPluginSandbox();
 
-    ApplyPluginSandbox();
+              bool init_complete = false;
+              bool running = true;
+              while (running) {
+                PluginCommandPacket packet{};
+                if (!ReadAll(channel.get(), &packet, sizeof(packet)))
+                  break;
+                if (packet.type != kPluginCommandMessageType)
+                  break;
 
-    bool init_complete = false;
-    bool running = true;
-    while (running) {
-      PluginCommandPacket packet{};
-      if (!ReadAll(channel, &packet, sizeof(packet)))
-        break;
-      if (packet.type != kPluginCommandMessageType)
-        break;
+                const auto command = static_cast<PluginCommand>(packet.command);
+                int command_status = 0;
 
-      const auto command = static_cast<PluginCommand>(packet.command);
-      int command_status = 0;
+                switch (command) {
+                  case PluginCommand::kInit:
+                    if (!init_complete) {
+                      command_status = init ? init() : -1;
+                      if (command_status == 0) {
+                        init_complete = true;
+                      }
+                    }
+                    break;
+                  case PluginCommand::kShutdown:
+                    if (init_complete && shutdown) {
+                      shutdown();
+                    }
+                    running = false;
+                    break;
+                  default:
+                    command_status = -1;
+                    running = false;
+                    break;
+                }
 
-      switch (command) {
-        case PluginCommand::kInit:
-          if (!init_complete) {
-            command_status = init ? init() : -1;
-            if (command_status == 0) {
-              init_complete = true;
+                PluginCommandResultPacket result{};
+                result.type = kPluginResultMessageType;
+                result.command = static_cast<uint32_t>(command);
+                result.status = command_status;
+                if (!WriteAll(channel.get(), &result, sizeof(result))) {
+                  running = false;
+                }
+              }
+
+              set_exit(EXIT_SUCCESS);
             }
           }
-          break;
-        case PluginCommand::kShutdown:
-          if (init_complete && shutdown) {
-            shutdown();
-          }
-          running = false;
-          break;
-        default:
-          command_status = -1;
-          running = false;
-          break;
-      }
-
-      PluginCommandResultPacket result{};
-      result.type = kPluginResultMessageType;
-      result.command = static_cast<uint32_t>(command);
-      result.status = command_status;
-      if (!WriteAll(channel, &result, sizeof(result))) {
-        break;
+        }
+      } catch (...) {
+        set_exit(EXIT_FAILURE);
       }
     }
 
-    _exit(EXIT_SUCCESS);
+    _exit(exit_code);
   }
 #endif
   // TSK010 cross-platform dynamic loader wrapper.
@@ -639,10 +733,9 @@ namespace {
     return false;
   }
 
-  void
-  PublishPluginDiagnostic(qv::orchestrator::EventSeverity severity, std::string_view event_id,
-                          std::string_view message, const std::filesystem::path& path,
-                          std::vector<qv::orchestrator::EventField> extra_fields = {}) { // TSK019
+  void PublishPluginDiagnostic(qv::orchestrator::EventSeverity severity, std::string_view event_id,
+                               std::string_view message, const std::filesystem::path& path,
+                               std::vector<qv::orchestrator::EventField> extra_fields = {}) { // TSK019
     qv::orchestrator::Event event;
     event.category = qv::orchestrator::EventCategory::kLifecycle;
     event.severity = severity;
@@ -656,7 +749,14 @@ namespace {
     for (auto& field : extra_fields) {
       event.fields.push_back(std::move(field));
     }
-    qv::orchestrator::EventBus::Instance().Publish(event);
+    try {
+      qv::orchestrator::EventBus::Instance().Publish(event);
+    } catch (const std::exception& ex) { // TSK098_Exception_Safety_and_Resource_Leaks
+      std::clog << "{\"event\":\"plugin_event_publish_failed\",\"error\":\"" << ex.what()
+                << "\"}" << std::endl;
+    } catch (...) { // TSK098_Exception_Safety_and_Resource_Leaks
+      std::clog << "{\"event\":\"plugin_event_publish_failed\",\"error\":\"unknown\"}" << std::endl;
+    }
   }
 
 } // namespace
@@ -672,7 +772,7 @@ struct PluginManager::LoadedPlugin {
   DynLib library;
 #else
   pid_t pid{-1};
-  int channel{-1};
+  FileDescriptor channel; // TSK098_Exception_Safety_and_Resource_Leaks
 #endif
 };
 
@@ -877,44 +977,44 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
     plugin_loaded.fields.emplace_back("plugin_version", info.version,
                                       qv::orchestrator::FieldPrivacy::kPublic);
   }
-  qv::orchestrator::EventBus::Instance().Publish(plugin_loaded);
+  try {
+    qv::orchestrator::EventBus::Instance().Publish(plugin_loaded);
+  } catch (const std::exception& ex) { // TSK098_Exception_Safety_and_Resource_Leaks
+    std::clog << "{\"event\":\"plugin_event_publish_failed\",\"error\":\"" << ex.what()
+              << "\"}" << std::endl;
+  } catch (...) { // TSK098_Exception_Safety_and_Resource_Leaks
+    std::clog << "{\"event\":\"plugin_event_publish_failed\",\"error\":\"unknown\"}" << std::endl;
+  }
   return true;
 #else
-  int sockets[2];
-#if defined(SOCK_CLOEXEC)
-  if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
-#else
-  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
-#endif
+  std::optional<SocketPair> sockets;
+  try {
+    sockets.emplace();
+  } catch (const Error&) { // TSK098_Exception_Safety_and_Resource_Leaks
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_ipc_failure",
                             "Failed to create plugin IPC channel", canonical_path);
     return false;
   }
 
-#if !defined(SOCK_CLOEXEC)
-  for (int fd : sockets) {
-    int flags = ::fcntl(fd, F_GETFD);
-    if (flags >= 0) {
-      ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-    }
-  }
-#endif
-
   pid_t pid = ::fork();
   if (pid < 0) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_fork_failure",
                             "Failed to fork plugin sandbox", canonical_path);
-    ::close(sockets[0]);
-    ::close(sockets[1]);
     return false;
   }
 
   if (pid == 0) {
-    ::close(sockets[0]);
-    PluginSubprocess(sockets[1], canonical_path);
+    auto child_channel = sockets->TakeChild();
+    {
+      auto parent_guard = sockets->TakeParent();
+    }
+    PluginSubprocess(std::move(child_channel), canonical_path);
   }
 
-  ::close(sockets[1]);
+  auto channel = sockets->TakeParent();
+  {
+    auto child_guard = sockets->TakeChild();
+  }
 
   auto cleanup_child = [&](int signal) {
     if (pid > 0) {
@@ -928,11 +1028,10 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   PluginHandshakePacket handshake{};
   std::string plugin_name;
   std::string plugin_version;
-  if (!ReceiveHandshake(sockets[0], &handshake, plugin_name, plugin_version,
+  if (!ReceiveHandshake(channel.get(), &handshake, plugin_name, plugin_version,
                         kPluginHandshakeTimeout)) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_handshake_failure",
                             "Failed to negotiate plugin handshake", canonical_path);
-    ::close(sockets[0]);
     cleanup_child(SIGKILL);
     return false;
   }
@@ -940,7 +1039,6 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   if (handshake.status != 0) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_child_error",
                             "Sandboxed plugin reported initialization error", canonical_path);
-    ::close(sockets[0]);
     cleanup_child(0);
     return false;
   }
@@ -952,7 +1050,6 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
         "Plugin ABI version outside allowed range", canonical_path,
         {qv::orchestrator::EventField("reported_abi_version", std::to_string(handshake.abi_version),
                                       qv::orchestrator::FieldPrivacy::kPublic, true)});
-    ::close(sockets[0]);
     cleanup_child(SIGKILL);
     return false;
   }
@@ -961,13 +1058,11 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
                             "plugin_capability_schema_mismatch",
                             "Sandboxed plugin reported incompatible capability schema", canonical_path);
-    ::close(sockets[0]);
     cleanup_child(SIGKILL);
     return false;
   }
 
   if (!ValidateCapabilities(handshake.capabilities, policy, canonical_path, plugin_name)) {
-    ::close(sockets[0]);
     cleanup_child(SIGKILL);
     return false;
   }
@@ -985,25 +1080,22 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kWarning, "plugin_identity_mismatch",
                             "Plugin identifier does not match verification policy", canonical_path,
                             std::move(identity_fields));
-    ::close(sockets[0]);
     cleanup_child(SIGKILL);
     return false;
   }
 
-  if (!SendCommandMessage(sockets[0], PluginCommand::kInit)) {
+  if (!SendCommandMessage(channel.get(), PluginCommand::kInit)) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_init_ipc_failure",
                             "Failed to send plugin init command", canonical_path);
-    ::close(sockets[0]);
     cleanup_child(SIGKILL);
     return false;
   }
 
   int init_status = 0;
-  if (!AwaitCommandResult(sockets[0], PluginCommand::kInit, &init_status, kPluginInitTimeout) ||
+  if (!AwaitCommandResult(channel.get(), PluginCommand::kInit, &init_status, kPluginInitTimeout) ||
       init_status != 0) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_initialization_failed",
                             "Plugin initialization routine failed", canonical_path);
-    ::close(sockets[0]);
     cleanup_child(SIGKILL);
     return false;
   }
@@ -1014,7 +1106,7 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
   stored->name = std::move(plugin_name);
   stored->version = std::move(plugin_version);
   stored->pid = pid;
-  stored->channel = sockets[0];
+  stored->channel = std::move(channel);
   loaded_.push_back(std::move(stored));
   qv::orchestrator::Event plugin_loaded{};       // TSK029
   plugin_loaded.category = EventCategory::kLifecycle;
@@ -1031,7 +1123,14 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
     plugin_loaded.fields.emplace_back("plugin_version", loaded_.back()->version,
                                       qv::orchestrator::FieldPrivacy::kPublic);
   }
-  qv::orchestrator::EventBus::Instance().Publish(plugin_loaded);
+  try {
+    qv::orchestrator::EventBus::Instance().Publish(plugin_loaded);
+  } catch (const std::exception& ex) { // TSK098_Exception_Safety_and_Resource_Leaks
+    std::clog << "{\"event\":\"plugin_event_publish_failed\",\"error\":\"" << ex.what()
+              << "\"}" << std::endl;
+  } catch (...) { // TSK098_Exception_Safety_and_Resource_Leaks
+    std::clog << "{\"event\":\"plugin_event_publish_failed\",\"error\":\"unknown\"}" << std::endl;
+  }
   return true;
 #endif
 }
@@ -1046,11 +1145,10 @@ void PluginManager::UnloadAll() {
     }
     // library closes when DynLib destructor runs.
 #else
-    if (plugin->channel >= 0) {
-      SendCommandMessage(plugin->channel, PluginCommand::kShutdown);
-      AwaitCommandResult(plugin->channel, PluginCommand::kShutdown, nullptr);
-      ::close(plugin->channel);
-      plugin->channel = -1;
+    if (plugin->channel) {
+      SendCommandMessage(plugin->channel.get(), PluginCommand::kShutdown);
+      AwaitCommandResult(plugin->channel.get(), PluginCommand::kShutdown, nullptr);
+      plugin->channel.reset();
     }
     if (plugin->pid > 0) {
       ::waitpid(plugin->pid, nullptr, 0);
