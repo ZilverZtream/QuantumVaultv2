@@ -39,6 +39,41 @@ std::array<uint8_t, 32> DeriveChunkKey(std::span<const uint8_t, 32> master) {
   return qv::core::DeriveDataKey(master);
 }
 
+size_t ExpectedTagSize(qv::crypto::CipherType cipher) { // TSK083_AAD_Recompute_and_Binding
+  switch (cipher) {
+    case qv::crypto::CipherType::AEGIS_128X:
+      return qv::crypto::kAEGIS128XTagSize;
+    case qv::crypto::CipherType::AEGIS_128L:
+      return qv::crypto::kAEGIS128LTagSize;
+    case qv::crypto::CipherType::AEGIS_256:
+      return qv::crypto::kAEGIS256TagSize;
+    case qv::crypto::CipherType::AES_256_GCM:
+    case qv::crypto::CipherType::CHACHA20_POLY1305:
+      return qv::crypto::AES256_GCM::TAG_SIZE;
+  }
+  return 0;
+}
+
+size_t ExpectedNonceSize(qv::crypto::CipherType cipher) { // TSK083
+  switch (cipher) {
+    case qv::crypto::CipherType::AEGIS_128X:
+      return qv::crypto::kAEGIS128XNonceSize;
+    case qv::crypto::CipherType::AEGIS_128L:
+      return qv::crypto::kAEGIS128LNonceSize;
+    case qv::crypto::CipherType::AEGIS_256:
+      return qv::crypto::kAEGIS256NonceSize;
+    case qv::crypto::CipherType::AES_256_GCM:
+    case qv::crypto::CipherType::CHACHA20_POLY1305:
+      return qv::crypto::AES256_GCM::NONCE_SIZE;
+  }
+  return 0;
+}
+
+std::array<uint8_t, 8> MakeChunkContext(qv::crypto::CipherType cipher, uint8_t tag_size,
+                                        uint8_t nonce_size) { // TSK083
+  return qv::core::BindChunkAADContext(static_cast<uint8_t>(cipher), tag_size, nonce_size);
+}
+
 }  // namespace
 
 ChunkManager::ChunkManager(const std::filesystem::path& container,
@@ -162,6 +197,11 @@ std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
   if (record.header.epoch != epoch_) {  // TSK078_Chunk_Integrity_and_Bounds
     throw Error{ErrorDomain::Validation, 0, "Chunk epoch mismatch"};
   }
+  const uint64_t expected_offset =
+      static_cast<uint64_t>(record.header.chunk_index) * kChunkPayloadSize; // TSK083_AAD_Recompute_and_Binding
+  if (record.header.logical_offset != expected_offset) {
+    throw Error{ErrorDomain::Validation, 0, "Logical offset mismatch"};
+  }
   if (record.header.data_size > kChunkPayloadSize) {  // TSK078_Chunk_Integrity_and_Bounds
     throw Error{ErrorDomain::Validation, 0, "Header data size exceeds payload capacity"};
   }
@@ -169,20 +209,31 @@ std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
   if (!qv::crypto::CipherAvailable(cipher) && cipher != qv::crypto::CipherType::AES_256_GCM) {
     throw Error{ErrorDomain::Crypto, 0, "Cipher unavailable for chunk"};
   }
-  auto aad_envelope = qv::core::MakeChunkAAD(record.header.epoch,
-                                             record.header.chunk_index,
-                                             record.header.logical_offset,
-                                             record.header.data_size,
-                                             record.header.aad_mac);
+  const auto expected_tag_size = ExpectedTagSize(cipher);                    // TSK083
+  const auto expected_nonce_size = ExpectedNonceSize(cipher);                // TSK083
+  if (expected_tag_size == 0 || expected_tag_size > record.header.tag.size()) {
+    throw Error{ErrorDomain::Validation, 0, "Unsupported tag size for cipher"};
+  }
+  if (expected_nonce_size == 0 || expected_nonce_size > record.header.nonce.size()) {
+    throw Error{ErrorDomain::Validation, 0, "Unsupported nonce size for cipher"};
+  }
+  if (record.header.tag_size != expected_tag_size) {
+    throw Error{ErrorDomain::Validation, 0, "Header tag size mismatch"};
+  }
+  if (record.header.nonce_size != expected_nonce_size) {
+    throw Error{ErrorDomain::Validation, 0, "Header nonce size mismatch"};
+  }
+  auto context = MakeChunkContext(cipher, static_cast<uint8_t>(expected_tag_size),
+                                  static_cast<uint8_t>(expected_nonce_size)); // TSK083
+  auto aad_data = qv::core::MakeAADData(record.header.epoch, record.header.chunk_index,
+                                        record.header.logical_offset, record.header.data_size,
+                                        context);
+  auto aad_envelope = qv::core::MakeAADEnvelope(
+      aad_data, std::span<const uint8_t, 32>(record.header.aad_mac)); // TSK083
   auto aad_bytes = qv::AsBytesConst(aad_envelope);
-  if (record.header.nonce_size == 0 || record.header.nonce_size > record.header.nonce.size()) {
-    throw Error{ErrorDomain::Validation, 0, "Invalid nonce size in header"};
-  }
-  if (record.header.tag_size == 0 || record.header.tag_size > record.header.tag.size()) {
-    throw Error{ErrorDomain::Validation, 0, "Invalid tag size in header"};
-  }
-  auto nonce_span = std::span<const uint8_t>(record.header.nonce.data(), record.header.nonce_size);
-  auto tag_span = std::span<const uint8_t>(record.header.tag.data(), record.header.tag_size);
+  auto nonce_span =
+      std::span<const uint8_t>(record.header.nonce.data(), expected_nonce_size); // TSK083
+  auto tag_span = std::span<const uint8_t>(record.header.tag.data(), expected_tag_size); // TSK083
   auto plaintext = qv::crypto::AEAD_Decrypt(
       cipher,
       record.ciphertext,
@@ -203,15 +254,26 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
   std::lock_guard<std::mutex> persist_lock(persist_mutex_); // TSK067_Nonce_Safety
   auto nonce_record = nonce_generator_.NextAuthenticated();
   auto nonce = MakeNonce(nonce_record, chunk_index);
+  const auto expected_tag_size = ExpectedTagSize(cipher_);                      // TSK083
+  const auto expected_nonce_size = ExpectedNonceSize(cipher_);                  // TSK083
+  if (expected_tag_size == 0 || expected_nonce_size == 0) {
+    throw Error{ErrorDomain::Crypto, 0, "Unsupported cipher parameters"};
+  }
+  if (nonce.size() != expected_nonce_size) {
+    throw Error{ErrorDomain::Crypto, 0, "Nonce length mismatch"};
+  }
   std::array<uint8_t, kChunkPayloadSize> plaintext{};
   qv::security::Zeroizer::ScopeWiper plaintext_guard(plaintext.data(), plaintext.size()); // TSK028A_Memory_Wiping_Gaps
   std::fill(plaintext.begin(), plaintext.end(), 0);
   auto logical_offset = static_cast<uint64_t>(chunk_index) * kChunkPayloadSize;
   auto copy_size = std::min<size_t>(data.size(), plaintext.size());
   std::copy_n(data.begin(), copy_size, plaintext.begin());
-  auto aad_envelope = qv::core::MakeChunkAAD(epoch_, chunk_index, logical_offset,
-                                             static_cast<uint32_t>(copy_size),
-                                             nonce_record.mac);
+  auto context = MakeChunkContext(cipher_, static_cast<uint8_t>(expected_tag_size),
+                                  static_cast<uint8_t>(expected_nonce_size));      // TSK083
+  auto aad_data = qv::core::MakeAADData(epoch_, chunk_index, logical_offset,
+                                        static_cast<uint32_t>(copy_size), context);
+  auto aad_envelope =
+      qv::core::MakeAADEnvelope(aad_data, nonce_record.mac);                        // TSK083
   auto aad_bytes = qv::AsBytesConst(aad_envelope);
   auto encrypt_result = qv::crypto::AEAD_Encrypt(
       cipher_,
@@ -221,6 +283,9 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
       std::span<const uint8_t>(data_key_.data(), data_key_.size()));
   if (encrypt_result.ciphertext.size() != kChunkPayloadSize) {
     throw Error{ErrorDomain::Crypto, 0, "Encrypted chunk size mismatch"};
+  }
+  if (encrypt_result.tag.size() != expected_tag_size) {                          // TSK083
+    throw Error{ErrorDomain::Crypto, 0, "AEAD tag length mismatch"};
   }
 
   ChunkHeader header{};
@@ -236,8 +301,8 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
   std::copy_n(nonce.begin(), std::min<size_t>(nonce.size(), header.nonce.size()), header.nonce.begin());
   std::copy(nonce_record.mac.begin(), nonce_record.mac.end(), header.aad_mac.begin());
   header.cipher_id = static_cast<uint8_t>(cipher_);
-  header.tag_size = static_cast<uint8_t>(encrypt_result.tag.size());
-  header.nonce_size = static_cast<uint8_t>(nonce.size());
+  header.tag_size = static_cast<uint8_t>(expected_tag_size);
+  header.nonce_size = static_cast<uint8_t>(expected_nonce_size);
 
   device_.WriteChunk(header, encrypt_result.ciphertext);
 

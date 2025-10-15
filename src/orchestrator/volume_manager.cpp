@@ -21,6 +21,7 @@
 #include "qv/common.h"
 #include "qv/core/nonce.h"
 #include "qv/core/pqc_hybrid_kdf.h"
+#include "qv/crypto/aegis.h"   // TSK083_AAD_Recompute_and_Binding cipher identifiers
 #include "qv/crypto/aes_gcm.h" // TSK024_Key_Rotation_and_Lifecycle_Management
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/error.h"
@@ -139,6 +140,23 @@ namespace {
 
   static_assert(sizeof(VolumeHeader) == 32, "volume header must be 32 bytes");  // TSK013
   static_assert(sizeof(ReservedV2Tlv) == 36, "reserved TLV layout unexpected"); // TSK013
+
+  constexpr uint8_t kAesGcmCipherId =                                         // TSK083_AAD_Recompute_and_Binding
+      static_cast<uint8_t>(qv::crypto::CipherType::AES_256_GCM);
+  constexpr uint8_t kAesGcmTagSize =                                          // TSK083
+      static_cast<uint8_t>(qv::crypto::AES256_GCM::TAG_SIZE);
+  constexpr uint8_t kAesGcmNonceSize =                                        // TSK083
+      static_cast<uint8_t>(qv::crypto::AES256_GCM::NONCE_SIZE);
+
+  qv::core::AADEnvelope MakeChunkEnvelope(uint32_t epoch, int64_t chunk_index, // TSK083
+                                          uint64_t logical_offset,
+                                          uint32_t chunk_size,
+                                          std::span<const uint8_t, 32> nonce_chain_mac) {
+    auto context =
+        qv::core::BindChunkAADContext(kAesGcmCipherId, kAesGcmTagSize, kAesGcmNonceSize);
+    auto aad_data = qv::core::MakeAADData(epoch, chunk_index, logical_offset, chunk_size, context);
+    return qv::core::MakeAADEnvelope(aad_data, nonce_chain_mac);
+  }
 
   void FillRandom(std::span<uint8_t> out) { // TSK013
     std::random_device rd;
@@ -761,28 +779,30 @@ VolumeManager::ChunkEncryptionResult VolumeManager::EncryptChunk(
     uint64_t logical_offset, uint32_t chunk_size, qv::core::NonceGenerator& nonce_gen,
     std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> data_key) { // TSK040_AAD_Binding_and_Chunk_Authentication
   auto nonce_record = nonce_gen.NextAuthenticated();                       // TSK040
-  auto envelope = qv::core::MakeChunkAAD(epoch, chunk_index, logical_offset,
-                                         chunk_size, nonce_record.mac);     // TSK040
+  auto envelope = MakeChunkEnvelope(epoch, chunk_index, logical_offset,
+                                    chunk_size, nonce_record.mac);          // TSK083_AAD_Recompute_and_Binding
   auto enc_result = qv::crypto::AES256_GCM_Encrypt(                         // TSK040
       plaintext, qv::AsBytesConst(envelope),
       std::span<const uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE>(
           nonce_record.nonce.data(), nonce_record.nonce.size()),
       data_key);
-
-  ChunkEncryptionResult sealed{};                                           // TSK040
-  sealed.nonce = nonce_record.nonce;                                        // TSK040
-  sealed.tag = enc_result.tag;                                              // TSK040
-  sealed.nonce_chain_mac = nonce_record.mac;                                // TSK040
-  sealed.ciphertext = std::move(enc_result.ciphertext);                     // TSK040
-  return sealed;                                                            // TSK040
+  return ChunkEncryptionResult(epoch, chunk_index, logical_offset, chunk_size,
+                               nonce_record.nonce, enc_result.tag,
+                               nonce_record.mac, std::move(enc_result.ciphertext)); // TSK083
 }
 
 std::vector<uint8_t> VolumeManager::DecryptChunk(
     const ChunkEncryptionResult& sealed_chunk, uint32_t epoch, int64_t chunk_index,
     uint64_t logical_offset, uint32_t chunk_size,
     std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> data_key) { // TSK040_AAD_Binding_and_Chunk_Authentication
-  auto envelope = qv::core::MakeChunkAAD(epoch, chunk_index, logical_offset,
-                                         chunk_size, sealed_chunk.nonce_chain_mac); // TSK040
+  if (sealed_chunk.epoch != epoch || sealed_chunk.chunk_index != chunk_index ||         // TSK083
+      sealed_chunk.logical_offset != logical_offset || sealed_chunk.chunk_size != chunk_size) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Sealed chunk metadata mismatch"}; // TSK083
+  }
+  auto envelope =
+      MakeChunkEnvelope(sealed_chunk.epoch, sealed_chunk.chunk_index, sealed_chunk.logical_offset,
+                        sealed_chunk.chunk_size, sealed_chunk.nonce_chain_mac); // TSK083
   return qv::crypto::AES256_GCM_Decrypt(                                            // TSK040
       std::span<const uint8_t>(sealed_chunk.ciphertext.data(), sealed_chunk.ciphertext.size()),
       qv::AsBytesConst(envelope),

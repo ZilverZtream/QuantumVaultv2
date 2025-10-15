@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>       // TSK040_AAD_Binding_and_Chunk_Authentication keyed spans
 #include <string>
+#include <utility>    // TSK083_AAD_Recompute_and_Binding move-only sealed payload
 #include <vector>     // TSK040_AAD_Binding_and_Chunk_Authentication ciphertext storage
 
 namespace qv::orchestrator {
@@ -60,10 +61,29 @@ namespace qv::orchestrator {
         const std::filesystem::path& container); // TSK082_Backup_Verification_and_Schema
 
     struct ChunkEncryptionResult { // TSK040_AAD_Binding_and_Chunk_Authentication bundle integrity inputs
-      std::array<uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE> nonce{};          // TSK040
-      std::array<uint8_t, qv::crypto::AES256_GCM::TAG_SIZE> tag{};              // TSK040
-      std::array<uint8_t, 32> nonce_chain_mac{};                                // TSK040
-      std::vector<uint8_t> ciphertext;                                         // TSK040
+      ChunkEncryptionResult(uint32_t epoch_in, int64_t chunk_index_in,           // TSK083_AAD_Recompute_and_Binding immutable sealed payload
+                            uint64_t logical_offset_in, uint32_t chunk_size_in,
+                            std::array<uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE> nonce_in,
+                            std::array<uint8_t, qv::crypto::AES256_GCM::TAG_SIZE> tag_in,
+                            std::array<uint8_t, 32> nonce_chain_mac_in,
+                            std::vector<uint8_t>&& ciphertext_in)
+          : epoch(epoch_in),
+            chunk_index(chunk_index_in),
+            logical_offset(logical_offset_in),
+            chunk_size(chunk_size_in),
+            nonce(nonce_in),
+            tag(tag_in),
+            nonce_chain_mac(nonce_chain_mac_in),
+            ciphertext(std::move(ciphertext_in)) {}
+
+      const uint32_t epoch;                                                     // TSK083
+      const int64_t chunk_index;                                                // TSK083
+      const uint64_t logical_offset;                                            // TSK083
+      const uint32_t chunk_size;                                                // TSK083
+      const std::array<uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE> nonce;       // TSK040
+      const std::array<uint8_t, qv::crypto::AES256_GCM::TAG_SIZE> tag;           // TSK040
+      const std::array<uint8_t, 32> nonce_chain_mac;                             // TSK040
+      const std::vector<uint8_t> ciphertext;                                    // TSK040
     };
 
     static ChunkEncryptionResult EncryptChunk(std::span<const uint8_t> plaintext,
