@@ -695,8 +695,21 @@ JsonLineLogger::JsonLineLogger()
 std::filesystem::path JsonLineLogger::LogPath() const { // TSK029
   std::filesystem::path logs_dir = std::filesystem::current_path() / "logs";
   std::error_code ec;
-  if (!std::filesystem::exists(logs_dir, ec)) {
+  const bool exists = std::filesystem::exists(logs_dir, ec);
+  if (ec) {
+    throw Error{ErrorDomain::IO, ec.value(),
+                "Failed to query audit log directory " + qv::PathToUtf8String(logs_dir) +
+                    ": " + ec.message(),
+                ec.value(), qv::Retryability::kTransient}; // TSK109_Error_Code_Handling surface filesystem failure
+  }
+  if (!exists) {
     std::filesystem::create_directories(logs_dir, ec);
+    if (ec) {
+      throw Error{ErrorDomain::IO, ec.value(),
+                  "Failed to create audit log directory " + qv::PathToUtf8String(logs_dir) +
+                      ": " + ec.message(),
+                  ec.value(), qv::Retryability::kRetryable}; // TSK109_Error_Code_Handling propagate mkdir errors
+    }
   }
   return logs_dir / "orchestrator.log";
 }
@@ -736,8 +749,23 @@ void JsonLineLogger::EnsureKey() { // TSK079_Audit_Log_Integrity_Chain hardened 
   }
   std::error_code ec;
   auto parent = key_path_.parent_path();
-  if (!parent.empty() && !std::filesystem::exists(parent, ec)) {
-    std::filesystem::create_directories(parent, ec);
+  if (!parent.empty()) {
+    const bool parent_exists = std::filesystem::exists(parent, ec);
+    if (ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"audit key directory stat failed\",\"error_code\":"
+                << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling surface filesystem error
+      integrity_ok_ = false;
+      return;
+    }
+    if (!parent_exists) {
+      std::filesystem::create_directories(parent, ec);
+      if (ec) {
+        std::clog << "{\"event\":\"logger_error\",\"message\":\"audit key directory create failed\",\"error_code\":"
+                  << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+        integrity_ok_ = false;
+        return;
+      }
+    }
   }
 #if defined(__APPLE__)
   const std::string service = "com.quantumvault.audit";
@@ -801,8 +829,23 @@ void JsonLineLogger::EnsureOpen() { // TSK029
   }
   std::error_code ec;
   auto parent = log_path_.parent_path();
-  if (!parent.empty() && !std::filesystem::exists(parent, ec)) {
-    std::filesystem::create_directories(parent, ec);
+  if (!parent.empty()) {
+    const bool parent_exists = std::filesystem::exists(parent, ec);
+    if (ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"audit log directory stat failed\",\"error_code\":"
+                << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+      integrity_ok_ = false;
+      return;
+    }
+    if (!parent_exists) {
+      std::filesystem::create_directories(parent, ec);
+      if (ec) {
+        std::clog << "{\"event\":\"logger_error\",\"message\":\"audit log directory create failed\",\"error_code\":"
+                  << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+        integrity_ok_ = false;
+        return;
+      }
+    }
   }
   stream_.open(log_path_, std::ios::out | std::ios::app);
 }
@@ -858,8 +901,21 @@ void JsonLineLogger::PersistStateLocked() { // TSK079_Audit_Log_Integrity_Chain
   disk.mac = ComputeStateMac(hmac_key_, kStateVersion, entry_counter_, dropped_streak_, last_mac_);
   auto parent = state_path_.parent_path();
   std::error_code ec;
-  if (!parent.empty() && !std::filesystem::exists(parent, ec)) {
-    std::filesystem::create_directories(parent, ec);
+  if (!parent.empty()) {
+    const bool parent_exists = std::filesystem::exists(parent, ec);
+    if (ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"state directory stat failed\",\"error_code\":"
+                << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+      return;
+    }
+    if (!parent_exists) {
+      std::filesystem::create_directories(parent, ec);
+      if (ec) {
+        std::clog << "{\"event\":\"logger_error\",\"message\":\"state directory create failed\",\"error_code\":"
+                  << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+        return;
+      }
+    }
   }
   auto temp = state_path_;
   temp += ".tmp";
@@ -878,13 +934,25 @@ void JsonLineLogger::PersistStateLocked() { // TSK079_Audit_Log_Integrity_Chain
   }
   std::filesystem::rename(temp, state_path_, ec);
   if (ec) {
-    std::filesystem::remove(state_path_, ec);
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"state rename failed\",\"error_code\":"
+              << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling first rename failure
+    std::error_code remove_ec;
+    std::filesystem::remove(state_path_, remove_ec);
+    if (remove_ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"state remove failed\",\"error_code\":"
+                << remove_ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+    }
+    ec.clear();
     std::filesystem::rename(temp, state_path_, ec);
     if (ec) {
-      std::clog << "{\"event\":\"logger_error\",\"message\":\"state rename failed\"}"
-                << std::endl;
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"state rename failed\",\"error_code\":"
+                << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling second rename failure
       std::error_code cleanup_ec;
       std::filesystem::remove(temp, cleanup_ec);
+      if (cleanup_ec) {
+        std::clog << "{\"event\":\"logger_error\",\"message\":\"state temp cleanup failed\",\"error_code\":"
+                  << cleanup_ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling cleanup failure
+      }
     }
   }
 }
@@ -896,6 +964,10 @@ void JsonLineLogger::ResetStateLocked() { // TSK079_Audit_Log_Integrity_Chain
   state_loaded_ = false;
   std::error_code ec;
   std::filesystem::remove(state_path_, ec);
+  if (ec) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"state reset failed\",\"error_code\":"
+              << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+  }
 }
 
 bool JsonLineLogger::ParseLog(std::array<uint8_t, kHmacSize>& mac, uint64_t& sequence) { // TSK029
@@ -1049,7 +1121,10 @@ void JsonLineLogger::RotateIfNeeded(size_t incoming_bytes) { // TSK029
   std::error_code ec;
   auto current_size = std::filesystem::file_size(log_path_, ec);
   if (ec) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"audit log size query failed\",\"error_code\":"
+              << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
     current_size = 0;
+    ec.clear();
   }
   if (current_size + incoming_bytes <= max_bytes_) {
     return;
@@ -1070,12 +1145,32 @@ void JsonLineLogger::RotateIfNeeded(size_t incoming_bytes) { // TSK029
     std::filesystem::path dst =
         std::filesystem::path(log_path_.string() + "." + std::to_string(idx));
     std::error_code rotate_ec;
-    if (std::filesystem::exists(src, rotate_ec)) {
-      std::filesystem::remove(dst, rotate_ec);
-      std::filesystem::rename(src, dst, rotate_ec);
+    const bool source_exists = std::filesystem::exists(src, rotate_ec);
+    if (rotate_ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"audit log rotation stat failed\",\"error_code\":"
+                << rotate_ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+      continue;
+    }
+    if (!source_exists) {
+      continue;
+    }
+    std::filesystem::remove(dst, rotate_ec);
+    if (rotate_ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"audit log rotation cleanup failed\",\"error_code\":"
+                << rotate_ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+      rotate_ec.clear();
+    }
+    std::filesystem::rename(src, dst, rotate_ec);
+    if (rotate_ec) {
+      std::clog << "{\"event\":\"logger_error\",\"message\":\"audit log rotate rename failed\",\"error_code\":"
+                << rotate_ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
     }
   }
   std::filesystem::remove(log_path_, ec);
+  if (ec) {
+    std::clog << "{\"event\":\"logger_error\",\"message\":\"audit log truncate failed\",\"error_code\":"
+              << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling
+  }
   stream_.open(log_path_, std::ios::out | std::ios::trunc);
   stream_.close();
 }

@@ -1,5 +1,7 @@
 #include "qv/orchestrator/io_util.h"
 
+#include "qv/common.h"  // TSK109_Error_Code_Handling UTF-8 path diagnostics
+
 #include <cerrno>
 #include <chrono>   // TSK101_File_IO_Persistence_and_Atomicity retry backoff
 #include <cstdint>
@@ -7,7 +9,10 @@
 #include <filesystem>
 #include <iostream> // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
 #include <span>
+#include <sstream>      // TSK109_Error_Code_Handling formatted context traces
 #include <string>
+#include <string_view>  // TSK109_Error_Code_Handling context formatter interface
+#include <type_traits>  // TSK109_Error_Code_Handling generic context helpers
 #include <system_error>
 #include <thread> // TSK101_File_IO_Persistence_and_Atomicity retry backoff
 
@@ -40,6 +45,150 @@ constexpr const char* kAtomicReplaceErrorMessage =
     "Atomic file replace failed"; // TSK068_Atomic_Header_Writes uniform error text
 constexpr const char* kAtomicUnsupportedMessage =
     "Filesystem does not support atomic rename"; // TSK107_Platform_Specific_Issues user-facing error
+
+class ErrorContext { // TSK109_Error_Code_Handling accumulate nested call context
+ public:
+  void Push(std::string context) { context_stack_.push_back(std::move(context)); }
+  void Pop() {
+    if (!context_stack_.empty()) {
+      context_stack_.pop_back();
+    }
+  }
+  [[nodiscard]] std::vector<std::string> Stack() const { return context_stack_; }
+  [[nodiscard]] std::string Format(std::string_view message) const {
+    std::ostringstream oss;
+    oss << message;
+    for (auto it = context_stack_.rbegin(); it != context_stack_.rend(); ++it) {
+      oss << "\n  while: " << *it;
+    }
+    return oss.str();
+  }
+
+ private:
+  std::vector<std::string> context_stack_;
+};
+
+class ScopedErrorContext { // TSK109_Error_Code_Handling automatic push/pop helper
+ public:
+  ScopedErrorContext(ErrorContext& ctx, std::string description) : ctx_(ctx) {
+    ctx_.Push(std::move(description));
+  }
+  ScopedErrorContext(const ScopedErrorContext&) = delete;
+  ScopedErrorContext& operator=(const ScopedErrorContext&) = delete;
+  ~ScopedErrorContext() { ctx_.Pop(); }
+
+ private:
+  ErrorContext& ctx_;
+};
+
+qv::Retryability ClassifyNativeError(int native) { // TSK109_Error_Code_Handling retry taxonomy
+  switch (native) {
+#if defined(EINTR)
+    case EINTR:
+#endif
+#if defined(EAGAIN)
+    case EAGAIN:
+#endif
+#if defined(EWOULDBLOCK)
+    case EWOULDBLOCK:
+#endif
+      return qv::Retryability::kRetryable;
+#if defined(EBUSY)
+    case EBUSY:
+      return qv::Retryability::kTransient;
+#endif
+#if defined(ETIMEDOUT)
+    case ETIMEDOUT:
+      return qv::Retryability::kTransient;
+#endif
+#if defined(_WIN32)
+    case ERROR_LOCK_VIOLATION:
+    case ERROR_SHARING_VIOLATION:
+      return qv::Retryability::kTransient;
+#endif
+    default:
+      break;
+  }
+  return qv::Retryability::kFatal;
+}
+
+qv::Retryability ClassifyErrorCode(const std::error_code& ec) { // TSK109_Error_Code_Handling std::error_code bridge
+  return ClassifyNativeError(ec.value());
+}
+
+std::vector<std::string> MergeContext(const std::vector<std::string>& existing,
+                                      const ErrorContext& ctx) { // TSK109_Error_Code_Handling accumulate stack
+  auto merged = existing;
+  auto stack = ctx.Stack();
+  merged.insert(merged.end(), stack.begin(), stack.end());
+  return merged;
+}
+
+[[noreturn]] void ThrowIoError(const ErrorContext& ctx, int code, std::string message,
+                               std::optional<int> native = std::nullopt,
+                               qv::Retryability retry = qv::Retryability::kFatal) { // TSK109_Error_Code_Handling unify throws
+  auto stack = ctx.Stack();
+  std::optional<int> native_value = native;
+  if (!native_value.has_value() && code != 0) {
+    native_value = code;
+  }
+  throw Error{ErrorDomain::IO, code, ctx.Format(std::move(message)), native_value, retry, std::move(stack)};
+}
+
+[[noreturn]] void ThrowValidationError(const ErrorContext& ctx, std::string message) { // TSK109_Error_Code_Handling
+  auto stack = ctx.Stack();
+  throw Error{ErrorDomain::Validation, 0, ctx.Format(std::move(message)), std::nullopt,
+              qv::Retryability::kFatal, std::move(stack)};
+}
+
+Error AugmentError(const Error& err, const ErrorContext& ctx) { // TSK109_Error_Code_Handling append context to nested errors
+  return Error{err.domain,
+               err.code,
+               ctx.Format(err.what()),
+               err.native_code,
+               err.retryability,
+               MergeContext(err.context, ctx)};
+}
+
+[[noreturn]] void RethrowSystemError(const std::system_error& sys_err,
+                                     const ErrorContext& ctx) { // TSK109_Error_Code_Handling preserve errno
+  auto stack = ctx.Stack();
+  throw Error{ErrorDomain::IO,
+              sys_err.code().value(),
+              ctx.Format(sys_err.what()),
+              sys_err.code().value(),
+              ClassifyErrorCode(sys_err.code()),
+              std::move(stack)};
+}
+
+[[noreturn]] void RethrowUnknownError(const std::exception& ex,
+                                      const ErrorContext& ctx) { // TSK109_Error_Code_Handling
+  throw Error{ErrorDomain::Internal, 0, ctx.Format(ex.what()), std::nullopt,
+              qv::Retryability::kFatal, ctx.Stack()};
+}
+
+template <typename Func>
+auto WithContext(ErrorContext& ctx, std::string description, Func&& fn)
+    -> std::invoke_result_t<Func&> { // TSK109_Error_Code_Handling scope wrapper
+  ScopedErrorContext scoped(ctx, std::move(description));
+  try {
+    if constexpr (std::is_void_v<std::invoke_result_t<Func&>>) {
+      fn();
+      return;
+    } else {
+      return fn();
+    }
+  } catch (const Error& err) {
+    if (err.context.empty()) {
+      throw AugmentError(err, ctx);
+    }
+    throw;
+  } catch (const std::system_error& sys_err) {
+    RethrowSystemError(sys_err, ctx);
+  } catch (const std::exception& ex) {
+    RethrowUnknownError(ex, ctx);
+  }
+}
 
 #ifdef _WIN32
 std::wstring ToWidePath(const std::filesystem::path& path) { // TSK107_Platform_Specific_Issues
@@ -155,13 +304,21 @@ void SyncDirectory(const std::filesystem::path& dir) { // TSK068_Atomic_Header_W
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
-    throw Error{ErrorDomain::IO, static_cast<int>(::GetLastError()),
-                kAtomicReplaceErrorMessage};
+    const int saved_error = static_cast<int>(::GetLastError());          // TSK109_Error_Code_Handling snapshot win32 error
+    throw Error{ErrorDomain::IO,
+                saved_error,
+                std::string(kAtomicReplaceErrorMessage) + ": open directory failed",
+                saved_error,
+                ClassifyNativeError(saved_error)};
   }
   if (!::FlushFileBuffers(handle)) {
-    auto err = static_cast<int>(::GetLastError());
+    const int err = static_cast<int>(::GetLastError());                  // TSK109_Error_Code_Handling preserve before cleanup
     ::CloseHandle(handle);
-    throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
+    throw Error{ErrorDomain::IO,
+                err,
+                std::string(kAtomicReplaceErrorMessage) + ": directory flush failed",
+                err,
+                ClassifyNativeError(err)};
   }
   ::CloseHandle(handle);
 }
@@ -188,12 +345,21 @@ bool NativeRename(const std::filesystem::path& from,
 void SyncDirectory(const std::filesystem::path& dir) { // TSK068_Atomic_Header_Writes ensure metadata durability
   int dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
   if (dir_fd < 0) {
-    throw Error{ErrorDomain::IO, errno, kAtomicReplaceErrorMessage};
+    const int saved_errno = errno;                                       // TSK109_Error_Code_Handling preserve errno
+    throw Error{ErrorDomain::IO,
+                saved_errno,
+                std::string(kAtomicReplaceErrorMessage) + ": open directory failed",
+                saved_errno,
+                ClassifyNativeError(saved_errno)};
   }
   if (::fsync(dir_fd) != 0) {
-    int err = errno;
+    const int err = errno;                                               // TSK109_Error_Code_Handling snapshot before close
     ::close(dir_fd);
-    throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
+    throw Error{ErrorDomain::IO,
+                err,
+                std::string(kAtomicReplaceErrorMessage) + ": directory flush failed",
+                err,
+                ClassifyNativeError(err)};
   }
   ::close(dir_fd);
 }
@@ -208,38 +374,50 @@ bool IsTransientFsyncError(int err) { // TSK101_File_IO_Persistence_and_Atomicit
 #endif
 }
 
-void SyncFileWithRetry(int fd) { // TSK101_File_IO_Persistence_and_Atomicity durability retry loop
+void SyncFileWithRetry(int fd, ErrorContext& ctx) { // TSK101_File_IO_Persistence_and_Atomicity durability retry loop
   constexpr int kMaxRetries = 4;
   std::chrono::milliseconds backoff{5};
   for (int attempt = 0;; ++attempt) {
     if (NativeFsync(fd) == 0) {
       return;
     }
-    int err = errno;
-    if (err == EINTR) {
+    const int saved_errno = errno;                           // TSK109_Error_Code_Handling preserve errno
+    if (saved_errno == EINTR) {
       continue;
     }
-    if (attempt >= kMaxRetries || !IsTransientFsyncError(err)) {
-      throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
+    if (attempt >= kMaxRetries || !IsTransientFsyncError(saved_errno)) {
+      ThrowIoError(ctx,
+                   saved_errno,
+                   std::string(kAtomicReplaceErrorMessage) + ": fsync failed", // TSK109_Error_Code_Handling richer detail
+                   saved_errno,
+                   ClassifyNativeError(saved_errno));
     }
     std::this_thread::sleep_for(backoff);
     backoff *= 2;
   }
 }
 
-void WriteAll(int fd, std::span<const uint8_t> payload) { // TSK068_Atomic_Header_Writes
+void WriteAll(int fd, std::span<const uint8_t> payload, ErrorContext& ctx) { // TSK068_Atomic_Header_Writes
   size_t written = 0;
   while (written < payload.size()) {
     auto chunk = NativeWrite(fd, payload.data() + written, payload.size() - written);
     if (chunk < 0) {
-      int err = errno;
-      if (err == EINTR) { // TSK101_File_IO_Persistence_and_Atomicity retry interrupted writes
+      const int saved_errno = errno;                         // TSK109_Error_Code_Handling snapshot native error
+      if (saved_errno == EINTR) { // TSK101_File_IO_Persistence_and_Atomicity retry interrupted writes
         continue;
       }
-      throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
+      ThrowIoError(ctx,
+                   saved_errno,
+                   std::string(kAtomicReplaceErrorMessage) + ": write failed", // TSK109_Error_Code_Handling stage detail
+                   saved_errno,
+                   ClassifyNativeError(saved_errno));
     }
     if (chunk == 0) {
-      throw Error{ErrorDomain::IO, 0, kAtomicReplaceErrorMessage}; // TSK101_File_IO_Persistence_and_Atomicity short write
+      ThrowIoError(ctx,
+                   0,
+                   std::string(kAtomicReplaceErrorMessage) + ": short write",
+                   0,
+                   qv::Retryability::kFatal); // TSK109_Error_Code_Handling treat zero-write as fatal
     }
     written += static_cast<size_t>(chunk);
   }
@@ -279,62 +457,121 @@ std::filesystem::path MakeTempPath(const std::filesystem::path& dir,
 
 void AtomicReplace(const std::filesystem::path& target, std::span<const uint8_t> payload,
                    const AtomicReplaceHooks& hooks) {
-  if (target.empty()) {
-    throw Error{ErrorDomain::Validation, 0, "Target path required"};
-  }
-  auto dir = target.parent_path();
-  if (dir.empty()) {
-    dir = std::filesystem::current_path();
-  }
-
-  if (!SupportsAtomicRename(dir)) { // TSK107_Platform_Specific_Issues proactively guard non-atomic filesystems
-    throw Error{ErrorDomain::IO, 0, kAtomicUnsupportedMessage};
-  }
-
-  auto temp_path = MakeTempPath(dir, target);
-  TempFileGuard cleanup(temp_path);
-
-  int fd = NativeOpen(temp_path);
-  if (fd < 0) {
-    throw Error{ErrorDomain::IO, errno, kAtomicReplaceErrorMessage};
-  }
+  ErrorContext ctx;                                                      // TSK109_Error_Code_Handling contextual diagnostics
+  const std::string target_utf8 = target.empty() ? std::string("<empty>") : qv::PathToUtf8String(target);
+  ScopedErrorContext root(ctx, "atomic replace target=" + target_utf8); // TSK109_Error_Code_Handling primary context
 
   try {
-    WriteAll(fd, payload);
-    SyncFileWithRetry(fd);
-  } catch (...) {
-    NativeClose(fd);
-    throw;
-  }
-
-  if (NativeClose(fd) != 0) {
-    throw Error{ErrorDomain::IO, errno, kAtomicReplaceErrorMessage};
-  }
-
-  if (hooks.before_rename) {
-    hooks.before_rename(temp_path, target);
-  }
-
-  if (!NativeRename(temp_path, target)) {
-    int err = errno;
-#ifdef _WIN32
-    if (err == 0) {
-      err = static_cast<int>(::GetLastError());
+    if (target.empty()) {
+      ThrowValidationError(ctx, "Target path required");
     }
-#endif
-    throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
-  }
-  std::error_code verify_ec;
-  if (!std::filesystem::exists(target, verify_ec) || verify_ec) { // TSK101_File_IO_Persistence_and_Atomicity verify rename
-    throw Error{ErrorDomain::IO, verify_ec ? verify_ec.value() : 0, kAtomicReplaceErrorMessage};
-  }
-  cleanup.Release();
 
-  auto sync_dir = dir;
-  if (sync_dir.empty()) {
-    sync_dir = std::filesystem::current_path();
+    auto dir = target.parent_path();
+    if (dir.empty()) {
+      dir = WithContext(ctx, "resolving current working directory", [] {
+        return std::filesystem::current_path();
+      });
+    }
+
+    WithContext(ctx, "checking atomic rename support", [&] {
+      if (!SupportsAtomicRename(dir)) { // TSK107_Platform_Specific_Issues proactively guard non-atomic filesystems
+        ThrowIoError(ctx, 0, kAtomicUnsupportedMessage, std::nullopt, qv::Retryability::kFatal);
+      }
+    });
+
+    auto temp_path = MakeTempPath(dir, target);
+    TempFileGuard cleanup(temp_path);
+
+    int fd = WithContext(ctx, "opening temporary payload file", [&]() {
+      int handle = NativeOpen(temp_path);
+      if (handle < 0) {
+        const int saved_errno = errno;
+        ThrowIoError(ctx,
+                     saved_errno,
+                     std::string(kAtomicReplaceErrorMessage) + ": open failed",
+                     saved_errno,
+                     ClassifyNativeError(saved_errno));
+      }
+      return handle;
+    });
+
+    try {
+      WithContext(ctx, "writing payload", [&] { WriteAll(fd, payload, ctx); });
+      WithContext(ctx, "syncing payload", [&] { SyncFileWithRetry(fd, ctx); });
+    } catch (...) {
+      NativeClose(fd);
+      throw;
+    }
+
+    WithContext(ctx, "closing temporary payload file", [&] {
+      if (NativeClose(fd) != 0) {
+        const int saved_errno = errno;
+        ThrowIoError(ctx,
+                     saved_errno,
+                     std::string(kAtomicReplaceErrorMessage) + ": close failed",
+                     saved_errno,
+                     ClassifyNativeError(saved_errno));
+      }
+    });
+
+    if (hooks.before_rename) {
+      WithContext(ctx, "executing before_rename hook", [&] { hooks.before_rename(temp_path, target); });
+    }
+
+    WithContext(ctx, "renaming temporary file into place", [&] {
+      if (!NativeRename(temp_path, target)) {
+        int err = errno;
+#ifdef _WIN32
+        if (err == 0) {
+          err = static_cast<int>(::GetLastError());
+        }
+#endif
+        ThrowIoError(ctx,
+                     err,
+                     std::string(kAtomicReplaceErrorMessage) + ": rename failed",
+                     err,
+                     ClassifyNativeError(err));
+      }
+    });
+
+    WithContext(ctx, "verifying renamed target", [&] {
+      std::error_code verify_ec;
+      const bool exists_after = std::filesystem::exists(target, verify_ec);
+      if (verify_ec) { // TSK101_File_IO_Persistence_and_Atomicity verify rename
+        ThrowIoError(ctx,
+                     verify_ec.value(),
+                     std::string(kAtomicReplaceErrorMessage) + ": existence check failed",
+                     verify_ec.value(),
+                     ClassifyErrorCode(verify_ec));
+      }
+      if (!exists_after) {
+        ThrowIoError(ctx,
+                     0,
+                     std::string(kAtomicReplaceErrorMessage) + ": renamed file missing",
+                     0,
+                     qv::Retryability::kFatal);
+      }
+    });
+
+    cleanup.Release();
+
+    auto sync_dir = dir;
+    if (sync_dir.empty()) {
+      sync_dir = WithContext(ctx, "resolving directory for metadata sync", [] {
+        return std::filesystem::current_path();
+      });
+    }
+    WithContext(ctx, "syncing directory metadata", [&] { SyncDirectory(sync_dir); });
+  } catch (const Error& err) {
+    if (err.context.empty()) {
+      throw AugmentError(err, ctx);
+    }
+    throw;
+  } catch (const std::system_error& sys_err) {
+    RethrowSystemError(sys_err, ctx);
+  } catch (const std::exception& ex) {
+    RethrowUnknownError(ex, ctx);
   }
-  SyncDirectory(sync_dir);
 }
 
 }  // namespace qv::orchestrator
