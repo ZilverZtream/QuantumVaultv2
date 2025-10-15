@@ -6,11 +6,12 @@
 #include <cstring>
 #include <iomanip>
 #include <memory>
-#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "qv/crypto/hkdf.h" // TSK106_Cryptographic_Implementation_Weaknesses
+#include "qv/crypto/random.h" // TSK106_Cryptographic_Implementation_Weaknesses
 #if !defined(QV_USE_STUB_CRYPTO) && __has_include(<oqs/oqs.h>)
 #define QV_HAVE_LIBOQS 1
 #include <oqs/oqs.h>
@@ -36,12 +37,7 @@ static constexpr uint16_t kKemIdMlKem768 = 0x0300; // TSK003
 static constexpr std::array<uint8_t, 8> kPqcSkAadContext{'Q','V','P','Q','C','S','K','1'}; // TSK014
 
 void RandomBytes(std::span<uint8_t> out) {
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<int> dist(0, 255);
-  for (auto& b : out) {
-    b = static_cast<uint8_t>(dist(gen));
-  }
+  qv::crypto::SystemRandomBytes(out); // TSK106_Cryptographic_Implementation_Weaknesses
 }
 
 #if QV_HAVE_LIBOQS
@@ -80,40 +76,6 @@ std::vector<uint8_t> MakeStableAad(std::span<const uint8_t, 16> volume_uuid,
   aad.insert(aad.end(), version_bytes, version_bytes + sizeof(version_le));
   aad.insert(aad.end(), epoch_tlv.begin(), epoch_tlv.end());
   return aad;
-}
-
-std::array<uint8_t, 32> HKDF_SHA256(std::span<const uint8_t> ikm,
-                                    std::span<const uint8_t> salt,
-                                    std::span<const uint8_t> info) {
-  std::array<uint8_t, 32> out{};
-  EVP_PKEY_CTX* raw_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
-  if (!raw_ctx) {
-    throw Error(ErrorDomain::Crypto, -1, "EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF) failed");
-  }
-  std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> ctx(raw_ctx, &EVP_PKEY_CTX_free);
-
-  auto check = [](int status, const char* step) {
-    if (status <= 0) {
-      throw Error(ErrorDomain::Crypto, -1, std::string("HKDF step failed: ") + step);
-    }
-  };
-
-  check(EVP_PKEY_derive_init(ctx.get()), "derive_init");
-  check(EVP_PKEY_CTX_set_hkdf_md(ctx.get(), EVP_sha256()), "set_md");
-  check(EVP_PKEY_CTX_set1_hkdf_salt(ctx.get(), salt.empty() ? nullptr : salt.data(),
-                                     static_cast<int>(salt.size())), "set_salt");
-  check(EVP_PKEY_CTX_set1_hkdf_key(ctx.get(), ikm.data(), static_cast<int>(ikm.size())),
-        "set_key");
-  if (!info.empty()) {
-    check(EVP_PKEY_CTX_add1_hkdf_info(ctx.get(), info.data(), static_cast<int>(info.size())),
-          "set_info");
-  }
-  size_t len = out.size();
-  check(EVP_PKEY_derive(ctx.get(), out.data(), &len), "derive");
-  if (len != out.size()) {
-    throw Error(ErrorDomain::Crypto, -1, "HKDF derive produced unexpected length");
-  }
-  return out;
 }
 
 } // namespace
@@ -278,5 +240,6 @@ PQCHybridKDF::DeriveHybridKey(std::span<const uint8_t, 32> classical_key,
   const std::span<const uint8_t> info_span(
       reinterpret_cast<const uint8_t*>(info_label.data()), info_label.size());
 
-  return HKDF_SHA256(std::span<const uint8_t>(ikm.data(), ikm.size()), salt, info_span);
+  return qv::crypto::HKDF_SHA256(std::span<const uint8_t>(ikm.data(), ikm.size()), salt,
+                                 info_span); // TSK106_Cryptographic_Implementation_Weaknesses
 }

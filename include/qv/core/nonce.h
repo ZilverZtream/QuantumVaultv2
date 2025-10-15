@@ -15,6 +15,7 @@
 #include <string_view> // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <vector>
 
+#include "qv/crypto/hkdf.h"                     // TSK106_Cryptographic_Implementation_Weaknesses
 #include "qv/crypto/hmac_sha256.h"              // TSK024_Key_Rotation_and_Lifecycle_Management
 #include "qv/security/zeroizer.h"               // TSK024_Key_Rotation_and_Lifecycle_Management
 
@@ -182,12 +183,12 @@ namespace qv::core {
     if (label.size() + 1 > 64) {
       throw qv::Error{qv::ErrorDomain::Validation, 0, "HKDF label too long"};
     }
-    std::array<uint8_t, 64> info_block{};
-    std::copy(label.begin(), label.end(), info_block.begin());
-    info_block[label.size()] = 0x01;
-    auto derived = qv::crypto::HMAC_SHA256::Compute(master, std::span<const uint8_t>(info_block.data(), label.size() + 1));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(info_block.data(), label.size() + 1));
-    return derived;
+    static constexpr std::array<uint8_t, 0> kEmptySalt{};
+    const std::span<const uint8_t> info_span(
+        reinterpret_cast<const uint8_t*>(label.data()), label.size());
+    return qv::crypto::HKDF_SHA256(
+        master, std::span<const uint8_t>(kEmptySalt.data(), kEmptySalt.size()),
+        info_span); // TSK106_Cryptographic_Implementation_Weaknesses
   }
 
   inline std::array<uint8_t, 32>
