@@ -57,6 +57,8 @@ public:
       Zeroizer::Wipe(byte_span);
     }
 
+    void Release() noexcept { span_ = {}; } // TSK097_Cryptographic_Key_Management allow opt-out when transferring ownership
+
   private:
     std::span<T> span_;
   };

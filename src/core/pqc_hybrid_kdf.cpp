@@ -25,6 +25,7 @@ using namespace qv;
 using namespace qv::core;
 using qv::security::SecureBuffer;
 using qv::security::Zeroizer;
+using ByteScopeWiper = Zeroizer::ScopeWiper<uint8_t>; // TSK097_Cryptographic_Key_Management unified wiping helper
 using qv::crypto::AES256_GCM;
 using qv::crypto::AES256_GCM_Decrypt;
 using qv::crypto::AES256_GCM_Encrypt;
@@ -33,42 +34,6 @@ namespace {
 
 static constexpr uint16_t kKemIdMlKem768 = 0x0300; // TSK003
 static constexpr std::array<uint8_t, 8> kPqcSkAadContext{'Q','V','P','Q','C','S','K','1'}; // TSK014
-
-class ScopeWiper { // TSK003
-public:
-  ScopeWiper() = default;
-  explicit ScopeWiper(std::span<uint8_t> data) : data_(data) {}
-  ScopeWiper(uint8_t* data, size_t size) : data_(data, size) {}
-  ScopeWiper(const ScopeWiper&) = delete;
-  ScopeWiper& operator=(const ScopeWiper&) = delete;
-  ScopeWiper(ScopeWiper&& other) noexcept : data_(other.data_) {
-    other.data_ = {};
-  }
-  ScopeWiper& operator=(ScopeWiper&& other) noexcept {
-    if (this != &other) {
-      Wipe();
-      data_ = other.data_;
-      other.data_ = {};
-    }
-    return *this;
-  }
-  ~ScopeWiper() { Wipe(); }
-  void Reset(std::span<uint8_t> data) {
-    Wipe();
-    data_ = data;
-  }
-  void Release() noexcept { data_ = {}; }
-
-private:
-  void Wipe() noexcept {
-    if (!data_.empty()) {
-      Zeroizer::Wipe(data_);
-      data_ = {};
-    }
-  }
-
-  std::span<uint8_t> data_{};
-};
 
 void RandomBytes(std::span<uint8_t> out) {
   std::random_device rd;
@@ -210,10 +175,10 @@ PQCHybridKDF::Create(std::span<const uint8_t, 32> classical_key,
                      std::span<const uint8_t> epoch_tlv) {
   PQCKeyEncapsulation kem;
   auto kp = kem.GenerateKeypair();
-  ScopeWiper sk_guard(kp.sk.AsSpan());
+  ByteScopeWiper sk_guard(kp.sk.AsSpan());
 
   auto enc = kem.Encapsulate(kp.pk);
-  ScopeWiper ss_guard(std::span<uint8_t>(enc.shared_secret.data(), enc.shared_secret.size()));
+  ByteScopeWiper ss_guard(std::span<uint8_t>(enc.shared_secret.data(), enc.shared_secret.size()));
 
   PQC_KEM_TLV tlv{};
   tlv.type = 0x7051;
@@ -271,21 +236,29 @@ PQCHybridKDF::Mount(std::span<const uint8_t, 32> classical_key,
         std::span<const uint8_t, AES256_GCM::TAG_SIZE>(kem_blob.sk_tag.data(), kem_blob.sk_tag.size()),
         classical_key);
   } catch (const AuthenticationFailureError&) {
+    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe transient buffer on auth failure
     throw;
   } catch (const std::exception& ex) {
+    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe transient buffer on generic failure
     throw AuthenticationFailureError(std::string("Failed to decrypt PQC secret key: ") + ex.what());
   }
   if (sk_plain.size() != PQC::SECRET_KEY_SIZE) {
+    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe rejected plaintext
     throw Error(ErrorDomain::Validation, -1, "PQC secret key length mismatch");
   }
-  ScopeWiper sk_plain_guard(sk_plain.data(), sk_plain.size());
+  SecureBuffer<uint8_t> sk_plain_secure(sk_plain.size()); // TSK097_Cryptographic_Key_Management secure PQC secret key buffer
+  if (!sk_plain.empty()) {
+    std::memcpy(sk_plain_secure.data(), sk_plain.data(), sk_plain.size());
+    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe temporary decrypt buffer
+  }
+  ByteScopeWiper sk_plain_guard(sk_plain_secure.AsSpan());
 
   PQCKeyEncapsulation kem;
   auto shared_secret = kem.Decapsulate(
-      std::span<const uint8_t, PQC::SECRET_KEY_SIZE>(sk_plain.data(), PQC::SECRET_KEY_SIZE),
+      std::span<const uint8_t, PQC::SECRET_KEY_SIZE>(sk_plain_secure.data(), PQC::SECRET_KEY_SIZE),
       std::span<const uint8_t, PQC::CIPHERTEXT_SIZE>(kem_blob.kem_ct.data(),
                                                      PQC::CIPHERTEXT_SIZE));
-  ScopeWiper ss_guard(std::span<uint8_t>(shared_secret.data(), shared_secret.size()));
+  ByteScopeWiper ss_guard(std::span<uint8_t>(shared_secret.data(), shared_secret.size()));
 
   return DeriveHybridKey(classical_key, shared_secret, salt, volume_uuid);
 }
@@ -299,7 +272,7 @@ PQCHybridKDF::DeriveHybridKey(std::span<const uint8_t, 32> classical_key,
   std::memcpy(ikm.data(), classical_key.data(), classical_key.size());
   std::memcpy(ikm.data() + classical_key.size(), pqc_shared_secret.data(),
               pqc_shared_secret.size());
-  ScopeWiper ikm_guard(ikm.data(), ikm.size());
+  ByteScopeWiper ikm_guard(ikm.data(), ikm.size());
 
   const std::string info_label = std::string("QV-HYBRID/v4.1|") + FormatUuid(volume_uuid);
   const std::span<const uint8_t> info_span(
