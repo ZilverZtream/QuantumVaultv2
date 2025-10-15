@@ -32,6 +32,7 @@
 #include <string>
 #include <utility>
 
+#include "qv/crypto/ct.h" // TSK102_Timing_Side_Channels constant-time comparisons
 #include "qv/error.h"
 
 namespace qv::crypto {
@@ -165,12 +166,17 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
       std::span<const uint8_t>(kAad.data(), kAad.size()),
       std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(kNonce),
       std::span<const uint8_t, AES256_GCM::KEY_SIZE>(kKey));
-  if (enc.ciphertext.size() != kExpectedCiphertext.size() ||
-      !std::equal(enc.ciphertext.begin(), enc.ciphertext.end(),
-                  kExpectedCiphertext.begin())) {
+  std::array<uint8_t, kExpectedCiphertext.size()> cipher_buf{};          // TSK102_Timing_Side_Channels
+  const size_t cipher_copy = std::min(enc.ciphertext.size(), cipher_buf.size());
+  std::copy_n(enc.ciphertext.begin(), cipher_copy, cipher_buf.begin());
+  uint32_t cipher_mask = 0;                                              // TSK102_Timing_Side_Channels
+  cipher_mask |= enc.ciphertext.size() == kExpectedCiphertext.size() ? 0u : 1u;
+  cipher_mask |= qv::crypto::ct::CompareEqual(cipher_buf, kExpectedCiphertext) ? 0u : 2u;
+  if (cipher_mask != 0u) {
     ThrowCryptoError("AES-GCM KAT ciphertext mismatch");
   }
-  if (!std::equal(enc.tag.begin(), enc.tag.end(), kExpectedTag.begin())) {
+  uint32_t tag_mask = qv::crypto::ct::CompareEqual(enc.tag, kExpectedTag) ? 0u : 1u; // TSK102_Timing_Side_Channels
+  if (tag_mask != 0u) {
     ThrowCryptoError("AES-GCM KAT tag mismatch");
   }
 
@@ -180,8 +186,13 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
       std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(kNonce),
       std::span<const uint8_t, AES256_GCM::TAG_SIZE>(enc.tag),
       std::span<const uint8_t, AES256_GCM::KEY_SIZE>(kKey));
-  if (dec.size() != kPlaintext.size() ||
-      !std::equal(dec.begin(), dec.end(), kPlaintext.begin())) {
+  std::array<uint8_t, kPlaintext.size()> plain_buf{};                     // TSK102_Timing_Side_Channels
+  const size_t plain_copy = std::min(dec.size(), plain_buf.size());
+  std::copy_n(dec.begin(), plain_copy, plain_buf.begin());
+  uint32_t plain_mask = 0;                                                // TSK102_Timing_Side_Channels
+  plain_mask |= dec.size() == kPlaintext.size() ? 0u : 1u;
+  plain_mask |= qv::crypto::ct::CompareEqual(plain_buf, kPlaintext) ? 0u : 2u;
+  if (plain_mask != 0u) {
     ThrowCryptoError("AES-GCM KAT decrypt mismatch");
   }
 }

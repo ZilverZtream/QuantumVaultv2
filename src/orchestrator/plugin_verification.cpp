@@ -249,6 +249,26 @@ bool IsKeyTrusted(const PluginTrustPolicy& policy, const std::string& plugin_id,
   std::atomic_signal_fence(std::memory_order_seq_cst); // TSK037
   return trusted_mask != 0;
 }
+
+std::optional<PluginCompatibilityRange> ResolveAbiOverride(const PluginTrustPolicy& policy,
+                                                           const std::string& plugin_id) {
+  PluginCompatibilityRange resolved{};                                     // TSK102_Timing_Side_Channels
+  uint32_t found_mask = 0;                                                 // TSK102_Timing_Side_Channels
+  const bool plugin_present = !plugin_id.empty();                          // TSK102_Timing_Side_Channels
+  for (const auto& entry : policy.plugin_abi_ranges) {                     // TSK102_Timing_Side_Channels
+    bool id_match = plugin_present & StringCompare(entry.first, plugin_id); // TSK102_Timing_Side_Channels
+    resolved.min_version = qv::crypto::ct::Select<uint32_t>(resolved.min_version,
+                                                            entry.second.min_version, id_match);
+    resolved.max_version = qv::crypto::ct::Select<uint32_t>(resolved.max_version,
+                                                            entry.second.max_version, id_match);
+    found_mask |= static_cast<uint32_t>(id_match);
+  }
+  std::atomic_signal_fence(std::memory_order_seq_cst);                     // TSK102_Timing_Side_Channels
+  if (found_mask != 0) {
+    return resolved;
+  }
+  return std::nullopt;
+}
 } // namespace
 
 namespace qv::orchestrator {
@@ -399,9 +419,9 @@ bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& e
   PluginCompatibilityRange allowed{expected.min_abi_version, expected.max_abi_version};
   allowed.min_version = std::max(allowed.min_version, policy.default_abi_range.min_version);
   allowed.max_version = std::min(allowed.max_version, policy.default_abi_range.max_version);
-  if (auto override = policy.plugin_abi_ranges.find(plugin_id); override != policy.plugin_abi_ranges.end()) {
-    allowed.min_version = std::max(allowed.min_version, override->second.min_version);
-    allowed.max_version = std::min(allowed.max_version, override->second.max_version);
+  if (auto override = ResolveAbiOverride(policy, plugin_id)) {                    // TSK102_Timing_Side_Channels
+    allowed.min_version = std::max(allowed.min_version, override->min_version);
+    allowed.max_version = std::min(allowed.max_version, override->max_version);
   }
 
   if (allowed.min_version > allowed.max_version) {
