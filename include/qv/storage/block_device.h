@@ -49,6 +49,7 @@ private:
 
   void EnsureOpenUnlocked();
   void EnsureSizeUnlocked(uint64_t size);
+  uint64_t ByteOffsetForChunk(int64_t chunk_index) const; // TSK107_Platform_Specific_Issues 64-bit offsets
   std::streampos OffsetForChunk(int64_t chunk_index) const;
 };
 

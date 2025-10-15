@@ -116,12 +116,13 @@ namespace qv::security {
       }
     }
 
-    void MaybeEnableProcessWideLocking() { // TSK031
+    void MaybeEnableProcessWideLocking() { // TSK031, TSK107_Platform_Specific_Issues
       const char* env = std::getenv("QV_USE_MLOCKALL");
       if (!env || env[0] == '\0' || env[0] == '0') {
         return;
       }
 
+#if (defined(__linux__) || defined(__FreeBSD__)) && defined(MCL_CURRENT) && defined(MCL_FUTURE)
       if (::mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         const int err = errno;                                                    // TSK085
         std::clog << "SecureBuffer warning: mlockall() failed despite QV_USE_MLOCKALL; "
@@ -135,6 +136,10 @@ namespace qv::security {
                                   qv::orchestrator::FieldPrivacy::kPublic, true); // TSK085
         qv::orchestrator::EventBus::Instance().Publish(event);                    // TSK085
       }
+#else
+      std::clog << "SecureBuffer notice: mlockall() not available on this platform; "
+                << "QV_USE_MLOCKALL ignored.\n"; // TSK031, TSK107_Platform_Specific_Issues
+#endif
     }
 
     void EnsurePosixLockingConfigured() { // TSK031

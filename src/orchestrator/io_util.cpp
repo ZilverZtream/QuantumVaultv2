@@ -16,6 +16,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/statfs.h>
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/mount.h>
+#endif
 #else
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,16 +38,103 @@ namespace {
 
 constexpr const char* kAtomicReplaceErrorMessage =
     "Atomic file replace failed"; // TSK068_Atomic_Header_Writes uniform error text
+constexpr const char* kAtomicUnsupportedMessage =
+    "Filesystem does not support atomic rename"; // TSK107_Platform_Specific_Issues user-facing error
+
+#ifdef _WIN32
+std::wstring ToWidePath(const std::filesystem::path& path) { // TSK107_Platform_Specific_Issues
+  return path.wstring();
+}
+
+bool SupportsAtomicRename(const std::filesystem::path& dir) { // TSK107_Platform_Specific_Issues
+  std::filesystem::path probe = dir;
+  if (probe.empty()) {
+    probe = std::filesystem::current_path();
+  }
+  std::error_code ec;
+  auto absolute = std::filesystem::weakly_canonical(probe, ec);
+  if (ec) {
+    absolute = std::filesystem::absolute(probe, ec);
+    if (ec) {
+      return false;
+    }
+  }
+  auto root = absolute.root_path();
+  if (root.empty()) {
+    root = absolute;
+  }
+  std::wstring volume = root.wstring();
+  if (!volume.empty() && volume.back() != L'\\' && volume.back() != L'/') {
+    volume.push_back(L'\\');
+  }
+  DWORD flags = 0;
+  if (!::GetVolumeInformationW(volume.c_str(), nullptr, 0, nullptr, nullptr, &flags, nullptr, 0)) {
+    return false;
+  }
+#if defined(FILE_REMOTE_DEVICE)
+  if ((flags & FILE_REMOTE_DEVICE) != 0U) {
+    return false;
+  }
+#endif
+#if defined(FILE_SUPPORTS_POSIX_UNLINK_RENAME)
+  return (flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME) != 0U;
+#else
+  return true;
+#endif
+}
+#else
+bool SupportsAtomicRename(const std::filesystem::path& dir) { // TSK107_Platform_Specific_Issues
+  std::filesystem::path probe = dir;
+  if (probe.empty()) {
+    probe = std::filesystem::current_path();
+  }
+  std::error_code ec;
+  auto absolute = std::filesystem::weakly_canonical(probe, ec);
+  if (ec) {
+    absolute = std::filesystem::absolute(probe, ec);
+  }
+  if (absolute.empty()) {
+    return false;
+  }
+
+  struct statfs info {
+  };
+  if (::statfs(absolute.c_str(), &info) != 0) {
+    return false;
+  }
+
+#if defined(__linux__)
+  switch (info.f_type) {
+    case 0x6969:      // NFS_SUPER_MAGIC
+    case 0xFF534D42:  // CIFS
+    case 0xFE534D42:  // SMB2
+    case 0x517B:      // SMB
+      return false;
+    default:
+      return true;
+  }
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+  return (info.f_flags & MNT_LOCAL) != 0;
+#else
+  return true;
+#endif
+}
+#endif
 
 #ifdef _WIN32
 int NativeOpen(const std::filesystem::path& path) { // TSK068_Atomic_Header_Writes platform abstraction
-  return _wopen(path.c_str(), _O_CREAT | _O_WRONLY | _O_TRUNC | _O_BINARY | _O_SEQUENTIAL,
+  const std::wstring native = ToWidePath(path); // TSK107_Platform_Specific_Issues ensure wide API use
+  return _wopen(native.c_str(), _O_CREAT | _O_WRONLY | _O_TRUNC | _O_BINARY | _O_SEQUENTIAL,
                 _S_IREAD | _S_IWRITE);
 }
 
 int NativeClose(int fd) { return _close(fd); }
 
-int NativeFsync(int fd) { return _commit(fd); }
+int NativeFsync(int fd) {
+  // TSK107_Platform_Specific_Issues: _commit() provides best-effort fsync-equivalent semantics on Windows.
+  // It forces dirty buffers to disk but may still depend on storage write-back policies.
+  return _commit(fd);
+}
 
 int NativeWrite(int fd, const uint8_t* data, size_t size) {
   return _write(fd, data, static_cast<unsigned int>(size));
@@ -49,13 +142,16 @@ int NativeWrite(int fd, const uint8_t* data, size_t size) {
 
 bool NativeRename(const std::filesystem::path& from,
                   const std::filesystem::path& to) { // TSK068_Atomic_Header_Writes atomic swap
-  return ::MoveFileExW(from.c_str(), to.c_str(),
+  const std::wstring native_from = ToWidePath(from);   // TSK107_Platform_Specific_Issues ensure wide API use
+  const std::wstring native_to = ToWidePath(to);       // TSK107_Platform_Specific_Issues ensure wide API use
+  return ::MoveFileExW(native_from.c_str(), native_to.c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
 void SyncDirectory(const std::filesystem::path& dir) { // TSK068_Atomic_Header_Writes ensure metadata durability
+  const std::wstring native = ToWidePath(dir);         // TSK107_Platform_Specific_Issues ensure wide API use
   HANDLE handle = ::CreateFileW(
-      dir.c_str(), GENERIC_READ | GENERIC_WRITE,
+      native.c_str(), GENERIC_READ | GENERIC_WRITE,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
@@ -173,10 +269,10 @@ class TempFileGuard { // TSK068_Atomic_Header_Writes ensure cleanup on failure
 std::filesystem::path MakeTempPath(const std::filesystem::path& dir,
                                    const std::filesystem::path& base) { // TSK068_Atomic_Header_Writes unique temp
   auto token = std::filesystem::unique_path("%%%%%%%%");
-  auto stem = base.filename().string();
-  auto unique = token.string();
-  auto temp_name = stem + ".tmp." + unique;
-  return dir / temp_name;
+  std::filesystem::path temp_name = base.filename();
+  temp_name += ".tmp.";
+  temp_name += token;
+  return dir / temp_name; // TSK107_Platform_Specific_Issues avoid lossy conversions
 }
 
 }  // namespace
@@ -189,6 +285,10 @@ void AtomicReplace(const std::filesystem::path& target, std::span<const uint8_t>
   auto dir = target.parent_path();
   if (dir.empty()) {
     dir = std::filesystem::current_path();
+  }
+
+  if (!SupportsAtomicRename(dir)) { // TSK107_Platform_Specific_Issues proactively guard non-atomic filesystems
+    throw Error{ErrorDomain::IO, 0, kAtomicUnsupportedMessage};
   }
 
   auto temp_path = MakeTempPath(dir, target);

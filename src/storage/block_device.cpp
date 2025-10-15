@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint> // TSK107_Platform_Specific_Issues explicit 64-bit math
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -169,7 +170,7 @@ void BlockDevice::EnsureSizeUnlocked(uint64_t size) {
   std::filesystem::resize_file(path_, size);
 }
 
-std::streampos BlockDevice::OffsetForChunk(int64_t chunk_index) const {
+uint64_t BlockDevice::ByteOffsetForChunk(int64_t chunk_index) const { // TSK107_Platform_Specific_Issues
   if (chunk_index < 0) {
     throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};
   }
@@ -177,8 +178,20 @@ std::streampos BlockDevice::OffsetForChunk(int64_t chunk_index) const {
   if (record_size_ != 0 && u_index > std::numeric_limits<uint64_t>::max() / record_size_) {
     throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"}; // TSK100_Integer_Overflow_and_Arithmetic guard chunk offset
   }
-  const uint64_t offset = u_index * record_size_;
-  return static_cast<std::streampos>(offset);
+  return u_index * record_size_;
+}
+
+std::streampos BlockDevice::OffsetForChunk(int64_t chunk_index) const { // TSK107_Platform_Specific_Issues
+  const uint64_t offset = ByteOffsetForChunk(chunk_index);
+  static_assert(sizeof(std::streamoff) >= sizeof(int64_t),
+                "BlockDevice requires 64-bit stream offsets"); // TSK107_Platform_Specific_Issues enforce large file support
+#if defined(_WIN32)
+  const __int64 native_offset = static_cast<__int64>(offset);
+  return std::streampos(static_cast<std::streamoff>(native_offset));
+#else
+  const int64_t native_offset = static_cast<int64_t>(offset);
+  return std::streampos(static_cast<std::streamoff>(native_offset));
+#endif
 }
 
 void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t> ciphertext) {
@@ -188,7 +201,7 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   std::scoped_lock lock(io_mutex_);
   EnsureOpenUnlocked();
   auto offset = OffsetForChunk(header.chunk_index);
-  const uint64_t base_offset = static_cast<uint64_t>(static_cast<std::streamoff>(offset));
+  const uint64_t base_offset = ByteOffsetForChunk(header.chunk_index); // TSK107_Platform_Specific_Issues preserve 64-bit arithmetic
   const uint64_t current_size =
       std::filesystem::exists(path_) ? std::filesystem::file_size(path_) : 0ULL;
   const uint64_t final_size = std::max<uint64_t>(base_offset + record_size_, current_size);
