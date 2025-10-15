@@ -11,7 +11,6 @@
 #include <iterator>   // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <limits>     // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <optional>     // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV control
-#include <random>
 #include <span>
 #include <sstream>      // TSK033 version formatting
 #include <string_view>
@@ -23,8 +22,10 @@
 #include "qv/common.h"
 #include "qv/core/nonce.h"
 #include "qv/core/pqc_hybrid_kdf.h"
+#include "qv/crypto/hkdf.h"   // TSK106_Cryptographic_Implementation_Weaknesses
 #include "qv/crypto/aegis.h"   // TSK083_AAD_Recompute_and_Binding cipher identifiers
 #include "qv/crypto/aes_gcm.h" // TSK024_Key_Rotation_and_Lifecycle_Management
+#include "qv/crypto/random.h"  // TSK106_Cryptographic_Implementation_Weaknesses
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/error.h"
 #include "qv/orchestrator/event_bus.h" // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -257,14 +258,7 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
   }
 
   void FillRandom(std::span<uint8_t> out) { // TSK013
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    for (size_t i = 0; i < out.size();) {
-      auto value = gen();
-      for (size_t j = 0; j < sizeof(value) && i < out.size(); ++j, ++i) {
-        out[i] = static_cast<uint8_t>((value >> (j * 8)) & 0xFF);
-      }
-    }
+    qv::crypto::SystemRandomBytes(out); // TSK106_Cryptographic_Implementation_Weaknesses
   }
 
   std::array<uint8_t, 16> GenerateUuidV4() { // TSK013
@@ -360,21 +354,12 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
       const std::array<uint8_t, 16>& uuid) { // TSK024_Key_Rotation_and_Lifecycle_Management
     auto metadata_root =
         qv::core::DeriveMetadataKey(hybrid_key); // TSK024_Key_Rotation_and_Lifecycle_Management
-    auto prk = qv::crypto::HMAC_SHA256::Compute( // TSK024_Key_Rotation_and_Lifecycle_Management
-        std::span<const uint8_t>(uuid.data(),
-                                 uuid.size()), // TSK024_Key_Rotation_and_Lifecycle_Management
-        std::span<const uint8_t>(
-            metadata_root.data(),
-            metadata_root.size())); // TSK024_Key_Rotation_and_Lifecycle_Management
     static constexpr std::string_view kInfo{"QV-HEADER-MAC/v1"};
-    std::array<uint8_t, kInfo.size() + 1> info_block{};
-    std::memcpy(info_block.data(), kInfo.data(), kInfo.size());
-    info_block[kInfo.size()] = 0x01;
-    auto okm = qv::crypto::HMAC_SHA256::Compute(
-        std::span<const uint8_t>(prk.data(), prk.size()),
-        std::span<const uint8_t>(info_block.data(), info_block.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(prk.data(), prk.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(info_block.data(), info_block.size()));
+    const std::span<const uint8_t> info_span(
+        reinterpret_cast<const uint8_t*>(kInfo.data()), kInfo.size());
+    auto okm = qv::crypto::HKDF_SHA256(
+        std::span<const uint8_t>(metadata_root.data(), metadata_root.size()),
+        std::span<const uint8_t>(uuid.data(), uuid.size()), info_span); // TSK106_Cryptographic_Implementation_Weaknesses
     qv::security::Zeroizer::Wipe(
         std::span<uint8_t>(metadata_root.data(),
                            metadata_root.size())); // TSK024_Key_Rotation_and_Lifecycle_Management

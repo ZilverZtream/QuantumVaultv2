@@ -105,7 +105,9 @@ add_library(qv_core
     src/core/pqc_hybrid_kdf.cpp
     src/crypto/aegis.cpp
     src/crypto/aes_gcm.cpp
+    src/crypto/hkdf.cpp
     src/crypto/hmac_sha256.cpp
+    src/crypto/random.cpp
     src/crypto/provider.cpp
     src/crypto/sha256.cpp
     src/security/zeroizer.cpp
