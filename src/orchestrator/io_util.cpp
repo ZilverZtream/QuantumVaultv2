@@ -282,6 +282,8 @@ int NativeClose(int fd) { return _close(fd); }
 int NativeFsync(int fd) {
   // TSK107_Platform_Specific_Issues: _commit() provides best-effort fsync-equivalent semantics on Windows.
   // It forces dirty buffers to disk but may still depend on storage write-back policies.
+  // TSK112_Documentation_and_Code_Clarity: Windows lacks a direct fsync; _commit flushes file
+  // contents but metadata durability still relies on the subsequent directory FlushFileBuffers call.
   return _commit(fd);
 }
 
@@ -331,7 +333,11 @@ int NativeOpen(const std::filesystem::path& path) { // TSK068_Atomic_Header_Writ
 
 int NativeClose(int fd) { return ::close(fd); }
 
-int NativeFsync(int fd) { return ::fsync(fd); }
+int NativeFsync(int fd) {
+  // TSK112_Documentation_and_Code_Clarity: POSIX provides ::fsync which commits both file data and
+  // metadata for the descriptor, contrasting with the Windows _commit fallback documented above.
+  return ::fsync(fd);
+}
 
 ssize_t NativeWrite(int fd, const uint8_t* data, size_t size) {
   return ::write(fd, data, size);

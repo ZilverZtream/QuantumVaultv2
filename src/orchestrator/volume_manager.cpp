@@ -188,12 +188,15 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
 
   constexpr std::array<char, 8> kVolumeMagic = {'Q', 'V', 'A', 'U', 'L', 'T', '\0', '\0'}; // TSK013
   constexpr uint32_t kHeaderVersion = VolumeManager::kLatestHeaderVersion;                  // TSK033 align serialization with published target
-  constexpr uint16_t kTlvTypePbkdf2 = 0x1001;                                              // TSK013
-  constexpr uint16_t kTlvTypeHybridSalt = 0x1002;                                          // TSK013
-  constexpr uint16_t kTlvTypeArgon2 = 0x1003;                                              // TSK036_PBKDF2_Argon2_Migration_Path
-  constexpr uint16_t kTlvTypeEpoch = 0x4E4F; // matches EpochTLV
-  constexpr uint16_t kTlvTypePqcKem = 0x7051;
-  constexpr uint16_t kTlvTypeReservedV2 = 0x7F02; // TSK033 reserved for ACL metadata staging
+  // TSK112_Documentation_and_Code_Clarity: TLV type identifiers (little-endian) encode
+  // well-known header extensions. The ASCII pairs document human-readable tags used by
+  // interoperability tooling when inspecting raw headers.
+  constexpr uint16_t kTlvTypePbkdf2 = 0x1001;                                              // Password-based KDF parameters // TSK112
+  constexpr uint16_t kTlvTypeHybridSalt = 0x1002;                                          // PQC hybrid KDF salt // TSK112
+  constexpr uint16_t kTlvTypeArgon2 = 0x1003;                                              // Argon2id KDF parameters // TSK112
+  constexpr uint16_t kTlvTypeEpoch = 0x4E4F;                                               // 'NO' nonce/epoch counter // TSK112
+  constexpr uint16_t kTlvTypePqcKem = 0x7051;                                              // 'pQ' post-quantum KEM blob // TSK112
+  constexpr uint16_t kTlvTypeReservedV2 = 0x7F02;                                          // Reserved V2 payload // TSK112
   constexpr uint32_t kDefaultFlags = 0;
   constexpr uint32_t kDefaultPbkdfIterations = 600'000; // TSK036_PBKDF2_Argon2_Migration_Path baseline
   constexpr uint32_t kBenchmarkIterations = 100'000;    // TSK036_PBKDF2_Argon2_Migration_Path calibration sample size
@@ -457,6 +460,9 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
   uint32_t DeterminePbkdfIterations(std::span<const uint8_t> password,
                                      const std::array<uint8_t, kPbkdfSaltSize>& salt,
                                      const VolumeManager::KdfPolicy& policy) { // TSK036_PBKDF2_Argon2_Migration_Path
+    // TSK112_Documentation_and_Code_Clarity: Sample a baseline derivation to estimate
+    // per-iteration cost, then scale to meet the policy target duration. The clamp keeps
+    // results within security bounds even if timing jitter produces outliers.
     if (policy.iteration_override) {
       return std::clamp<uint32_t>(*policy.iteration_override, kMinPbkdfIterations, kMaxPbkdfIterations);
     }
