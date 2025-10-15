@@ -391,6 +391,8 @@ constexpr uint16_t kTlvTypeReservedV2 = 0x7F02;                                 
 constexpr size_t kPbkdfSaltSize = 16;
 constexpr size_t kHybridSaltSize = 32;
 constexpr size_t kHeaderMacSize = qv::crypto::HMAC_SHA256::TAG_SIZE;
+constexpr size_t kMaxTlvPayloadBytes = 64 * 1024 - 1;                           // TSK095_Memory_Safety_and_Buffer_Bounds
+static_assert(kMaxTlvPayloadBytes < 64 * 1024, "TLV payload limit too large"); // TSK095_Memory_Safety_and_Buffer_Bounds
 
 #if defined(_MSC_VER)
 constexpr uint16_t ToLittleEndian16(uint16_t value) {
@@ -526,6 +528,10 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
     std::memcpy(&length_le, bytes.data() + offset + sizeof(type_le), sizeof(length_le));
     uint16_t type = FromLittleEndian16(type_le);
     size_t length = static_cast<size_t>(FromLittleEndian16(length_le));
+    if (length > kMaxTlvPayloadBytes) {                                         // TSK095_Memory_Safety_and_Buffer_Bounds
+      parse_ok = false;
+      break;
+    }
     offset += 4;
     if (offset > bytes.size()) {         // TSK030
       parse_ok = false;                  // TSK030, TSK070
@@ -535,17 +541,34 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
     if (length > available) {                 // TSK030
       parse_ok = false;                       // TSK030, TSK070
     }
+    if (!parse_ok) {                                                          // TSK095_Memory_Safety_and_Buffer_Bounds
+      break;
+    }
     size_t safe_length = std::min(length, available); // TSK070
     auto payload = bytes.subspan(offset, safe_length);
+    auto ensure_payload_slice = [&](size_t cursor, size_t need) {             // TSK095_Memory_Safety_and_Buffer_Bounds
+      if (cursor > payload.size()) {
+        return false;
+      }
+      return need <= (payload.size() - cursor);
+    };
     switch (type) {
       case kTlvTypePbkdf2: {
         const size_t expected = 4 + kPbkdfSaltSize; // TSK070
         bool length_ok = safe_length == expected;   // TSK070
         parse_ok = parse_ok && length_ok;           // TSK070
         if (length_ok) {
+          if (!ensure_payload_slice(0, expected)) {                          // TSK095_Memory_Safety_and_Buffer_Bounds
+            parse_ok = false;
+            break;
+          }
           uint32_t iter_le = 0;
           std::memcpy(&iter_le, payload.data(), sizeof(iter_le));
           parsed.pbkdf_iterations = FromLittleEndian32(iter_le);
+          if (!ensure_payload_slice(sizeof(iter_le), kPbkdfSaltSize)) {      // TSK095_Memory_Safety_and_Buffer_Bounds
+            parse_ok = false;
+            break;
+          }
           std::memcpy(parsed.pbkdf_salt.data(), payload.data() + sizeof(iter_le), kPbkdfSaltSize);
           if (parsed.pbkdf_iterations == 0 || parsed.pbkdf_iterations >= (1u << 24)) {
             parsed.pbkdf_iterations = kFallbackIterations;
@@ -561,6 +584,10 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         bool length_ok = safe_length == expected;                      // TSK070
         parse_ok = parse_ok && length_ok;                              // TSK070
         if (length_ok) {
+          if (!ensure_payload_slice(0, expected)) {                    // TSK095_Memory_Safety_and_Buffer_Bounds
+            parse_ok = false;
+            break;
+          }
           std::memcpy(&parsed.argon2.version, payload.data(), sizeof(parsed.argon2.version));
           std::memcpy(&parsed.argon2.time_cost, payload.data() + sizeof(uint32_t), sizeof(parsed.argon2.time_cost));
           std::memcpy(&parsed.argon2.memory_cost_kib, payload.data() + sizeof(uint32_t) * 2,
@@ -589,6 +616,10 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         bool length_ok = safe_length == kHybridSaltSize; // TSK070
         parse_ok = parse_ok && length_ok;                // TSK070
         if (length_ok) {
+          if (!ensure_payload_slice(0, kHybridSaltSize)) {              // TSK095_Memory_Safety_and_Buffer_Bounds
+            parse_ok = false;
+            break;
+          }
           std::memcpy(parsed.hybrid_salt.data(), payload.data(), kHybridSaltSize);
           parsed.have_hybrid = true;
         }
@@ -598,6 +629,10 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         bool length_ok = safe_length == sizeof(uint32_t); // TSK070
         parse_ok = parse_ok && length_ok;                 // TSK070
         if (length_ok) {
+          if (!ensure_payload_slice(0, sizeof(uint32_t))) {            // TSK095_Memory_Safety_and_Buffer_Bounds
+            parse_ok = false;
+            break;
+          }
           uint32_t epoch_le = 0;
           std::memcpy(&epoch_le, payload.data(), sizeof(epoch_le));
           parsed.epoch = FromLittleEndian32(epoch_le);
@@ -617,21 +652,51 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         bool length_ok = safe_length == expected;                 // TSK070
         parse_ok = parse_ok && length_ok;                         // TSK070
         if (length_ok) {
+          if (!ensure_payload_slice(0, expected)) {               // TSK095_Memory_Safety_and_Buffer_Bounds
+            parse_ok = false;
+            break;
+          }
           parsed.pqc.type = type;
           parsed.pqc.length = length;
           uint16_t version_le = 0;
           uint16_t kem_id_le = 0;
-          std::memcpy(&version_le, payload.data(), sizeof(version_le));
-          std::memcpy(&kem_id_le, payload.data() + sizeof(version_le), sizeof(kem_id_le));
+          size_t cursor = 0;                                       // TSK095_Memory_Safety_and_Buffer_Bounds
+          if (!ensure_payload_slice(cursor, sizeof(version_le))) {
+            parse_ok = false;
+            break;
+          }
+          std::memcpy(&version_le, payload.data() + cursor, sizeof(version_le));
+          cursor += sizeof(version_le);
+          if (!ensure_payload_slice(cursor, sizeof(kem_id_le))) {
+            parse_ok = false;
+            break;
+          }
+          std::memcpy(&kem_id_le, payload.data() + cursor, sizeof(kem_id_le));
+          cursor += sizeof(kem_id_le);
           parsed.pqc.version = FromLittleEndian16(version_le);
           parsed.pqc.kem_id = FromLittleEndian16(kem_id_le);
-          size_t cursor = sizeof(version_le) + sizeof(kem_id_le);
+          if (!ensure_payload_slice(cursor, parsed.pqc.kem_ct.size())) {
+            parse_ok = false;
+            break;
+          }
           std::memcpy(parsed.pqc.kem_ct.data(), payload.data() + cursor, parsed.pqc.kem_ct.size());
           cursor += parsed.pqc.kem_ct.size();
+          if (!ensure_payload_slice(cursor, parsed.pqc.sk_nonce.size())) {
+            parse_ok = false;
+            break;
+          }
           std::memcpy(parsed.pqc.sk_nonce.data(), payload.data() + cursor, parsed.pqc.sk_nonce.size());
           cursor += parsed.pqc.sk_nonce.size();
+          if (!ensure_payload_slice(cursor, parsed.pqc.sk_tag.size())) {
+            parse_ok = false;
+            break;
+          }
           std::memcpy(parsed.pqc.sk_tag.data(), payload.data() + cursor, parsed.pqc.sk_tag.size());
           cursor += parsed.pqc.sk_tag.size();
+          if (!ensure_payload_slice(cursor, parsed.pqc.sk_encrypted.size())) {
+            parse_ok = false;
+            break;
+          }
           std::memcpy(parsed.pqc.sk_encrypted.data(), payload.data() + cursor,
                       parsed.pqc.sk_encrypted.size());
           parsed.have_pqc = true;
@@ -641,6 +706,9 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
       default:
         // TSK033: Skip unknown TLVs to maintain forward compatibility
         break;
+    }
+    if (!parse_ok) {                                                          // TSK095_Memory_Safety_and_Buffer_Bounds
+      break;
     }
     size_t next_offset = offset + length; // TSK070
     if (next_offset < offset) {           // overflow guard TSK070
