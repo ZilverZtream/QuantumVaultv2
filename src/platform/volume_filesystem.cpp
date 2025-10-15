@@ -15,6 +15,7 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <cerrno>
 #include <unistd.h>
 #endif
 
@@ -59,22 +60,82 @@ constexpr mode_t kDefaultFileMode = 0644;
 constexpr mode_t kDefaultDirMode = 0755;
 constexpr uint64_t kChunkPayloadSize = storage::kChunkSize;
 
+#if defined(__linux__)
+int FuseErrorFrom(const qv::Error& error) {
+  // TSK084_WinFSP_Normalization_and_Traversal normalize errno mapping for validation failures
+  if (error.domain == qv::ErrorDomain::Validation) {
+    return -EINVAL;
+  }
+  return -EIO;
+}
+#endif
+
 std::string NormalizePath(const std::string& raw_path) {
-  if (raw_path.empty()) {
-    return "/";
+  // TSK084_WinFSP_Normalization_and_Traversal hardened normalization for shared backends
+  constexpr size_t kMaxPathDepth = 128;
+  constexpr size_t kMaxPathLength = 4096;
+
+  std::string cleaned = raw_path;
+  std::replace(cleaned.begin(), cleaned.end(), '\\', '/');
+
+  if (cleaned.find(':') != std::string::npos) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Drive-qualified paths are not allowed"};
   }
-  std::filesystem::path fs_path(raw_path);
+  if (cleaned.size() >= 2 && cleaned[0] == '/' && cleaned[1] == '/') {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "UNC paths are not allowed"};
+  }
+
+  std::filesystem::path fs_path(cleaned);
+  if (fs_path.has_root_name()) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Rooted paths are not allowed"};
+  }
+
   auto normalized = fs_path.lexically_normal();
-  std::string result = normalized.string();
+  std::string generic = normalized.generic_string();
+
+  std::string result;
+  if (generic.empty() || generic == "." || generic == "/") {
+    result = "/";
+  } else {
+    result = std::move(generic);
+    if (!normalized.has_root_directory() || result.front() != '/') {
+      result.insert(result.begin(), '/');
+    }
+    while (result.size() > 1 && result.back() == '/') {
+      result.pop_back();
+    }
+  }
+
   if (result.empty()) {
-    return "/";
+    result = "/";
   }
-  if (result.front() != '/') {
-    result.insert(result.begin(), '/');
+
+  size_t depth = 0;
+  for (size_t pos = 1; pos < result.size();) {
+    auto next = result.find('/', pos);
+    size_t len = (next == std::string::npos) ? result.size() - pos : next - pos;
+    if (len > 0) {
+      auto segment = result.substr(pos, len);
+      if (segment == "..") {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Path traversal outside root is not allowed"};
+      }
+      if (segment != ".") {
+        ++depth;
+        if (depth > kMaxPathDepth) {
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "Path depth exceeds maximum"};
+        }
+      }
+    }
+    if (next == std::string::npos) {
+      break;
+    }
+    pos = next + 1;
   }
-  if (result.size() > 1 && result.back() == '/') {
-    result.pop_back();
+
+  if (result.size() > kMaxPathLength) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Path length exceeds maximum"};
   }
+
   return result;
 }
 
@@ -181,65 +242,83 @@ DirectoryEntry* VolumeFilesystem::FindDirectory(const std::string& path) {
 #if defined(__linux__)
 
 int VolumeFilesystem::GetAttr(const char* path, struct stat* stbuf) {
-  FilesystemMutexGuard lock(fs_mutex_);
-  std::memset(stbuf, 0, sizeof(*stbuf));
-  auto normalized = NormalizePath(path);
-  if (normalized == "/") {
-    stbuf->st_mode = S_IFDIR | kDefaultDirMode;
-    stbuf->st_nlink = 2;
-    stbuf->st_mtim = root_->mtime;
-    stbuf->st_ctim = root_->mtime;
-    return 0;
-  }
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    std::memset(stbuf, 0, sizeof(*stbuf));
+    auto normalized = NormalizePath(path);
+    if (normalized == "/") {
+      stbuf->st_mode = S_IFDIR | kDefaultDirMode;
+      stbuf->st_nlink = 2;
+      stbuf->st_mtim = root_->mtime;
+      stbuf->st_ctim = root_->mtime;
+      return 0;
+    }
 
-  if (auto* dir = FindDirectory(normalized)) {
-    stbuf->st_mode = S_IFDIR | kDefaultDirMode;
-    stbuf->st_nlink = 2;
-    stbuf->st_mtim = dir->mtime;
-    stbuf->st_ctim = dir->mtime;
-    return 0;
-  }
+    if (auto* dir = FindDirectory(normalized)) {
+      stbuf->st_mode = S_IFDIR | kDefaultDirMode;
+      stbuf->st_nlink = 2;
+      stbuf->st_mtim = dir->mtime;
+      stbuf->st_ctim = dir->mtime;
+      return 0;
+    }
 
-  auto* file = FindFile(normalized);
-  if (!file) {
-    return -ENOENT;
+    auto* file = FindFile(normalized);
+    if (!file) {
+      return -ENOENT;
+    }
+    auto mode_bits = file->mode == 0 ? kDefaultFileMode : file->mode;
+    stbuf->st_mode = S_IFREG | (mode_bits & 0777);
+    stbuf->st_nlink = 1;
+    stbuf->st_size = static_cast<off_t>(file->size);
+    stbuf->st_mtim = file->mtime;
+    stbuf->st_ctim = file->ctime;
+    stbuf->st_uid = file->uid;
+    stbuf->st_gid = file->gid;
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  auto mode_bits = file->mode == 0 ? kDefaultFileMode : file->mode;
-  stbuf->st_mode = S_IFREG | (mode_bits & 0777);
-  stbuf->st_nlink = 1;
-  stbuf->st_size = static_cast<off_t>(file->size);
-  stbuf->st_mtim = file->mtime;
-  stbuf->st_ctim = file->ctime;
-  stbuf->st_uid = file->uid;
-  stbuf->st_gid = file->gid;
-  return 0;
 }
 
 int VolumeFilesystem::ReadDir(const char* path, void* buf, fuse_fill_dir_t filler) {
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto* dir = FindDirectory(path);
-  if (!dir) {
-    return -ENOENT;
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto* dir = FindDirectory(path);
+    if (!dir) {
+      return -ENOENT;
+    }
+    filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+    filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+    for (const auto& subdir : dir->subdirs) {
+      filler(buf, subdir->name.c_str(), nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+    }
+    for (const auto& file : dir->files) {
+      filler(buf, file.name.c_str(), nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+    }
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-  filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-  for (const auto& subdir : dir->subdirs) {
-    filler(buf, subdir->name.c_str(), nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-  }
-  for (const auto& file : dir->files) {
-    filler(buf, file.name.c_str(), nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-  }
-  return 0;
 }
 
 int VolumeFilesystem::Open(const char* path, struct fuse_file_info* fi) {
   (void)fi;
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto* file = FindFile(path);
-  if (!file) {
-    return -ENOENT;
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto* file = FindFile(path);
+    if (!file) {
+      return -ENOENT;
+    }
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  return 0;
 }
 
 std::vector<uint8_t> VolumeFilesystem::ReadFileContent(const FileEntry& file) {
@@ -303,79 +382,97 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
 
 #if defined(__linux__)
 int VolumeFilesystem::Read(const char* path, char* buf, size_t size, off_t offset) {
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto* file = FindFile(path);
-  if (!file) {
-    return -ENOENT;
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto* file = FindFile(path);
+    if (!file) {
+      return -ENOENT;
+    }
+    if (offset < 0) {
+      return -EINVAL;
+    }
+    auto data = ReadFileContent(*file);
+    if (offset >= static_cast<off_t>(data.size())) {
+      return 0;
+    }
+    size_t readable = std::min<size_t>(size, data.size() - static_cast<size_t>(offset));
+    std::memcpy(buf, data.data() + static_cast<size_t>(offset), readable);
+    return static_cast<int>(readable);
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  if (offset < 0) {
-    return -EINVAL;
-  }
-  auto data = ReadFileContent(*file);
-  if (offset >= static_cast<off_t>(data.size())) {
-    return 0;
-  }
-  size_t readable = std::min<size_t>(size, data.size() - static_cast<size_t>(offset));
-  std::memcpy(buf, data.data() + static_cast<size_t>(offset), readable);
-  return static_cast<int>(readable);
 }
 
 int VolumeFilesystem::Write(const char* path, const char* buf, size_t size, off_t offset) {
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto* file = FindFile(path);
-  if (!file) {
-    return -ENOENT;
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto* file = FindFile(path);
+    if (!file) {
+      return -ENOENT;
+    }
+    if (offset < 0) {
+      return -EINVAL;
+    }
+    auto data = ReadFileContent(*file);
+    if (static_cast<size_t>(offset) > data.size()) {
+      data.resize(static_cast<size_t>(offset), 0);
+    }
+    if (offset + static_cast<off_t>(size) > static_cast<off_t>(data.size())) {
+      data.resize(static_cast<size_t>(offset + static_cast<off_t>(size)), 0);
+    }
+    std::memcpy(data.data() + static_cast<size_t>(offset), buf, size);
+    WriteFileContent(*file, data);
+    file->size = data.size();
+    auto now = CurrentTimespec();
+    file->mtime = now;
+    SaveMetadata();
+    return static_cast<int>(size);
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  if (offset < 0) {
-    return -EINVAL;
-  }
-  auto data = ReadFileContent(*file);
-  if (static_cast<size_t>(offset) > data.size()) {
-    data.resize(static_cast<size_t>(offset), 0);
-  }
-  if (offset + static_cast<off_t>(size) > static_cast<off_t>(data.size())) {
-    data.resize(static_cast<size_t>(offset + static_cast<off_t>(size)), 0);
-  }
-  std::memcpy(data.data() + static_cast<size_t>(offset), buf, size);
-  WriteFileContent(*file, data);
-  file->size = data.size();
-  auto now = CurrentTimespec();
-  file->mtime = now;
-  SaveMetadata();
-  return static_cast<int>(size);
 }
 
 int VolumeFilesystem::Create(const char* path, mode_t mode, struct fuse_file_info* fi) {
   (void)fi;
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto normalized = NormalizePath(path);
-  auto parent_path = std::filesystem::path(normalized).parent_path().string();
-  if (parent_path.empty()) {
-    parent_path = "/";
-  }
-  auto* dir = FindDirectory(parent_path);
-  if (!dir) {
-    return -ENOENT;
-  }
-  auto name = std::filesystem::path(normalized).filename().string();
-  for (const auto& file : dir->files) {
-    if (file.name == name) {
-      return -EEXIST;
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto normalized = NormalizePath(path);
+    auto parent_path = std::filesystem::path(normalized).parent_path().string();
+    if (parent_path.empty()) {
+      parent_path = "/";
     }
+    auto* dir = FindDirectory(parent_path);
+    if (!dir) {
+      return -ENOENT;
+    }
+    auto name = std::filesystem::path(normalized).filename().string();
+    for (const auto& file : dir->files) {
+      if (file.name == name) {
+        return -EEXIST;
+      }
+    }
+    FileEntry entry{};
+    entry.name = name;
+    entry.mode = mode;
+    entry.size = 0;
+    entry.start_offset = 0;
+    entry.mtime = CurrentTimespec();
+    entry.ctime = entry.mtime;
+    entry.uid = fuse_get_context() ? fuse_get_context()->uid : getuid();
+    entry.gid = fuse_get_context() ? fuse_get_context()->gid : getgid();
+    dir->files.push_back(entry);
+    dir->mtime = entry.mtime;
+    SaveMetadata();
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  FileEntry entry{};
-  entry.name = name;
-  entry.mode = mode;
-  entry.size = 0;
-  entry.start_offset = 0;
-  entry.mtime = CurrentTimespec();
-  entry.ctime = entry.mtime;
-  entry.uid = fuse_get_context() ? fuse_get_context()->uid : getuid();
-  entry.gid = fuse_get_context() ? fuse_get_context()->gid : getgid();
-  dir->files.push_back(entry);
-  dir->mtime = entry.mtime;
-  SaveMetadata();
-  return 0;
 }
 #endif  // defined(__linux__)
 
@@ -765,103 +862,127 @@ void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<t
 
 
 int VolumeFilesystem::Unlink(const char* path) {
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto normalized = NormalizePath(path);
-  auto parent_path = std::filesystem::path(normalized).parent_path().string();
-  if (parent_path.empty()) {
-    parent_path = "/";
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto normalized = NormalizePath(path);
+    auto parent_path = std::filesystem::path(normalized).parent_path().string();
+    if (parent_path.empty()) {
+      parent_path = "/";
+    }
+    auto* dir = FindDirectory(parent_path);
+    if (!dir) {
+      return -ENOENT;
+    }
+    auto target = std::filesystem::path(normalized).filename().string();
+    auto before = dir->files.size();
+    dir->files.erase(std::remove_if(dir->files.begin(), dir->files.end(),
+                                    [&](const FileEntry& file) { return file.name == target; }),
+                     dir->files.end());
+    if (dir->files.size() == before) {
+      return -ENOENT;
+    }
+    dir->mtime = CurrentTimespec();
+    SaveMetadata();
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  auto* dir = FindDirectory(parent_path);
-  if (!dir) {
-    return -ENOENT;
-  }
-  auto target = std::filesystem::path(normalized).filename().string();
-  auto before = dir->files.size();
-  dir->files.erase(std::remove_if(dir->files.begin(), dir->files.end(),
-                                  [&](const FileEntry& file) { return file.name == target; }),
-                   dir->files.end());
-  if (dir->files.size() == before) {
-    return -ENOENT;
-  }
-  dir->mtime = CurrentTimespec();
-  SaveMetadata();
-  return 0;
 }
 
 int VolumeFilesystem::Mkdir(const char* path, mode_t mode) {
   (void)mode;
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto normalized = NormalizePath(path);
-  auto parent_path = std::filesystem::path(normalized).parent_path().string();
-  if (parent_path.empty()) {
-    parent_path = "/";
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto normalized = NormalizePath(path);
+    auto parent_path = std::filesystem::path(normalized).parent_path().string();
+    if (parent_path.empty()) {
+      parent_path = "/";
+    }
+    auto* parent = FindDirectory(parent_path);
+    if (!parent) {
+      return -ENOENT;
+    }
+    auto name = std::filesystem::path(normalized).filename().string();
+    if (FindDirectory(normalized)) {
+      return -EEXIST;
+    }
+    auto dir = std::make_shared<DirectoryEntry>();
+    dir->name = name;
+    dir->mtime = CurrentTimespec();
+    parent->subdirs.push_back(dir);
+    parent->mtime = dir->mtime;
+    SaveMetadata();
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  auto* parent = FindDirectory(parent_path);
-  if (!parent) {
-    return -ENOENT;
-  }
-  auto name = std::filesystem::path(normalized).filename().string();
-  if (FindDirectory(normalized)) {
-    return -EEXIST;
-  }
-  auto dir = std::make_shared<DirectoryEntry>();
-  dir->name = name;
-  dir->mtime = CurrentTimespec();
-  parent->subdirs.push_back(dir);
-  parent->mtime = dir->mtime;
-  SaveMetadata();
-  return 0;
 }
 
 int VolumeFilesystem::Rmdir(const char* path) {
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto normalized = NormalizePath(path);
-  if (normalized == "/") {
-    return -EBUSY;
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto normalized = NormalizePath(path);
+    if (normalized == "/") {
+      return -EBUSY;
+    }
+    auto parent_path = std::filesystem::path(normalized).parent_path().string();
+    if (parent_path.empty()) {
+      parent_path = "/";
+    }
+    auto* parent = FindDirectory(parent_path);
+    if (!parent) {
+      return -ENOENT;
+    }
+    auto name = std::filesystem::path(normalized).filename().string();
+    auto it = std::find_if(parent->subdirs.begin(), parent->subdirs.end(),
+                           [&](const std::shared_ptr<DirectoryEntry>& child) { return child->name == name; });
+    if (it == parent->subdirs.end()) {
+      return -ENOENT;
+    }
+    if (!(*it)->files.empty() || !(*it)->subdirs.empty()) {
+      return -ENOTEMPTY;
+    }
+    parent->subdirs.erase(it);
+    parent->mtime = CurrentTimespec();
+    SaveMetadata();
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  auto parent_path = std::filesystem::path(normalized).parent_path().string();
-  if (parent_path.empty()) {
-    parent_path = "/";
-  }
-  auto* parent = FindDirectory(parent_path);
-  if (!parent) {
-    return -ENOENT;
-  }
-  auto name = std::filesystem::path(normalized).filename().string();
-  auto it = std::find_if(parent->subdirs.begin(), parent->subdirs.end(),
-                         [&](const std::shared_ptr<DirectoryEntry>& child) { return child->name == name; });
-  if (it == parent->subdirs.end()) {
-    return -ENOENT;
-  }
-  if (!(*it)->files.empty() || !(*it)->subdirs.empty()) {
-    return -ENOTEMPTY;
-  }
-  parent->subdirs.erase(it);
-  parent->mtime = CurrentTimespec();
-  SaveMetadata();
-  return 0;
 }
 
 int VolumeFilesystem::Truncate(const char* path, off_t size) {
-  FilesystemMutexGuard lock(fs_mutex_);
-  auto* file = FindFile(path);
-  if (!file) {
-    return -ENOENT;
+  try {
+    FilesystemMutexGuard lock(fs_mutex_);
+    auto* file = FindFile(path);
+    if (!file) {
+      return -ENOENT;
+    }
+    if (size < 0) {
+      return -EINVAL;
+    }
+    auto data = ReadFileContent(*file);
+    if (size < static_cast<off_t>(data.size())) {
+      data.resize(static_cast<size_t>(size));
+    } else if (size > static_cast<off_t>(data.size())) {
+      data.resize(static_cast<size_t>(size), 0);
+    }
+    WriteFileContent(*file, data);
+    file->size = data.size();
+    file->mtime = CurrentTimespec();
+    SaveMetadata();
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
   }
-  if (size < 0) {
-    return -EINVAL;
-  }
-  auto data = ReadFileContent(*file);
-  if (size < static_cast<off_t>(data.size())) {
-    data.resize(static_cast<size_t>(size));
-  } else if (size > static_cast<off_t>(data.size())) {
-    data.resize(static_cast<size_t>(size), 0);
-  }
-  WriteFileContent(*file, data);
-  file->size = data.size();
-  file->mtime = CurrentTimespec();
-  SaveMetadata();
-  return 0;
 }
 
 #endif  // defined(__linux__)

@@ -47,6 +47,7 @@ class WinFspAdapter::Impl {
   static std::wstring Utf8ToWide(const std::string& value);
   static std::string WideToUtf8(const std::wstring& value);
   static std::string NormalizePath(const std::wstring& value);
+  static NTSTATUS PathErrorStatus(const qv::Error& error);
   static UINT64 TimespecToFileTime(const timespec& ts);
   static timespec FileTimeToTimespec(UINT64 filetime);
   static void PopulateFileInfo(const NodeMetadata& metadata, FSP_FSCTL_FILE_INFO* info);
@@ -221,18 +222,82 @@ std::string WinFspAdapter::Impl::WideToUtf8(const std::wstring& value) {
 }
 
 std::string WinFspAdapter::Impl::NormalizePath(const std::wstring& value) {
-  if (value.empty()) {
-    return std::string{"/"};
-  }
+  // TSK084_WinFSP_Normalization_and_Traversal enforce canonical paths inside volume root
+  constexpr size_t kMaxPathDepth = 128;
+  constexpr size_t kMaxPathLength = 4096;
+
   std::wstring cleaned = value;
   std::replace(cleaned.begin(), cleaned.end(), L'\\', L'/');
-  if (!cleaned.empty() && cleaned.front() != L'/') {
-    cleaned.insert(cleaned.begin(), L'/');
+
+  if (!cleaned.empty()) {
+    if (cleaned.size() >= 2 && cleaned[0] == L'/' && cleaned[1] == L'/') {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "UNC paths are not supported"};
+    }
+    if (cleaned.find(L':') != std::wstring::npos) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Drive-qualified paths are not supported"};
+    }
   }
-  while (cleaned.size() > 1 && cleaned.back() == L'/') {
-    cleaned.pop_back();
+
+  std::filesystem::path fs_path(cleaned);
+  if (fs_path.has_root_name()) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Root-qualified paths are not supported"};
   }
-  return WideToUtf8(cleaned);
+
+  auto normalized = fs_path.lexically_normal();
+  std::wstring generic = normalized.generic_wstring();
+
+  std::wstring result;
+  if (generic.empty() || generic == L"." || generic == L"/") {
+    result = L"/";
+  } else {
+    result = std::move(generic);
+    if (!normalized.has_root_directory() || result.front() != L'/') {
+      result.insert(result.begin(), L'/');
+    }
+    while (result.size() > 1 && result.back() == L'/') {
+      result.pop_back();
+    }
+  }
+
+  if (result.empty()) {
+    result = L"/";
+  }
+
+  size_t depth = 0;
+  for (size_t pos = 1; pos < result.size();) {
+    auto next = result.find(L'/', pos);
+    size_t len = (next == std::wstring::npos) ? result.size() - pos : next - pos;
+    if (len > 0) {
+      auto segment = result.substr(pos, len);
+      if (segment == L"..") {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Path traversal outside root is not allowed"};
+      }
+      if (segment != L".") {
+        ++depth;
+        if (depth > kMaxPathDepth) {
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "Path depth exceeds maximum"};
+        }
+      }
+    }
+    if (next == std::wstring::npos) {
+      break;
+    }
+    pos = next + 1;
+  }
+
+  if (result.size() > kMaxPathLength) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Path length exceeds maximum"};
+  }
+
+  return WideToUtf8(result);
+}
+
+NTSTATUS WinFspAdapter::Impl::PathErrorStatus(const qv::Error& error) {
+  // TSK084_WinFSP_Normalization_and_Traversal map validation failures to NTSTATUS codes
+  if (error.domain == qv::ErrorDomain::Validation) {
+    return STATUS_OBJECT_PATH_SYNTAX_BAD;
+  }
+  return STATUS_ACCESS_DENIED;
 }
 
 UINT64 WinFspAdapter::Impl::TimespecToFileTime(const timespec& ts) {
@@ -320,8 +385,21 @@ NTSTATUS WinFspAdapter::Impl::GetSecurityByName(FSP_FILE_SYSTEM* fs, PWSTR filen
                                                 PSECURITY_DESCRIPTOR descriptor,
                                                 SIZE_T* descriptor_size) {
   auto* self = FromFs(fs);
-  auto path = NormalizePath(filename ? filename : L"\\");
-  auto metadata = self->volume_fs_->StatPath(path);
+  std::string path;
+  try {
+    path = NormalizePath(filename ? filename : L"\\");
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
+  }
+
+  std::optional<NodeMetadata> metadata;
+  try {
+    metadata = self->volume_fs_->StatPath(path);
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
+  } catch (...) {
+    return STATUS_IO_DEVICE_ERROR;
+  }
   if (!metadata) {
     return STATUS_OBJECT_NAME_NOT_FOUND;
   }
@@ -340,8 +418,21 @@ NTSTATUS WinFspAdapter::Impl::Open(FSP_FILE_SYSTEM* fs, PWSTR filename, UINT32 c
                                    FSP_FSCTL_FILE_INFO* file_info) {
   (void)granted_access;
   auto* self = FromFs(fs);
-  auto path = NormalizePath(filename ? filename : L"\\");
-  auto metadata = self->volume_fs_->StatPath(path);
+  std::string path;
+  try {
+    path = NormalizePath(filename ? filename : L"\\");
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
+  }
+
+  std::optional<NodeMetadata> metadata;
+  try {
+    metadata = self->volume_fs_->StatPath(path);
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
+  } catch (...) {
+    return STATUS_IO_DEVICE_ERROR;
+  }
   if (!metadata) {
     return STATUS_OBJECT_NAME_NOT_FOUND;
   }
@@ -366,7 +457,12 @@ NTSTATUS WinFspAdapter::Impl::Create(FSP_FILE_SYSTEM* fs, PWSTR filename, UINT32
   (void)descriptor;
   (void)allocation_size;
   auto* self = FromFs(fs);
-  auto path = NormalizePath(filename ? filename : L"\\");
+  std::string path;
+  try {
+    path = NormalizePath(filename ? filename : L"\\");
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
+  }
   bool is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
                       (create_options & FILE_DIRECTORY_FILE) != 0;
   try {
@@ -375,11 +471,18 @@ NTSTATUS WinFspAdapter::Impl::Create(FSP_FILE_SYSTEM* fs, PWSTR filename, UINT32
     } else {
       self->volume_fs_->CreateFileNode(path, 0644, 0, 0);
     }
-  } catch (const qv::Error&) {
-    return STATUS_ACCESS_DENIED;
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
   }
 
-  auto metadata = self->volume_fs_->StatPath(path);
+  std::optional<NodeMetadata> metadata;
+  try {
+    metadata = self->volume_fs_->StatPath(path);
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
+  } catch (...) {
+    return STATUS_IO_DEVICE_ERROR;
+  }
   if (!metadata) {
     return STATUS_OBJECT_NAME_NOT_FOUND;
   }
@@ -639,13 +742,21 @@ NTSTATUS WinFspAdapter::Impl::Rename(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR f
     return STATUS_INVALID_PARAMETER;
   }
   auto from_path = node->path;
-  auto to_path = NormalizePath(new_filename ? new_filename : L"\\");
+  std::string to_path;
+  try {
+    to_path = NormalizePath(new_filename ? new_filename : L"\\");
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
+  }
+  if (to_path == "/") {
+    return STATUS_INVALID_PARAMETER;
+  }
   try {
     self->volume_fs_->RenameNode(from_path, to_path, replace_existing);
     node->path = to_path;
     return STATUS_SUCCESS;
-  } catch (const qv::Error&) {
-    return STATUS_ACCESS_DENIED;
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);
   }
 }
 
