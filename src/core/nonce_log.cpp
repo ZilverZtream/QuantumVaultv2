@@ -14,6 +14,7 @@
 #include <iostream> // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
 #include <limits>      // TSK095_Memory_Safety_and_Buffer_Bounds overflow guards
 #include <mutex>        // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
+#include <stdexcept>  // TSK104_Concurrency_Deadlock_and_Lock_Ordering misuse detection
 #include <system_error>
 #include <thread>      // TSK101_File_IO_Persistence_and_Atomicity retry backoff
 #include <type_traits> // TSK100_Integer_Overflow_and_Arithmetic checked casts
@@ -798,6 +799,10 @@ void NonceLog::ReloadUnlocked() {
 }
 
 void NonceLog::PersistUnlocked() {
+  if (mu_.try_lock()) {  // TSK104_Concurrency_Deadlock_and_Lock_Ordering enforce external locking
+    mu_.unlock();
+    throw std::logic_error("PersistUnlocked requires caller to hold mu_");
+  }
   std::vector<uint8_t> buffer = SerializeHeader(kLogVersion, kHeaderMagic, key_);
   for (const auto& entry : entries_) {
     AppendEntryBytes(buffer, entry.counter, entry.mac);

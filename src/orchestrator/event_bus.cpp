@@ -49,6 +49,16 @@
 namespace qv::orchestrator {
 namespace {
 
+struct PublishReentrancyGuard {  // TSK104_Concurrency_Deadlock_and_Lock_Ordering suppress recursive publish deadlocks
+  explicit PublishReentrancyGuard(bool& flag) : flag_(flag) { flag_ = true; }
+  ~PublishReentrancyGuard() { flag_ = false; }
+  PublishReentrancyGuard(const PublishReentrancyGuard&) = delete;
+  PublishReentrancyGuard& operator=(const PublishReentrancyGuard&) = delete;
+
+ private:
+  bool& flag_;
+};
+
 constexpr size_t kHmacSize = qv::crypto::HMAC_SHA256::TAG_SIZE; // TSK029
 constexpr int kSyslogFacility = 10;                             // LOG_AUTHPRIV // TSK029
 constexpr size_t kMaxEventBytes = 16 * 1024;                    // TSK069_DoS_Resource_Exhaustion_Guards cap serialized size
@@ -1459,6 +1469,13 @@ EventBus& EventBus::Instance() { // TSK029
 }
 
 void EventBus::Publish(const Event& event) { // TSK029
+  static thread_local bool in_publish = false;  // TSK104_Concurrency_Deadlock_and_Lock_Ordering detect recursion
+  if (in_publish) {
+    std::clog << "{\"event\":\"event_bus_reentrancy\",\"message\":\"recursive publish suppressed\"}"
+              << std::endl;  // TSK104_Concurrency_Deadlock_and_Lock_Ordering
+    return;
+  }
+  PublishReentrancyGuard guard(in_publish);
   std::vector<Subscriber> targets;
   bool notify_dispatcher = false;                       // TSK081_EventBus_Throughput_and_Batching
   {

@@ -9,27 +9,12 @@ namespace qv::storage {
 ChunkCache::ChunkCache(size_t max_size) : max_size_(max_size) {}
 
 std::shared_ptr<CachedChunk> ChunkCache::Get(int64_t chunk_idx) {
-  uint64_t expected_generation = 0;  // TSK096_Race_Conditions_and_Thread_Safety
-  std::shared_ptr<CachedChunk> chunk;
-  {
-    std::shared_lock read_lock(mutex_);  // TSK076_Cache_Coherency
-    auto it = cache_.find(chunk_idx);
-    if (it == cache_.end()) {
-      return nullptr;
-    }
-    expected_generation = it->second.version;
-    chunk = it->second.chunk;
-  }
-
-  std::unique_lock write_lock(mutex_);
+  std::unique_lock write_lock(mutex_);  // TSK104_Concurrency_Deadlock_and_Lock_Ordering avoid upgrades
   auto it = cache_.find(chunk_idx);
   if (it == cache_.end()) {
     return nullptr;
   }
-  if (it->second.version != expected_generation) {
-    return nullptr;
-  }
-  chunk = it->second.chunk;
+  auto chunk = it->second.chunk;
   TouchLocked(chunk_idx, chunk);
   return chunk;
 }
@@ -39,6 +24,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
                                              bool dirty) {
   std::vector<std::shared_ptr<CachedChunk>> to_flush;
   std::function<void(int64_t, const std::vector<uint8_t>&)> callback;
+  std::shared_ptr<CachedChunk> inserted;  // TSK104_Concurrency_Deadlock_and_Lock_Ordering retain result outside lock
   {
     std::unique_lock lock(mutex_);
 
@@ -62,6 +48,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
     cache_[chunk_idx] = CacheEntry{chunk, chunk->version};
     lru_list_.push_front(chunk_idx);
     lru_map_[chunk_idx] = lru_list_.begin();
+    inserted = chunk;
     callback = write_back_;
   }
 
@@ -71,7 +58,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
     }
   }
 
-  return Get(chunk_idx);
+  return inserted;
 }
 
 std::vector<int64_t> ChunkCache::GetDirtyChunks() const {
