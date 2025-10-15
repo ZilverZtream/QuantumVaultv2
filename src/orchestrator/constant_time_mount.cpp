@@ -34,8 +34,11 @@
 #include "qv/crypto/aegis.h"
 #include "qv/crypto/ct.h"
 #include "qv/crypto/hmac_sha256.h"
+#include "qv/crypto/pbkdf2.h"  // TSK111_Code_Duplication_and_Maintainability shared PBKDF2
 #include "qv/orchestrator/event_bus.h"  // TSK019
 #include "qv/orchestrator/ipc_lock.h"   // TSK075_Lockout_Persistence_and_IPC
+#include "qv/errors.h"  // TSK111_Code_Duplication_and_Maintainability centralized errors
+#include "qv/tlv/parser.h"  // TSK111_Code_Duplication_and_Maintainability TLV iteration
 #include "qv/security/zeroizer.h"
 #include "qv/storage/block_device.h"
 
@@ -107,10 +110,12 @@ void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_
   constexpr size_t kMaxPasswordLen = 1024;
   const auto size = password.size();
   if (size < kMinPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too short"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooShort)};
   }
   if (size > kMaxPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too long"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooLong)};
   }
 }
 
@@ -123,13 +128,15 @@ std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sa
     std::error_code cwd_ec;
     base = std::filesystem::current_path(cwd_ec);
     if (cwd_ec) {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to resolve working directory"};
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kUnableToResolveWorkingDirectory)};
     }
   }
   std::error_code ec;
   auto canonical = std::filesystem::weakly_canonical(base, ec);
   if (ec) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to canonicalize container root"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kUnableToCanonicalizeContainerRoot)};
   }
   return canonical;
 }
@@ -143,16 +150,19 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
   std::error_code ec;
   auto canonical = std::filesystem::weakly_canonical(path, ec);
   if (ec) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Failed to canonicalize container path"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kFailedToCanonicalizeContainerPath)};
   }
   const auto& base = AllowedContainerRoot();
   auto relative = std::filesystem::relative(canonical, base, ec);
   if (ec || relative.is_absolute()) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Container path escapes allowed root"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kContainerEscapesAllowedRoot)};
   }
   for (const auto& component : relative) {
     if (component == "..") {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path escape attempt detected"};
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kPathEscapeAttemptDetected)};
     }
   }
   return canonical;
@@ -213,7 +223,7 @@ public:
 
     if (state.locked) {
       throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
-                      "Volume locked due to repeated authentication failures"}; // TSK026
+                    std::string(qv::errors::msg::kVolumeLocked)}; // TSK026
     }
 
     if (!state.have_last_attempt || state.failures <= 0) {
@@ -390,7 +400,7 @@ FailureTracker::PersistLoadResult FailureTracker::ReadPersistentState(
     return result;
   }
 
-  if (FromLittleEndian32(header.version_le) != kLockFileVersion) {
+  if (qv::FromLittleEndian32(header.version_le) != kLockFileVersion) {
     result.tampered = true;
     return result;
   }
@@ -402,16 +412,16 @@ FailureTracker::PersistLoadResult FailureTracker::ReadPersistentState(
   }
 
   AttemptState state{};
-  uint32_t failures = FromLittleEndian32(header.failures_le);
+  uint32_t failures = qv::FromLittleEndian32(header.failures_le);
   if (failures > static_cast<uint32_t>(kMaxAttempts)) {
     failures = static_cast<uint32_t>(kMaxAttempts);
   }
   state.failures = static_cast<int>(failures);
-  state.locked = FromLittleEndian32(header.locked_le) != 0;
+  state.locked = qv::FromLittleEndian32(header.locked_le) != 0;
   if (state.locked && state.failures < kMaxAttempts) {
     state.failures = kMaxAttempts;
   }
-  uint64_t last_epoch = FromLittleEndian64(header.last_attempt_le);
+  uint64_t last_epoch = qv::FromLittleEndian64(header.last_attempt_le);
   if (last_epoch != 0) {
     state.have_last_attempt = true;
     state.last_attempt = SystemClock::time_point(std::chrono::seconds(last_epoch));
@@ -434,7 +444,7 @@ void FailureTracker::WritePersistentState(const std::filesystem::path& container
                     state.last_attempt.time_since_epoch())
                     .count());
   }
-  header.last_attempt_le = ToLittleEndian64(last_epoch);
+  header.last_attempt_le = qv::ToLittleEndian64(last_epoch);
   header.locked_le = qv::ToLittleEndian(state.locked ? 1u : 0u);
 
   auto mac = ComputeLockMac(header, uuid);
@@ -442,13 +452,13 @@ void FailureTracker::WritePersistentState(const std::filesystem::path& container
   std::ofstream out(lock_path, std::ios::binary | std::ios::trunc);
   if (!out) {
     throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
-                    "Failed to persist lock file for protected volume"}; // TSK026
+                    std::string(qv::errors::msg::kPersistLockFileFailed)}; // TSK026
   }
   out.write(reinterpret_cast<const char*>(&header), sizeof(header));
   out.write(reinterpret_cast<const char*>(mac.data()), mac.size());
   if (!out) {
     throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
-                    "Failed to persist lock file for protected volume"}; // TSK026
+                    std::string(qv::errors::msg::kPersistLockFileFailed)}; // TSK026
   }
 }
 
@@ -508,51 +518,6 @@ constexpr size_t kHeaderMacSize = qv::crypto::HMAC_SHA256::TAG_SIZE;
 constexpr size_t kMaxTlvPayloadBytes = 64 * 1024 - 1;                           // TSK095_Memory_Safety_and_Buffer_Bounds
 static_assert(kMaxTlvPayloadBytes < 64 * 1024, "TLV payload limit too large"); // TSK095_Memory_Safety_and_Buffer_Bounds
 
-#if defined(_MSC_VER)
-constexpr uint16_t ToLittleEndian16(uint16_t value) {
-  return qv::kIsLittleEndian ? value : _byteswap_ushort(value);
-}
-constexpr uint64_t ToLittleEndian64(uint64_t value) {
-  return qv::kIsLittleEndian ? value : _byteswap_uint64(value);
-}
-#elif defined(__clang__) || defined(__GNUC__)
-constexpr uint16_t ToLittleEndian16(uint16_t value) {
-  return qv::kIsLittleEndian ? value : __builtin_bswap16(value);
-}
-constexpr uint64_t ToLittleEndian64(uint64_t value) {
-  return qv::kIsLittleEndian ? value : __builtin_bswap64(value);
-}
-#else
-constexpr uint16_t ToLittleEndian16(uint16_t value) {
-  if (qv::kIsLittleEndian) {
-    return value;
-  }
-  return static_cast<uint16_t>(((value & 0xFF) << 8) | ((value >> 8) & 0xFF));
-}
-constexpr uint64_t ToLittleEndian64(uint64_t value) {
-  if (qv::kIsLittleEndian) {
-    return value;
-  }
-  uint64_t swapped = 0;
-  for (int i = 0; i < 8; ++i) {
-    swapped |= ((value >> (i * 8)) & 0xFFull) << ((7 - i) * 8);
-  }
-  return swapped;
-}
-#endif
-
-constexpr uint16_t FromLittleEndian16(uint16_t value) {
-  return ToLittleEndian16(value);
-}
-
-constexpr uint32_t FromLittleEndian32(uint32_t value) {
-  return qv::ToLittleEndian(value);
-}
-
-constexpr uint64_t FromLittleEndian64(uint64_t value) {
-  return ToLittleEndian64(value);
-}
-
 #pragma pack(push, 1)
 struct VolumeHeader { // TSK013
   std::array<uint8_t, 8> magic{};
@@ -562,8 +527,8 @@ struct VolumeHeader { // TSK013
 };
 
 struct ReservedV2Tlv { // TSK013
-  uint16_t type = ToLittleEndian16(kTlvTypeReservedV2);
-  uint16_t length = ToLittleEndian16(32);
+  uint16_t type = qv::ToLittleEndian16(kTlvTypeReservedV2);
+  uint16_t length = qv::ToLittleEndian16(32);
   std::array<uint8_t, 32> payload{};
 };
 #pragma pack(pop)
@@ -623,206 +588,139 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
   std::memcpy(&parsed.header, bytes.data(), sizeof(VolumeHeader));
 
   bool magic_ok = qv::crypto::ct::CompareEqual(parsed.header.magic, kHeaderMagic);
-  parsed.version = FromLittleEndian32(parsed.header.version);
-  parsed.flags = FromLittleEndian32(parsed.header.flags);
+  parsed.version = qv::FromLittleEndian32(parsed.header.version);
+  parsed.flags = qv::FromLittleEndian32(parsed.header.flags);
   bool version_ok = parsed.version == kHeaderVersion;
 
-  size_t offset = sizeof(VolumeHeader);
-  size_t tlv_count = 0;                 // TSK038_Resource_Limits_and_DoS_Prevention
-  bool parse_ok = offset <= bytes.size(); // TSK070
-  while (parse_ok && (bytes.size() - offset) >= 4) {
-    ++tlv_count;
-    if (tlv_count > 64) {          // TSK038_Resource_Limits_and_DoS_Prevention
-      parse_ok = false;            // TSK038_Resource_Limits_and_DoS_Prevention
-      break;                       // TSK070
-    }
-    uint16_t type_le = 0;
-    uint16_t length_le = 0;
-    std::memcpy(&type_le, bytes.data() + offset, sizeof(type_le));
-    std::memcpy(&length_le, bytes.data() + offset + sizeof(type_le), sizeof(length_le));
-    uint16_t type = FromLittleEndian16(type_le);
-    size_t length = static_cast<size_t>(FromLittleEndian16(length_le));
-    if (length > kMaxTlvPayloadBytes) {                                         // TSK095_Memory_Safety_and_Buffer_Bounds
-      parse_ok = false;
-      break;
-    }
-    offset += 4;
-    if (offset > bytes.size()) {         // TSK030
-      parse_ok = false;                  // TSK030, TSK070
-      break;                             // TSK070
-    }
-    size_t available = bytes.size() - offset; // TSK070
-    if (length > available) {                 // TSK030
-      parse_ok = false;                       // TSK030, TSK070
-    }
-    if (!parse_ok) {                                                          // TSK095_Memory_Safety_and_Buffer_Bounds
-      break;
-    }
-    size_t safe_length = std::min(length, available); // TSK070
-    auto payload = bytes.subspan(offset, safe_length);
-    auto ensure_payload_slice = [&](size_t cursor, size_t need) {             // TSK095_Memory_Safety_and_Buffer_Bounds
-      if (cursor > payload.size()) {
-        return false;
-      }
-      return need <= (payload.size() - cursor);
-    };
-    switch (type) {
+  const size_t offset = sizeof(VolumeHeader);
+  bool parse_ok = offset <= bytes.size();
+  if (!parse_ok) {
+    parsed.valid = false;
+    return parsed;
+  }
+
+  qv::tlv::Parser parser(bytes.subspan(offset), 64, kMaxTlvPayloadBytes);
+  if (!parser.valid()) {
+    parsed.valid = false;
+    return parsed;
+  }
+
+  for (const auto& record : parser) {
+    switch (record.type) {
       case kTlvTypePbkdf2: {
-        const size_t expected = 4 + kPbkdfSaltSize; // TSK070
-        bool length_ok = safe_length == expected;   // TSK070
-        parse_ok = parse_ok && length_ok;           // TSK070
-        if (length_ok) {
-          if (!ensure_payload_slice(0, expected)) {                          // TSK095_Memory_Safety_and_Buffer_Bounds
-            parse_ok = false;
-            break;
-          }
-          uint32_t iter_le = 0;
-          std::memcpy(&iter_le, payload.data(), sizeof(iter_le));
-          parsed.pbkdf_iterations = FromLittleEndian32(iter_le);
-          if (!ensure_payload_slice(sizeof(iter_le), kPbkdfSaltSize)) {      // TSK095_Memory_Safety_and_Buffer_Bounds
-            parse_ok = false;
-            break;
-          }
-          std::memcpy(parsed.pbkdf_salt.data(), payload.data() + sizeof(iter_le), kPbkdfSaltSize);
-          if (parsed.pbkdf_iterations == 0 || parsed.pbkdf_iterations >= (1u << 24)) {
-            parsed.pbkdf_iterations = kFallbackIterations;
-          } else {
-            parsed.have_pbkdf = true;
-          }
-          parsed.algorithm = PasswordKdf::kPbkdf2; // TSK036_PBKDF2_Argon2_Migration_Path
+        const size_t expected = sizeof(uint32_t) + kPbkdfSaltSize;
+        if (record.value.size() != expected) {
+          parse_ok = false;
+          break;
         }
+        uint32_t iter_le = 0;
+        std::memcpy(&iter_le, record.value.data(), sizeof(iter_le));
+        parsed.pbkdf_iterations = qv::FromLittleEndian32(iter_le);
+        std::copy_n(record.value.data() + sizeof(uint32_t), kPbkdfSaltSize,
+                    parsed.pbkdf_salt.begin());
+        if (parsed.pbkdf_iterations == 0 || parsed.pbkdf_iterations >= (1u << 24)) {
+          parsed.pbkdf_iterations = kFallbackIterations;
+        } else {
+          parsed.have_pbkdf = true;
+        }
+        parsed.algorithm = PasswordKdf::kPbkdf2;
         break;
       }
-      case kTlvTypeArgon2: { // TSK036_PBKDF2_Argon2_Migration_Path
-        const size_t expected = sizeof(uint32_t) * 6 + kPbkdfSaltSize; // TSK070
-        bool length_ok = safe_length == expected;                      // TSK070
-        parse_ok = parse_ok && length_ok;                              // TSK070
-        if (length_ok) {
-          if (!ensure_payload_slice(0, expected)) {                    // TSK095_Memory_Safety_and_Buffer_Bounds
-            parse_ok = false;
-            break;
-          }
-          std::memcpy(&parsed.argon2.version, payload.data(), sizeof(parsed.argon2.version));
-          std::memcpy(&parsed.argon2.time_cost, payload.data() + sizeof(uint32_t), sizeof(parsed.argon2.time_cost));
-          std::memcpy(&parsed.argon2.memory_cost_kib, payload.data() + sizeof(uint32_t) * 2,
-                      sizeof(parsed.argon2.memory_cost_kib));
-          std::memcpy(&parsed.argon2.parallelism, payload.data() + sizeof(uint32_t) * 3,
-                      sizeof(parsed.argon2.parallelism));
-          std::memcpy(&parsed.argon2.hash_length, payload.data() + sizeof(uint32_t) * 4,
-                      sizeof(parsed.argon2.hash_length));
-          std::memcpy(&parsed.argon2.target_ms, payload.data() + sizeof(uint32_t) * 5,
-                      sizeof(parsed.argon2.target_ms));
-          parsed.argon2.version = FromLittleEndian32(parsed.argon2.version);
-          parsed.argon2.time_cost = FromLittleEndian32(parsed.argon2.time_cost);
-          parsed.argon2.memory_cost_kib = FromLittleEndian32(parsed.argon2.memory_cost_kib);
-          parsed.argon2.parallelism = FromLittleEndian32(parsed.argon2.parallelism);
-          parsed.argon2.hash_length = FromLittleEndian32(parsed.argon2.hash_length);
-          parsed.argon2.target_ms = FromLittleEndian32(parsed.argon2.target_ms);
-          std::memcpy(parsed.argon2.salt.data(), payload.data() + sizeof(uint32_t) * 6,
-                      parsed.argon2.salt.size());
-          std::copy(parsed.argon2.salt.begin(), parsed.argon2.salt.end(), parsed.pbkdf_salt.begin());
-          parsed.have_argon2 = true;
-          parsed.algorithm = PasswordKdf::kArgon2id;
+      case kTlvTypeArgon2: {
+        constexpr size_t expected = sizeof(uint32_t) * 6 + kPbkdfSaltSize;
+        if (record.value.size() != expected) {
+          parse_ok = false;
+          break;
         }
+        std::memcpy(&parsed.argon2.version, record.value.data(), sizeof(uint32_t));
+        std::memcpy(&parsed.argon2.time_cost, record.value.data() + sizeof(uint32_t), sizeof(uint32_t));
+        std::memcpy(&parsed.argon2.memory_cost_kib,
+                    record.value.data() + sizeof(uint32_t) * 2, sizeof(uint32_t));
+        std::memcpy(&parsed.argon2.parallelism,
+                    record.value.data() + sizeof(uint32_t) * 3, sizeof(uint32_t));
+        std::memcpy(&parsed.argon2.hash_length,
+                    record.value.data() + sizeof(uint32_t) * 4, sizeof(uint32_t));
+        std::memcpy(&parsed.argon2.target_ms,
+                    record.value.data() + sizeof(uint32_t) * 5, sizeof(uint32_t));
+        std::memcpy(parsed.argon2.salt.data(),
+                    record.value.data() + sizeof(uint32_t) * 6, parsed.argon2.salt.size());
+        parsed.argon2.version = qv::FromLittleEndian32(parsed.argon2.version);
+        parsed.argon2.time_cost = qv::FromLittleEndian32(parsed.argon2.time_cost);
+        parsed.argon2.memory_cost_kib = qv::FromLittleEndian32(parsed.argon2.memory_cost_kib);
+        parsed.argon2.parallelism = qv::FromLittleEndian32(parsed.argon2.parallelism);
+        parsed.argon2.hash_length = qv::FromLittleEndian32(parsed.argon2.hash_length);
+        parsed.argon2.target_ms = qv::FromLittleEndian32(parsed.argon2.target_ms);
+        std::copy(parsed.argon2.salt.begin(), parsed.argon2.salt.end(), parsed.pbkdf_salt.begin());
+        parsed.have_argon2 = true;
+        parsed.algorithm = PasswordKdf::kArgon2id;
         break;
       }
       case kTlvTypeHybridSalt: {
-        bool length_ok = safe_length == kHybridSaltSize; // TSK070
-        parse_ok = parse_ok && length_ok;                // TSK070
-        if (length_ok) {
-          if (!ensure_payload_slice(0, kHybridSaltSize)) {              // TSK095_Memory_Safety_and_Buffer_Bounds
-            parse_ok = false;
-            break;
-          }
-          std::memcpy(parsed.hybrid_salt.data(), payload.data(), kHybridSaltSize);
-          parsed.have_hybrid = true;
+        if (record.value.size() != kHybridSaltSize) {
+          parse_ok = false;
+          break;
         }
+        std::copy_n(record.value.data(), kHybridSaltSize, parsed.hybrid_salt.begin());
+        parsed.have_hybrid = true;
         break;
       }
       case kTlvTypeEpoch: {
-        bool length_ok = safe_length == sizeof(uint32_t); // TSK070
-        parse_ok = parse_ok && length_ok;                 // TSK070
-        if (length_ok) {
-          if (!ensure_payload_slice(0, sizeof(uint32_t))) {            // TSK095_Memory_Safety_and_Buffer_Bounds
-            parse_ok = false;
-            break;
-          }
-          uint32_t epoch_le = 0;
-          std::memcpy(&epoch_le, payload.data(), sizeof(epoch_le));
-          parsed.epoch = FromLittleEndian32(epoch_le);
-          parsed.have_epoch = true;
-          bool epoch_ok = (offset >= 4) &&
-                          ((offset - 4) <= bytes.size() - sizeof(qv::core::EpochTLV)); // TSK070
-          parse_ok = parse_ok && epoch_ok;                                              // TSK070
-          if (epoch_ok) {
-            const auto* epoch_tlv = reinterpret_cast<const qv::core::EpochTLV*>(
-                bytes.data() + offset - 4);
-            if (FromLittleEndian16(epoch_tlv->type) != kTlvTypeEpoch) {             // TSK099_Input_Validation_and_Sanitization
-              parse_ok = false;                                                    // TSK099_Input_Validation_and_Sanitization
-              break;
-            }
-            const uint16_t tlv_length = FromLittleEndian16(epoch_tlv->length);     // TSK099_Input_Validation_and_Sanitization
-            if (tlv_length != sizeof(epoch_tlv->epoch)) {                          // TSK099_Input_Validation_and_Sanitization
-              parse_ok = false;                                                    // TSK099_Input_Validation_and_Sanitization
-              break;
-            }
-            std::memcpy(parsed.epoch_tlv_bytes.data(), epoch_tlv, sizeof(qv::core::EpochTLV));
-          }
+        if (record.value.size() != sizeof(uint32_t)) {
+          parse_ok = false;
+          break;
         }
+        uint32_t epoch_le = 0;
+        std::memcpy(&epoch_le, record.value.data(), sizeof(epoch_le));
+        parsed.epoch = qv::FromLittleEndian32(epoch_le);
+        parsed.have_epoch = true;
+        qv::core::EpochTLV epoch_tlv{};
+        epoch_tlv.type = qv::ToLittleEndian16(kTlvTypeEpoch);
+        epoch_tlv.length = qv::ToLittleEndian16(static_cast<uint16_t>(record.value.size()));
+        std::memcpy(&epoch_tlv.epoch, record.value.data(), sizeof(epoch_tlv.epoch));
+        std::memcpy(parsed.epoch_tlv_bytes.data(), &epoch_tlv, sizeof(epoch_tlv));
         break;
       }
       case kTlvTypePqc: {
-        const size_t expected = sizeof(qv::core::PQC_KEM_TLV) - 4; // TSK070
-        bool length_ok = safe_length == expected;                 // TSK070
-        parse_ok = parse_ok && length_ok;                         // TSK070
-        if (length_ok) {
-          bool header_ok = (offset >= 4) &&
-                            ((offset - 4) <= bytes.size() - sizeof(qv::core::PQC_KEM_TLV)); // TSK099_Input_Validation_and_Sanitization
-          parse_ok = parse_ok && header_ok;                                           // TSK099_Input_Validation_and_Sanitization
-          if (!parse_ok) {
-            break;
-          }
-          const auto* pqc_tlv = reinterpret_cast<const qv::core::PQC_KEM_TLV*>(bytes.data() + offset - 4);
-          if (FromLittleEndian16(pqc_tlv->type) != kTlvTypePqc) {                        // TSK099_Input_Validation_and_Sanitization
-            parse_ok = false;                                                           // TSK099_Input_Validation_and_Sanitization
-            break;
-          }
-          const uint16_t stored_length = FromLittleEndian16(pqc_tlv->length);           // TSK099_Input_Validation_and_Sanitization
-          if (stored_length != expected) {                                              // TSK099_Input_Validation_and_Sanitization
-            parse_ok = false;                                                           // TSK099_Input_Validation_and_Sanitization
-            break;
-          }
-          parsed.pqc = *pqc_tlv;
-          parsed.pqc.type = FromLittleEndian16(parsed.pqc.type);
-          parsed.pqc.length = stored_length;
-          parsed.pqc.version = FromLittleEndian16(parsed.pqc.version);
-          parsed.pqc.kem_id = FromLittleEndian16(parsed.pqc.kem_id);
-          parsed.have_pqc = true;
+        const size_t expected = sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2;
+        if (record.value.size() != expected) {
+          parse_ok = false;
+          break;
+        }
+        parsed.pqc.type = qv::ToLittleEndian16(kTlvTypePqc);
+        parsed.pqc.length = qv::ToLittleEndian16(CheckedCast<uint16_t>(expected));
+        std::memcpy(reinterpret_cast<uint8_t*>(&parsed.pqc) + sizeof(uint16_t) * 2,
+                    record.value.data(), expected);
+        parsed.pqc.type = qv::FromLittleEndian16(parsed.pqc.type);
+        parsed.pqc.version = qv::FromLittleEndian16(parsed.pqc.version);
+        parsed.pqc.kem_id = qv::FromLittleEndian16(parsed.pqc.kem_id);
+        parsed.have_pqc = true;
+        break;
+      }
+      case kTlvTypeReservedV2: {
+        if (record.value.size() > parsed.reserved_v2.payload.size()) {
+          parse_ok = false;
+          break;
+        }
+        parsed.reserved_v2.type = qv::ToLittleEndian16(kTlvTypeReservedV2);
+        parsed.reserved_v2.length = static_cast<uint16_t>(record.value.size());
+        std::fill(parsed.reserved_v2.payload.begin(), parsed.reserved_v2.payload.end(), 0);
+        if (!record.value.empty()) {
+          std::copy(record.value.begin(), record.value.end(), parsed.reserved_v2.payload.begin());
+          parsed.have_reserved = true;
         }
         break;
       }
       default:
-        // TSK033: Skip unknown TLVs to maintain forward compatibility
         break;
     }
-    if (!parse_ok) {                                                          // TSK095_Memory_Safety_and_Buffer_Bounds
+    if (!parse_ok) {
       break;
-    }
-    size_t next_offset = offset + length; // TSK070
-    if (next_offset < offset) {           // overflow guard TSK070
-      parse_ok = false;                   // TSK070
-      offset = bytes.size();              // TSK070
-    } else if (next_offset > bytes.size()) {
-      parse_ok = false;                   // TSK070
-      offset = bytes.size();              // TSK070
-    } else {
-      offset = next_offset;               // TSK070
     }
   }
 
   parsed.valid = parse_ok && magic_ok && version_ok &&
                  (parsed.have_pbkdf || parsed.have_argon2) && parsed.have_hybrid &&
-                 parsed.have_pqc; // TSK070
+                 parsed.have_pqc;
   return parsed;
 }
 
@@ -837,7 +735,7 @@ std::optional<VolumeUuid> ReadVolumeUuid(const std::filesystem::path& container)
     return std::nullopt;
   }
   bool magic_ok = qv::crypto::ct::CompareEqual(header.magic, kHeaderMagic);
-  auto version = FromLittleEndian32(header.version);
+  auto version = qv::FromLittleEndian32(header.version);
   bool version_ok = version == kHeaderVersion;                     // TSK102_Timing_Side_Channels
   uint32_t error_mask = 0;                                         // TSK102_Timing_Side_Channels
   error_mask |= magic_ok ? 0u : 1u;                                // TSK102_Timing_Side_Channels
@@ -866,42 +764,28 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
   if (parsed.algorithm == PasswordKdf::kArgon2id) { // TSK036_PBKDF2_Argon2_Migration_Path
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
     if (parsed.argon2.hash_length != output.size()) {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unsupported Argon2 hash length"};
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kUnsupportedArgon2HashLength)};
     }
     int rc = argon2id_hash_raw(parsed.argon2.time_cost, parsed.argon2.memory_cost_kib,
                                parsed.argon2.parallelism, password_span.data(), password_span.size(),
                                parsed.argon2.salt.data(), parsed.argon2.salt.size(), output.data(),
                                output.size());
     if (rc != ARGON2_OK) {
-      throw qv::Error{qv::ErrorDomain::Crypto, rc, "Argon2id derivation failed"};
+      throw qv::Error{qv::ErrorDomain::Crypto, rc,
+                      std::string(qv::errors::msg::kArgon2DerivationFailed)};
     }
     used_argon2 = true; // TSK102_Timing_Side_Channels
 #else
     throw qv::Error{qv::ErrorDomain::Dependency, 0,
-                    "Argon2id support not available in this build"};
+                    std::string(qv::errors::msg::kArgon2Unavailable)};
 #endif
   } else {
-    std::array<uint8_t, 20> block{};
-    std::memcpy(block.data(), parsed.pbkdf_salt.data(), parsed.pbkdf_salt.size());
-    block[16] = 0;
-    block[17] = 0;
-    block[18] = 0;
-    block[19] = 1;
-
-    auto u = qv::crypto::HMAC_SHA256::Compute(password_span,
-                                              std::span<const uint8_t>(block.data(), block.size()));
-    output = u;
-    auto iter = u;
-    for (uint32_t i = 1; i < parsed.pbkdf_iterations; ++i) {
-      iter = qv::crypto::HMAC_SHA256::Compute(password_span,
-                                              std::span<const uint8_t>(iter.data(), iter.size()));
-      for (size_t j = 0; j < output.size(); ++j) {
-        output[j] ^= iter[j];
-      }
-    }
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(iter.data(), iter.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(u.data(), u.size()));
-    qv::security::Zeroizer::Wipe(std::span<uint8_t>(block.data(), block.size()));
+    auto derived = qv::crypto::PBKDF2_HMAC_SHA256(
+        password_span,
+        std::span<const uint8_t>(parsed.pbkdf_salt.data(), parsed.pbkdf_salt.size()),
+        parsed.pbkdf_iterations);
+    output = derived;
   }
   auto elapsed = std::chrono::steady_clock::now() - kdf_start; // TSK102_Timing_Side_Channels
   if (!used_argon2) {                                          // TSK102_Timing_Side_Channels
@@ -1099,8 +983,8 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
     event.category = EventCategory::kSecurity;                    // TSK026
     event.severity = EventSeverity::kWarning;                     // TSK026
     event.event_id = state.locked ? "volume_mount_locked" : "volume_mount_failure"; // TSK026
-    event.message = state.locked ? "Volume locked after repeated authentication failures"
-                                 : "Volume mount authentication failed"; // TSK026
+    event.message = state.locked ? std::string(qv::errors::msg::kMountLockedMessage)
+                                 : std::string(qv::errors::msg::kMountAuthFailed); // TSK026
     event.fields.emplace_back("container_path",                                    // TSK026
                               qv::PathToUtf8String(sanitized_container),
                               FieldPrivacy::kHash);                                 // TSK103_Logging_and_Information_Disclosure hashed path
@@ -1210,7 +1094,7 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
     kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
     kdf_timeout.event_id = "mount_key_timeout"; // TSK080_Error_Info_Redaction_in_Release
-    kdf_timeout.message = "Key agreement exceeded timeout"; // TSK080_Error_Info_Redaction_in_Release
+    kdf_timeout.message = std::string(qv::errors::msg::kKeyAgreementTimeout); // TSK080_Error_Info_Redaction_in_Release
     kdf_timeout.fields.emplace_back("container_path", qv::PathToUtf8String(container),
                                     qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention, TSK103_Logging_and_Information_Disclosure
     qv::orchestrator::EventBus::Instance().Publish(kdf_timeout); // TSK038_Resource_Limits_and_DoS_Prevention
@@ -1247,7 +1131,7 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     timeout_event.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
     timeout_event.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
     timeout_event.event_id = "mount_timeout_exceeded"; // TSK038_Resource_Limits_and_DoS_Prevention
-    timeout_event.message = "Mount attempt exceeded time limit"; // TSK038_Resource_Limits_and_DoS_Prevention
+    timeout_event.message = std::string(qv::errors::msg::kMountAttemptTimeout); // TSK038_Resource_Limits_and_DoS_Prevention
     timeout_event.fields.emplace_back("container_path", qv::PathToUtf8String(container),
                                       qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention, TSK103_Logging_and_Information_Disclosure
     timeout_event.fields.emplace_back("duration_ns", std::to_string(elapsed.count()),
