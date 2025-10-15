@@ -10,13 +10,15 @@
 #include <iomanip>    // TSK029
 #include <iterator>   // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <limits>     // TSK024_Key_Rotation_and_Lifecycle_Management
+#include <optional>     // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV control
 #include <random>
 #include <span>
 #include <sstream>      // TSK033 version formatting
 #include <string_view>
 #include <system_error> // TSK074_Migration_Rollback_and_Backup non-throwing filesystem ops
+#include <type_traits>  // TSK099_Input_Validation_and_Sanitization checked casts
 #include <vector>
-#include <optional>     // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV control
+#include <cstdlib>      // TSK099_Input_Validation_and_Sanitization container root policy
 
 #include "qv/common.h"
 #include "qv/core/nonce.h"
@@ -57,6 +59,101 @@
 using namespace qv::orchestrator;
 
 namespace {
+
+template <typename To, typename From>
+To CheckedCast(From value) { // TSK099_Input_Validation_and_Sanitization
+  static_assert(std::is_integral_v<From>, "CheckedCast requires integral source type");
+  static_assert(std::is_integral_v<To>, "CheckedCast requires integral destination type");
+
+  using ToLimits = std::numeric_limits<To>;
+  if constexpr (std::is_unsigned_v<To>) {
+    if constexpr (std::is_signed_v<From>) {
+      if (value < 0) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Negative value for checked_cast"};
+      }
+      const auto promoted = static_cast<unsigned long long>(static_cast<std::make_unsigned_t<From>>(value));
+      if (promoted > static_cast<unsigned long long>(ToLimits::max())) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    } else {
+      if (static_cast<unsigned long long>(value) > static_cast<unsigned long long>(ToLimits::max())) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    }
+  } else {
+    if constexpr (std::is_signed_v<From>) {
+      const auto promoted = static_cast<long long>(value);
+      const auto min_value = static_cast<long long>(ToLimits::min());
+      const auto max_value = static_cast<long long>(ToLimits::max());
+      if (promoted < min_value || promoted > max_value) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    } else {
+      if (static_cast<unsigned long long>(value) > static_cast<unsigned long long>(ToLimits::max())) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    }
+  }
+
+  return static_cast<To>(value);
+}
+
+void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_and_Sanitization
+  constexpr size_t kMinPasswordLen = 8;
+  constexpr size_t kMaxPasswordLen = 1024;
+  const auto size = password.size();
+  if (size < kMinPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too short"};
+  }
+  if (size > kMaxPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too long"};
+  }
+}
+
+std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sanitization
+  const char* env_root = std::getenv("QV_CONTAINER_ROOT");
+  std::filesystem::path base;
+  if (env_root && *env_root) {
+    base = std::filesystem::path(env_root);
+  } else {
+    std::error_code cwd_ec;
+    base = std::filesystem::current_path(cwd_ec);
+    if (cwd_ec) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to resolve working directory"};
+    }
+  }
+  std::error_code ec;
+  auto canonical = std::filesystem::weakly_canonical(base, ec);
+  if (ec) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to canonicalize container root"};
+  }
+  return canonical;
+}
+
+const std::filesystem::path& AllowedContainerRoot() { // TSK099_Input_Validation_and_Sanitization
+  static const std::filesystem::path root = ComputeContainerRoot();
+  return root;
+}
+
+std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) { // TSK099_Input_Validation_and_Sanitization
+  std::error_code ec;
+  auto canonical = std::filesystem::weakly_canonical(path, ec);
+  if (ec) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Failed to canonicalize container path"};
+  }
+  const auto& base = AllowedContainerRoot();
+  auto relative = std::filesystem::relative(canonical, base, ec);
+  if (ec || relative.is_absolute()) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Container path escapes allowed root"};
+  }
+  for (const auto& component : relative) {
+    if (component == "..") {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path escape attempt detected"};
+    }
+  }
+  return canonical;
+}
+
 
   class ScopedPathRemoval { // TSK074_Migration_Rollback_and_Backup cleanup staged files on failure
    public:
@@ -375,7 +472,7 @@ namespace {
 
     if (algorithm == PasswordKdf::kPbkdf2) { // TSK036_PBKDF2_Argon2_Migration_Path
       AppendUint16(serialized, kTlvTypePbkdf2);
-      AppendUint16(serialized, static_cast<uint16_t>(4 + password_salt.size()));
+      AppendUint16(serialized, CheckedCast<uint16_t>(4 + password_salt.size()));
       AppendUint32(serialized, pbkdf_iterations);
       serialized.insert(serialized.end(), password_salt.begin(), password_salt.end());
     } else if (algorithm == PasswordKdf::kArgon2id) { // TSK036_PBKDF2_Argon2_Migration_Path
@@ -395,9 +492,7 @@ namespace {
     }
 
     AppendUint16(serialized, kTlvTypeHybridSalt); // TSK024_Key_Rotation_and_Lifecycle_Management
-    AppendUint16(
-        serialized,
-        static_cast<uint16_t>(hybrid_salt.size())); // TSK024_Key_Rotation_and_Lifecycle_Management
+    AppendUint16(serialized, CheckedCast<uint16_t>(hybrid_salt.size())); // TSK024_Key_Rotation_and_Lifecycle_Management
     serialized.insert(serialized.end(), hybrid_salt.begin(),
                       hybrid_salt.end()); // TSK024_Key_Rotation_and_Lifecycle_Management
 
@@ -407,7 +502,7 @@ namespace {
     pqc_blob.type =
         ToLittleEndian16(kTlvTypePqcKem); // TSK024_Key_Rotation_and_Lifecycle_Management
     pqc_blob.length = ToLittleEndian16(
-        static_cast<uint16_t>(sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2));
+        CheckedCast<uint16_t>(sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2));
     pqc_blob.version =
         ToLittleEndian16(pqc_blob.version); // TSK024_Key_Rotation_and_Lifecycle_Management
     pqc_blob.kem_id =
@@ -418,7 +513,7 @@ namespace {
       auto reserved_copy = reserved;                   // TSK024_Key_Rotation_and_Lifecycle_Management
       uint16_t reserved_length = reserved_copy.length; // TSK033 clamp payload
       if (reserved_length > reserved_copy.payload.size()) { // TSK033 clamp payload
-        reserved_length = static_cast<uint16_t>(reserved_copy.payload.size());
+        reserved_length = CheckedCast<uint16_t>(reserved_copy.payload.size());
       }
       reserved_copy.type =
           ToLittleEndian16(kTlvTypeReservedV2); // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -456,7 +551,7 @@ namespace {
       computed = kMinPbkdfIterations;
     }
     computed = std::clamp<uint64_t>(computed, kMinPbkdfIterations, kMaxPbkdfIterations);
-    return static_cast<uint32_t>(computed);
+    return CheckedCast<uint32_t>(computed);
   }
 
   ParsedHeader
@@ -562,8 +657,17 @@ namespace {
         if (length != sizeof(parsed.epoch_tlv.epoch)) {
           throw qv::Error{qv::ErrorDomain::Validation, 0, "Epoch TLV malformed"};
         }
+        if (value_offset < sizeof(uint16_t) * 2 ||
+            value_offset - sizeof(uint16_t) * 2 > parsed.payload.size() - sizeof(qv::core::EpochTLV)) { // TSK099_Input_Validation_and_Sanitization
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "Epoch TLV truncated"};                         // TSK099_Input_Validation_and_Sanitization
+        }
+        const auto* epoch_tlv = reinterpret_cast<const qv::core::EpochTLV*>(
+            parsed.payload.data() + value_offset - sizeof(uint16_t) * 2);                                  // TSK099_Input_Validation_and_Sanitization
+        if (ToLittleEndian16(epoch_tlv->length) != sizeof(epoch_tlv->epoch)) {                             // TSK099_Input_Validation_and_Sanitization
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "Epoch TLV length mismatch"};                   // TSK099_Input_Validation_and_Sanitization
+        }
         parsed.epoch_tlv.type = ToLittleEndian16(kTlvTypeEpoch);
-        parsed.epoch_tlv.length = qv::ToLittleEndian(static_cast<uint16_t>(length));
+        parsed.epoch_tlv.length = qv::ToLittleEndian(CheckedCast<uint16_t>(length));
         std::memcpy(&parsed.epoch_tlv.epoch, value, sizeof(parsed.epoch_tlv.epoch));
         parsed.epoch_value = qv::ToLittleEndian(parsed.epoch_tlv.epoch);
         have_epoch = true;
@@ -573,9 +677,18 @@ namespace {
         if (length != sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2) {
           throw qv::Error{qv::ErrorDomain::Validation, 0, "PQC TLV malformed"};
         }
+        if (value_offset < sizeof(uint16_t) * 2 ||
+            value_offset - sizeof(uint16_t) * 2 > parsed.payload.size() - sizeof(qv::core::PQC_KEM_TLV)) { // TSK099_Input_Validation_and_Sanitization
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "PQC TLV truncated"};                            // TSK099_Input_Validation_and_Sanitization
+        }
+        const auto* pqc_tlv = reinterpret_cast<const qv::core::PQC_KEM_TLV*>(
+            parsed.payload.data() + value_offset - sizeof(uint16_t) * 2);                                   // TSK099_Input_Validation_and_Sanitization
+        if (ToLittleEndian16(pqc_tlv->length) != length) {                                                 // TSK099_Input_Validation_and_Sanitization
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "PQC TLV length mismatch"};                     // TSK099_Input_Validation_and_Sanitization
+        }
         parsed.kem_blob.type = ToLittleEndian16(kTlvTypePqcKem);
         parsed.kem_blob.length =
-            ToLittleEndian16(static_cast<uint16_t>(length)); // TSK024_Key_Rotation_and_Lifecycle_Management
+            ToLittleEndian16(CheckedCast<uint16_t>(length)); // TSK024_Key_Rotation_and_Lifecycle_Management
         std::memcpy(reinterpret_cast<uint8_t*>(&parsed.kem_blob) + sizeof(uint16_t) * 2, value,
                     length);
         parsed.kem_blob.version =
@@ -591,7 +704,7 @@ namespace {
         }
         parsed.reserved_v2_present = length > 0;
         parsed.reserved_v2.type = ToLittleEndian16(kTlvTypeReservedV2);
-        parsed.reserved_v2.length = static_cast<uint16_t>(length);
+        parsed.reserved_v2.length = CheckedCast<uint16_t>(length);
         std::fill(parsed.reserved_v2.payload.begin(), parsed.reserved_v2.payload.end(), 0);
         if (length > 0) {
           std::memcpy(parsed.reserved_v2.payload.data(), value, length);
@@ -819,14 +932,16 @@ std::vector<uint8_t> VolumeManager::DecryptChunk(
 QV_SENSITIVE_BEGIN
 QV_SENSITIVE_FUNCTION std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Create(const std::filesystem::path& container, const std::string& password) {
-  if (std::filesystem::exists(container)) {
+  ValidatePassword(password);                                                 // TSK099_Input_Validation_and_Sanitization
+  auto sanitized_container = SanitizeContainerPath(container);               // TSK099_Input_Validation_and_Sanitization
+  if (std::filesystem::exists(sanitized_container)) {
     throw qv::Error{qv::ErrorDomain::Validation,
                     qv::errors::validation::kVolumeExists, // TSK020
-                    "Container already exists: " + container.string()};
+                    "Container already exists: " + sanitized_container.string()};
   }
 
-  if (container.has_parent_path()) {
-    std::filesystem::create_directories(container.parent_path());
+  if (sanitized_container.has_parent_path()) {
+    std::filesystem::create_directories(sanitized_container.parent_path());
   }
 
   VolumeHeader header{}; // TSK013
@@ -850,7 +965,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
     std::span<const uint8_t> password_span(password_bytes.AsSpan());
     if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
       Argon2Config cfg{};
-      cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
+      cfg.target_ms = CheckedCast<uint32_t>(kdf_policy_.target_duration.count());
       std::copy(password_salt.begin(), password_salt.end(), cfg.salt.begin());
       classical_key = DerivePasswordKeyArgon2id(password_span, cfg);
       argon2_config = cfg;
@@ -863,8 +978,13 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
 
   qv::core::EpochTLV epoch{};
   epoch.type = ToLittleEndian16(kTlvTypeEpoch);
-  epoch.length = ToLittleEndian16(static_cast<uint16_t>(sizeof(epoch.epoch)));
-  epoch.epoch = qv::ToLittleEndian(static_cast<uint32_t>(1));
+  epoch.length = ToLittleEndian16(CheckedCast<uint16_t>(sizeof(epoch.epoch)));
+  const uint32_t initial_epoch = 1;                                             // TSK099_Input_Validation_and_Sanitization
+  if (initial_epoch >= qv::core::EpochOverflowWarningThreshold()) {             // TSK099_Input_Validation_and_Sanitization
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Initial epoch too large"};                                // TSK099_Input_Validation_and_Sanitization
+  }
+  epoch.epoch = qv::ToLittleEndian(initial_epoch);
   const auto epoch_bytes = qv::AsBytesConst(epoch);
 
   auto creation = qv::core::PQCHybridKDF::Create(
@@ -898,7 +1018,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
 
   try {
-    AtomicReplace(container, std::span<const uint8_t>(payload.data(), payload.size()));
+    AtomicReplace(sanitized_container, std::span<const uint8_t>(payload.data(), payload.size()));
   } catch (const qv::Error& err) {
     throw qv::Error{err.domain(), err.code(),
                     "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
@@ -909,7 +1029,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   created.severity = EventSeverity::kInfo;
   created.event_id = "volume_created";
   created.message = "New encrypted volume created";
-  created.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+  created.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container), FieldPrivacy::kRedact);
   created.fields.emplace_back("uuid", FormatUuid(header.uuid), FieldPrivacy::kPublic);
   if (kdf_policy_.algorithm == PasswordKdf::kPbkdf2) {
     created.fields.emplace_back("pbkdf_iterations", std::to_string(pbkdf_iterations),
@@ -929,14 +1049,16 @@ QV_SENSITIVE_END
 
 std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Mount(const std::filesystem::path& container, const std::string& password) {
-  auto handle = ctm_.Mount(container, password); // TSK029
+  ValidatePassword(password);                                                 // TSK099_Input_Validation_and_Sanitization
+  auto sanitized_container = SanitizeContainerPath(container);               // TSK099_Input_Validation_and_Sanitization
+  auto handle = ctm_.Mount(sanitized_container, password); // TSK029
   if (handle) {
     qv::orchestrator::Event mounted{}; // TSK029
     mounted.category = EventCategory::kLifecycle;
     mounted.severity = EventSeverity::kInfo;
     mounted.event_id = "volume_mounted";
     mounted.message = "Encrypted volume mounted";
-    mounted.fields.emplace_back("container", qv::PathToUtf8String(container),
+    mounted.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container),
                                 FieldPrivacy::kRedact);
     qv::orchestrator::EventBus::Instance().Publish(mounted);
   }
@@ -945,12 +1067,13 @@ VolumeManager::Mount(const std::filesystem::path& container, const std::string& 
 
 void VolumeManager::ValidateHeaderForBackup(
     const std::filesystem::path& container) { // TSK082_Backup_Verification_and_Schema
-  std::ifstream in(container, std::ios::binary);
+  auto sanitized_container = SanitizeContainerPath(container);               // TSK099_Input_Validation_and_Sanitization
+  std::ifstream in(sanitized_container, std::ios::binary);
   if (!in) {
     const int err = errno;
     throw qv::Error{qv::ErrorDomain::IO, err,
                     "Failed to open backup container for validation: " +
-                        container.string()};
+                        sanitized_container.string()};
   }
 
   std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)),
@@ -968,9 +1091,12 @@ QV_SENSITIVE_FUNCTION std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Rekey(const std::filesystem::path& container, const std::string& current_password,
                      const std::string& new_password,
                      std::optional<std::filesystem::path> backup_public_key) {
-  if (!std::filesystem::exists(container)) { // TSK024_Key_Rotation_and_Lifecycle_Management
+  ValidatePassword(current_password);                                           // TSK099_Input_Validation_and_Sanitization
+  ValidatePassword(new_password);                                              // TSK099_Input_Validation_and_Sanitization
+  auto sanitized_container = SanitizeContainerPath(container);                 // TSK099_Input_Validation_and_Sanitization
+  if (!std::filesystem::exists(sanitized_container)) { // TSK024_Key_Rotation_and_Lifecycle_Management
     throw qv::Error{qv::ErrorDomain::IO, qv::errors::io::kContainerMissing,
-                    "Container not found: " + container.string()};
+                    "Container not found: " + sanitized_container.string()};
   }
 
   qv::orchestrator::Event initiated{}; // TSK029
@@ -978,15 +1104,15 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   initiated.severity = EventSeverity::kInfo;
   initiated.event_id = "rekey_initiated";
   initiated.message = "Volume rekey operation started";
-  initiated.fields.emplace_back("container", qv::PathToUtf8String(container),
+  initiated.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container),
                                 FieldPrivacy::kRedact);
   qv::orchestrator::EventBus::Instance().Publish(initiated);
 
-  std::ifstream in(container, std::ios::binary); // TSK024_Key_Rotation_and_Lifecycle_Management
+  std::ifstream in(sanitized_container, std::ios::binary); // TSK024_Key_Rotation_and_Lifecycle_Management
   if (!in) {                                     // TSK024_Key_Rotation_and_Lifecycle_Management
     const int err = errno;                       // TSK024_Key_Rotation_and_Lifecycle_Management
     throw qv::Error{qv::ErrorDomain::IO, err,
-                    "Failed to open container for rekey: " + container.string()};
+                    "Failed to open container for rekey: " + sanitized_container.string()};
   }
 
   std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -1043,7 +1169,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
     refused.severity = EventSeverity::kError;
     refused.event_id = "volume_epoch_rekey_refused";
     refused.message = "Epoch counter too close to overflow";
-    refused.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+    refused.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container), FieldPrivacy::kRedact);
     refused.fields.emplace_back("epoch", std::to_string(old_epoch), FieldPrivacy::kPublic, true);
     refused.fields.emplace_back("unsafe_threshold", std::to_string(unsafe_threshold), FieldPrivacy::kPublic, true);
     refused.fields.emplace_back(
@@ -1060,7 +1186,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
     warning.severity = EventSeverity::kWarning;
     warning.event_id = "volume_epoch_near_overflow";
     warning.message = "Epoch counter approaching overflow margin";
-    warning.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+    warning.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container), FieldPrivacy::kRedact);
     warning.fields.emplace_back("epoch", std::to_string(old_epoch), FieldPrivacy::kPublic, true);
     warning.fields.emplace_back("warning_threshold", std::to_string(warning_threshold), FieldPrivacy::kPublic, true);
     warning.fields.emplace_back(
@@ -1090,7 +1216,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
     std::span<const uint8_t> new_span(new_bytes.AsSpan());
     if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
       Argon2Config cfg{};
-      cfg.target_ms = static_cast<uint32_t>(kdf_policy_.target_duration.count());
+      cfg.target_ms = CheckedCast<uint32_t>(kdf_policy_.target_duration.count());
       std::copy(new_password_salt.begin(), new_password_salt.end(), cfg.salt.begin());
       new_classical_key = DerivePasswordKeyArgon2id(new_span, cfg);
       new_argon2 = cfg;
@@ -1142,7 +1268,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   }
 
   try {
-    AtomicReplace(container, std::span<const uint8_t>(payload.data(), payload.size()));
+    AtomicReplace(sanitized_container, std::span<const uint8_t>(payload.data(), payload.size()));
   } catch (const qv::Error& err) {
     throw qv::Error{err.domain(), err.code(),
                     "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
@@ -1150,7 +1276,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
 
   std::optional<std::filesystem::path> backup_path; // TSK024_Key_Rotation_and_Lifecycle_Management
   if (backup_public_key) {
-    backup_path = PerformKeyBackup(container, new_epoch, parsed.header.uuid, derived_keys,
+    backup_path = PerformKeyBackup(sanitized_container, new_epoch, parsed.header.uuid, derived_keys,
                                    *backup_public_key);
   }
 
@@ -1172,7 +1298,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   event.severity = EventSeverity::kInfo;
   event.event_id = "volume_rekeyed";
   event.message = "Volume encryption keys rotated";
-  event.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+  event.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container), FieldPrivacy::kRedact);
   event.fields.emplace_back("old_epoch", std::to_string(old_epoch), FieldPrivacy::kPublic, true);
   event.fields.emplace_back("new_epoch", std::to_string(new_epoch), FieldPrivacy::kPublic, true);
   if (kdf_policy_.algorithm == PasswordKdf::kPbkdf2) {
@@ -1202,20 +1328,22 @@ QV_SENSITIVE_END
 std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_version,
                        const std::string& password) { // TSK033
-  if (!std::filesystem::exists(container)) { // TSK033
+  ValidatePassword(password);                                                 // TSK099_Input_Validation_and_Sanitization
+  auto sanitized_container = SanitizeContainerPath(container);               // TSK099_Input_Validation_and_Sanitization
+  if (!std::filesystem::exists(sanitized_container)) { // TSK033
     throw qv::Error{qv::ErrorDomain::IO, qv::errors::io::kContainerMissing,
-                    "Container not found: " + container.string()};
+                    "Container not found: " + sanitized_container.string()};
   }
 
   if (target_version == 0) { // TSK033 treat zero as request for latest
     target_version = VolumeManager::kLatestHeaderVersion;
   }
 
-  std::ifstream in(container, std::ios::binary); // TSK033
+  std::ifstream in(sanitized_container, std::ios::binary); // TSK033
   if (!in) {
     const int err = errno;
     throw qv::Error{qv::ErrorDomain::IO, err,
-                    "Failed to open container for migration: " + container.string()};
+                    "Failed to open container for migration: " + sanitized_container.string()};
   }
   std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   auto parsed = ParseHeader(blob); // TSK033 reuse validated parser
@@ -1284,7 +1412,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
 
   ReservedV2Tlv reserved = parsed.reserved_v2_present ? parsed.reserved_v2 : ReservedV2Tlv{}; // TSK033
   if (!parsed.reserved_v2_present) { // TSK033 add ACL staging TLV for new version
-    reserved.length = static_cast<uint16_t>(reserved.payload.size());
+    reserved.length = CheckedCast<uint16_t>(reserved.payload.size());
   }
 
   parsed.header.version = qv::ToLittleEndian(target_version); // TSK033 bump version field
@@ -1304,7 +1432,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   auto payload_span =
       std::span<const uint8_t>(payload.data(), payload.size()); // TSK074_Migration_Rollback_and_Backup reuse views
 
-  auto migration_temp = container;
+  auto migration_temp = sanitized_container;
   migration_temp += ".migrate.tmp"; // TSK074_Migration_Rollback_and_Backup staged header checkpoint
   std::error_code temp_ec;
   std::filesystem::remove(migration_temp, temp_ec); // TSK074_Migration_Rollback_and_Backup clear stale stage
@@ -1376,7 +1504,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
     return std::string("0x") + version_hex(version);
   }; // TSK074_Migration_Rollback_and_Backup unify reporting
 
-  auto metadata_dir = MetadataDirFor(container); // TSK074_Migration_Rollback_and_Backup backup location
+  auto metadata_dir = MetadataDirFor(sanitized_container); // TSK074_Migration_Rollback_and_Backup backup location
   std::error_code metadata_ec;
   std::filesystem::create_directories(metadata_dir, metadata_ec);
   if (metadata_ec) {
@@ -1387,7 +1515,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
                     "Failed to prepare metadata directory: " + metadata_dir.string()};
   }
 
-  auto container_name = container.filename().string();
+  auto container_name = sanitized_container.filename().string();
   if (container_name.empty()) {
     container_name = "volume";
   }
@@ -1406,7 +1534,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   }
 
   try {
-    AtomicReplace(container, payload_span);
+    AtomicReplace(sanitized_container, payload_span);
   } catch (const qv::Error& err) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
@@ -1427,7 +1555,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   event.severity = EventSeverity::kInfo;
   event.event_id = "volume_migrated";
   event.message = "Volume header format upgraded";
-  event.fields.emplace_back("container", qv::PathToUtf8String(container), FieldPrivacy::kRedact);
+  event.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container), FieldPrivacy::kRedact);
   event.fields.emplace_back("from_version", format_version(current_version), FieldPrivacy::kPublic,
                             true);
   event.fields.emplace_back("to_version", format_version(target_version), FieldPrivacy::kPublic,

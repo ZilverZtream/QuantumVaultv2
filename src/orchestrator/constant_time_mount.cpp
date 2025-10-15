@@ -9,17 +9,20 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future> // TSK038_Resource_Limits_and_DoS_Prevention crypto timeout
 #include <iostream>
+#include <limits>   // TSK099_Input_Validation_and_Sanitization checked casts
 #include <mutex>
 #include <optional> // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV tracking
-#include <future> // TSK038_Resource_Limits_and_DoS_Prevention crypto timeout
-#include <thread>
-#include <vector>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <type_traits> // TSK099_Input_Validation_and_Sanitization checked casts
 #include <unordered_map>
+#include <vector>
+#include <cstdlib> // TSK099_Input_Validation_and_Sanitization container root policy
 
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
@@ -43,6 +46,101 @@
 using namespace qv::orchestrator;
 
 namespace {
+
+template <typename To, typename From>
+To CheckedCast(From value) { // TSK099_Input_Validation_and_Sanitization
+  static_assert(std::is_integral_v<From>, "CheckedCast requires integral source type");
+  static_assert(std::is_integral_v<To>, "CheckedCast requires integral destination type");
+
+  using ToLimits = std::numeric_limits<To>;
+  if constexpr (std::is_unsigned_v<To>) {
+    if constexpr (std::is_signed_v<From>) {
+      if (value < 0) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Negative value for checked_cast"};
+      }
+      const auto promoted = static_cast<unsigned long long>(static_cast<std::make_unsigned_t<From>>(value));
+      if (promoted > static_cast<unsigned long long>(ToLimits::max())) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    } else {
+      if (static_cast<unsigned long long>(value) > static_cast<unsigned long long>(ToLimits::max())) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    }
+  } else { // destination signed
+    if constexpr (std::is_signed_v<From>) {
+      const auto promoted = static_cast<long long>(value);
+      const auto min_value = static_cast<long long>(ToLimits::min());
+      const auto max_value = static_cast<long long>(ToLimits::max());
+      if (promoted < min_value || promoted > max_value) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    } else {
+      const auto promoted = static_cast<unsigned long long>(value);
+      if (promoted > static_cast<unsigned long long>(ToLimits::max())) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Integer overflow during checked_cast"};
+      }
+    }
+  }
+
+  return static_cast<To>(value);
+}
+
+void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_and_Sanitization
+  constexpr size_t kMinPasswordLen = 8;
+  constexpr size_t kMaxPasswordLen = 1024;
+  const auto size = password.size();
+  if (size < kMinPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too short"};
+  }
+  if (size > kMaxPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too long"};
+  }
+}
+
+std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sanitization
+  const char* env_root = std::getenv("QV_CONTAINER_ROOT");
+  std::filesystem::path base;
+  if (env_root && *env_root) {
+    base = std::filesystem::path(env_root);
+  } else {
+    std::error_code cwd_ec;
+    base = std::filesystem::current_path(cwd_ec);
+    if (cwd_ec) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to resolve working directory"};
+    }
+  }
+  std::error_code ec;
+  auto canonical = std::filesystem::weakly_canonical(base, ec);
+  if (ec) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to canonicalize container root"};
+  }
+  return canonical;
+}
+
+const std::filesystem::path& AllowedContainerRoot() { // TSK099_Input_Validation_and_Sanitization
+  static const std::filesystem::path root = ComputeContainerRoot();
+  return root;
+}
+
+std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) { // TSK099_Input_Validation_and_Sanitization
+  std::error_code ec;
+  auto canonical = std::filesystem::weakly_canonical(path, ec);
+  if (ec) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Failed to canonicalize container path"};
+  }
+  const auto& base = AllowedContainerRoot();
+  auto relative = std::filesystem::relative(canonical, base, ec);
+  if (ec || relative.is_absolute()) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Container path escapes allowed root"};
+  }
+  for (const auto& component : relative) {
+    if (component == "..") {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path escape attempt detected"};
+    }
+  }
+  return canonical;
+}
 
 std::filesystem::path LockFilePath(const std::filesystem::path& container) { // TSK026
   auto lock_path = container;
@@ -641,8 +739,18 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
                           ((offset - 4) <= bytes.size() - sizeof(qv::core::EpochTLV)); // TSK070
           parse_ok = parse_ok && epoch_ok;                                              // TSK070
           if (epoch_ok) {
-            std::memcpy(parsed.epoch_tlv_bytes.data(), bytes.data() + offset - 4,
-                        sizeof(qv::core::EpochTLV));
+            const auto* epoch_tlv = reinterpret_cast<const qv::core::EpochTLV*>(
+                bytes.data() + offset - 4);
+            if (FromLittleEndian16(epoch_tlv->type) != kTlvTypeEpoch) {             // TSK099_Input_Validation_and_Sanitization
+              parse_ok = false;                                                    // TSK099_Input_Validation_and_Sanitization
+              break;
+            }
+            const uint16_t tlv_length = FromLittleEndian16(epoch_tlv->length);     // TSK099_Input_Validation_and_Sanitization
+            if (tlv_length != sizeof(epoch_tlv->epoch)) {                          // TSK099_Input_Validation_and_Sanitization
+              parse_ok = false;                                                    // TSK099_Input_Validation_and_Sanitization
+              break;
+            }
+            std::memcpy(parsed.epoch_tlv_bytes.data(), epoch_tlv, sizeof(qv::core::EpochTLV));
           }
         }
         break;
@@ -652,53 +760,27 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
         bool length_ok = safe_length == expected;                 // TSK070
         parse_ok = parse_ok && length_ok;                         // TSK070
         if (length_ok) {
-          if (!ensure_payload_slice(0, expected)) {               // TSK095_Memory_Safety_and_Buffer_Bounds
-            parse_ok = false;
+          bool header_ok = (offset >= 4) &&
+                            ((offset - 4) <= bytes.size() - sizeof(qv::core::PQC_KEM_TLV)); // TSK099_Input_Validation_and_Sanitization
+          parse_ok = parse_ok && header_ok;                                           // TSK099_Input_Validation_and_Sanitization
+          if (!parse_ok) {
             break;
           }
-          parsed.pqc.type = type;
-          parsed.pqc.length = length;
-          uint16_t version_le = 0;
-          uint16_t kem_id_le = 0;
-          size_t cursor = 0;                                       // TSK095_Memory_Safety_and_Buffer_Bounds
-          if (!ensure_payload_slice(cursor, sizeof(version_le))) {
-            parse_ok = false;
+          const auto* pqc_tlv = reinterpret_cast<const qv::core::PQC_KEM_TLV*>(bytes.data() + offset - 4);
+          if (FromLittleEndian16(pqc_tlv->type) != kTlvTypePqc) {                        // TSK099_Input_Validation_and_Sanitization
+            parse_ok = false;                                                           // TSK099_Input_Validation_and_Sanitization
             break;
           }
-          std::memcpy(&version_le, payload.data() + cursor, sizeof(version_le));
-          cursor += sizeof(version_le);
-          if (!ensure_payload_slice(cursor, sizeof(kem_id_le))) {
-            parse_ok = false;
+          const uint16_t stored_length = FromLittleEndian16(pqc_tlv->length);           // TSK099_Input_Validation_and_Sanitization
+          if (stored_length != expected) {                                              // TSK099_Input_Validation_and_Sanitization
+            parse_ok = false;                                                           // TSK099_Input_Validation_and_Sanitization
             break;
           }
-          std::memcpy(&kem_id_le, payload.data() + cursor, sizeof(kem_id_le));
-          cursor += sizeof(kem_id_le);
-          parsed.pqc.version = FromLittleEndian16(version_le);
-          parsed.pqc.kem_id = FromLittleEndian16(kem_id_le);
-          if (!ensure_payload_slice(cursor, parsed.pqc.kem_ct.size())) {
-            parse_ok = false;
-            break;
-          }
-          std::memcpy(parsed.pqc.kem_ct.data(), payload.data() + cursor, parsed.pqc.kem_ct.size());
-          cursor += parsed.pqc.kem_ct.size();
-          if (!ensure_payload_slice(cursor, parsed.pqc.sk_nonce.size())) {
-            parse_ok = false;
-            break;
-          }
-          std::memcpy(parsed.pqc.sk_nonce.data(), payload.data() + cursor, parsed.pqc.sk_nonce.size());
-          cursor += parsed.pqc.sk_nonce.size();
-          if (!ensure_payload_slice(cursor, parsed.pqc.sk_tag.size())) {
-            parse_ok = false;
-            break;
-          }
-          std::memcpy(parsed.pqc.sk_tag.data(), payload.data() + cursor, parsed.pqc.sk_tag.size());
-          cursor += parsed.pqc.sk_tag.size();
-          if (!ensure_payload_slice(cursor, parsed.pqc.sk_encrypted.size())) {
-            parse_ok = false;
-            break;
-          }
-          std::memcpy(parsed.pqc.sk_encrypted.data(), payload.data() + cursor,
-                      parsed.pqc.sk_encrypted.size());
+          parsed.pqc = *pqc_tlv;
+          parsed.pqc.type = FromLittleEndian16(parsed.pqc.type);
+          parsed.pqc.length = stored_length;
+          parsed.pqc.version = FromLittleEndian16(parsed.pqc.version);
+          parsed.pqc.kem_id = FromLittleEndian16(parsed.pqc.kem_id);
           parsed.have_pqc = true;
         }
         break;
@@ -750,6 +832,7 @@ std::optional<VolumeUuid> ReadVolumeUuid(const std::filesystem::path& container)
 
 std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
                                           const ParsedHeader& parsed) { // TSK013
+  ValidatePassword(password); // TSK099_Input_Validation_and_Sanitization
   std::vector<uint8_t> pass_bytes(password.begin(), password.end());
   std::array<uint8_t, 32> output{};
   std::span<const uint8_t> password_span(pass_bytes.data(), pass_bytes.size());
@@ -937,22 +1020,24 @@ bool ParseHeaderHarness(std::span<const uint8_t> bytes) { // TSK030
 std::optional<ConstantTimeMount::VolumeHandle>
 ConstantTimeMount::Mount(const std::filesystem::path& container,
                          const std::string& password) {
-  auto& tracker = FailureTracker::Instance();                     // TSK026
-  auto volume_uuid = ReadVolumeUuid(container);                   // TSK075_Lockout_Persistence_and_IPC
-  tracker.EnforceDelay(container, volume_uuid);                   // TSK026, TSK075_Lockout_Persistence_and_IPC
+  ValidatePassword(password);                                                 // TSK099_Input_Validation_and_Sanitization
+  auto sanitized_container = SanitizeContainerPath(container);                // TSK099_Input_Validation_and_Sanitization
+  auto& tracker = FailureTracker::Instance();                                 // TSK026
+  auto volume_uuid = ReadVolumeUuid(sanitized_container);                     // TSK075_Lockout_Persistence_and_IPC
+  tracker.EnforceDelay(sanitized_container, volume_uuid);                     // TSK026, TSK075_Lockout_Persistence_and_IPC
 
   Attempt a, b;
   auto start = std::chrono::steady_clock::now();
   a.start = start;
   b.start = start;
 
-  auto r1 = AttemptMount(container, password);
+  auto r1 = AttemptMount(sanitized_container, password);
   a.duration = std::chrono::steady_clock::now() - a.start;
   a.pad = ComputePadding(a.duration);
   ConstantTimePadding(a.pad);
   RecordSample(a.duration);
 
-  auto r2 = AttemptMount(container, password);
+  auto r2 = AttemptMount(sanitized_container, password);
   b.duration = std::chrono::steady_clock::now() - b.start;
   b.pad = ComputePadding(b.duration);
   ConstantTimePadding(b.pad);
@@ -963,11 +1048,11 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   bool r1_ok = r1.has_value();
   bool r2_ok = r2.has_value();
   bool any_success = r1_ok || r2_ok;
-  uint32_t h1 = r1_ok ? static_cast<uint32_t>(r1->dummy) : 0;
-  uint32_t h2 = r2_ok ? static_cast<uint32_t>(r2->dummy) : 0;
+  uint32_t h1 = r1_ok ? CheckedCast<uint32_t>(r1->dummy) : 0;           // TSK099_Input_Validation_and_Sanitization
+  uint32_t h2 = r2_ok ? CheckedCast<uint32_t>(r2->dummy) : 0;           // TSK099_Input_Validation_and_Sanitization
   uint32_t selected = qv::crypto::ct::Select<uint32_t>(h1, h2, (!r1_ok && r2_ok));
 
-  auto state = tracker.RecordAttempt(container, volume_uuid, any_success); // TSK026, TSK075_Lockout_Persistence_and_IPC
+  auto state = tracker.RecordAttempt(sanitized_container, volume_uuid, any_success); // TSK026, TSK075_Lockout_Persistence_and_IPC
   if (!any_success) {
     Event event{};                                                // TSK026
     event.category = EventCategory::kSecurity;                    // TSK026
@@ -976,7 +1061,7 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
     event.message = state.locked ? "Volume locked after repeated authentication failures"
                                  : "Volume mount authentication failed"; // TSK026
     event.fields.emplace_back("container_hash",                                     // TSK026
-                              HashForTelemetry(qv::PathToUtf8String(container)),
+                              HashForTelemetry(qv::PathToUtf8String(sanitized_container)),
                               FieldPrivacy::kHash);
     event.fields.emplace_back("consecutive_failures", std::to_string(state.failures),
                               FieldPrivacy::kPublic, true); // TSK026
@@ -989,7 +1074,7 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   if (any_success) {
     VolumeHandle handle{};
     handle.dummy = static_cast<int>(selected);
-    handle.device = MakeBlockDevice(container);
+    handle.device = MakeBlockDevice(sanitized_container);
     return handle;
   }
   return std::nullopt;
