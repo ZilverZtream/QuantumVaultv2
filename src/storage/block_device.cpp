@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <span>
+#include <system_error> // TSK098_Exception_Safety_and_Resource_Leaks
 #include <vector>
 
 namespace qv::storage {
@@ -70,6 +71,44 @@ ChunkHeader PrepareHeaderForWrite(const ChunkHeader& header) {
   std::memcpy(prepared.reserved.data(), &stored, sizeof(stored));
   return prepared;
 }
+
+class ResizeRollbackGuard { // TSK098_Exception_Safety_and_Resource_Leaks
+ public:
+  ResizeRollbackGuard(const std::filesystem::path& path, uint64_t rollback_size)
+      : path_(path), rollback_size_(rollback_size) {}
+
+  ResizeRollbackGuard(const ResizeRollbackGuard&) = delete;
+  ResizeRollbackGuard& operator=(const ResizeRollbackGuard&) = delete;
+
+  ResizeRollbackGuard(ResizeRollbackGuard&& other) noexcept
+      : path_(std::move(other.path_)), rollback_size_(other.rollback_size_), committed_(other.committed_) {
+    other.committed_ = true;
+  }
+
+  ResizeRollbackGuard& operator=(ResizeRollbackGuard&& other) noexcept {
+    if (this != &other) {
+      path_ = std::move(other.path_);
+      rollback_size_ = other.rollback_size_;
+      committed_ = other.committed_;
+      other.committed_ = true;
+    }
+    return *this;
+  }
+
+  ~ResizeRollbackGuard() {
+    if (!committed_) {
+      std::error_code ec;
+      std::filesystem::resize_file(path_, rollback_size_, ec);
+    }
+  }
+
+  void Commit() noexcept { committed_ = true; }
+
+ private:
+  std::filesystem::path path_;
+  uint64_t rollback_size_{0};
+  bool committed_{false};
+};
 
 void VerifyHeaderCRCOrThrow(ChunkHeader& header) {
   const uint32_t stored = ExtractStoredCRC(header);
@@ -149,12 +188,28 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   const uint64_t final_size = std::max<uint64_t>(base_offset + record_size_, current_size);
   const uint64_t staging_offset_value = final_size;
 
+  std::vector<uint8_t> previous_record; // TSK098_Exception_Safety_and_Resource_Leaks
+  if (base_offset + record_size_ <= current_size) {
+    previous_record.resize(static_cast<size_t>(record_size_));
+    file_.seekg(offset);
+    if (!file_) {
+      throw Error{ErrorDomain::IO, 0, "Failed to seek for backup"};
+    }
+    file_.read(reinterpret_cast<char*>(previous_record.data()),
+               static_cast<std::streamsize>(previous_record.size()));
+    if (file_.gcount() != static_cast<std::streamsize>(previous_record.size())) {
+      throw Error{ErrorDomain::IO, 0, "Failed to read existing chunk for backup"};
+    }
+    file_.clear();
+  }
+
   ChunkHeader prepared_header = PrepareHeaderForWrite(header);  // TSK078_Chunk_Integrity_and_Bounds
   std::vector<uint8_t> record(static_cast<size_t>(record_size_));
   std::memcpy(record.data(), &prepared_header, sizeof(prepared_header));
   std::memcpy(record.data() + sizeof(prepared_header), ciphertext.data(), ciphertext.size());
 
   EnsureSizeUnlocked(staging_offset_value + record_size_);
+  ResizeRollbackGuard rollback(path_, current_size); // TSK098_Exception_Safety_and_Resource_Leaks
 
   auto write_buffer = [&](std::streampos position) {
     file_.seekp(position);
@@ -169,8 +224,26 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   };
 
   write_buffer(static_cast<std::streampos>(staging_offset_value));  // TSK078_Chunk_Integrity_and_Bounds
-  write_buffer(offset);
+  try {
+    write_buffer(offset);
+  } catch (...) {
+    if (!previous_record.empty()) {
+      try {
+        file_.clear();
+        file_.seekp(offset);
+        if (file_) {
+          file_.write(reinterpret_cast<const char*>(previous_record.data()),
+                      static_cast<std::streamsize>(previous_record.size()));
+          file_.flush();
+        }
+      } catch (...) {
+        // Swallow secondary failure and rethrow original error.
+      }
+    }
+    throw;
+  }
   std::filesystem::resize_file(path_, final_size);  // TSK078_Chunk_Integrity_and_Bounds
+  rollback.Commit();
 }
 
 ChunkReadResult BlockDevice::ReadChunk(int64_t chunk_index) {
