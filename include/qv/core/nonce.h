@@ -3,7 +3,6 @@
 #include "qv/error.h"
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono> // TSK015
 #include <cstdint>
 #include <cstring>
@@ -77,7 +76,8 @@ namespace qv::core {
     NonceRecord NextAuthenticated(); // TSK014
     std::array<uint8_t, 12> Next();
     uint64_t CurrentCounter() const {
-      return counter_.load(std::memory_order_acquire);
+      std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
+      return counter_;
     }
     bool NeedsRekey() const;                                                // TSK015
     Status GetStatus() const;                                               // TSK015
@@ -87,7 +87,7 @@ namespace qv::core {
     std::optional<NonceRecord> LastPersisted() const;                       // TSK015
   private:
     uint32_t epoch_;
-    std::atomic<uint64_t> counter_;
+    uint64_t counter_{0};
     NonceLog log_;
     struct RekeyPolicy { // TSK015
       uint64_t max_nonces = 50'000'000ULL;
@@ -96,7 +96,7 @@ namespace qv::core {
     RekeyPolicy policy_{};                                  // TSK015
     std::chrono::system_clock::time_point epoch_started_{}; // TSK015
     uint64_t base_counter_{0};                              // TSK015
-    mutable std::mutex nonce_mutex_;                        // TSK067_Nonce_Safety
+    mutable std::mutex state_mutex_;                        // TSK067_Nonce_Safety
     RekeyReason DetermineRekeyReason(uint64_t candidate,
                                      std::chrono::system_clock::time_point now) const; // TSK015
     static std::array<uint8_t, 12> MakeNonceBytes(uint32_t epoch, uint64_t counter);   // TSK015

@@ -18,6 +18,7 @@ struct CachedChunk {
   std::vector<uint8_t> data;
   bool dirty{false};
   std::chrono::steady_clock::time_point last_access{};
+  uint64_t version{0};  // TSK096_Race_Conditions_and_Thread_Safety
 };
 
 class ChunkCache {
@@ -46,20 +47,32 @@ class ChunkCache {
     std::shared_ptr<CachedChunk> chunk;
   };
 
+  struct CacheEntry {
+    std::shared_ptr<CachedChunk> chunk;
+    uint64_t version{0};
+  };
+
+  struct EraseResult {
+    std::shared_ptr<CachedChunk> chunk;
+    uint64_t generation{0};
+  };
+
   void TouchLocked(int64_t chunk_idx, const std::shared_ptr<CachedChunk>& chunk);
 
   EvictedChunk EvictLRULocked();
 
-  void EraseLocked(int64_t chunk_idx);  // TSK076_Cache_Coherency
+  EraseResult EraseLocked(int64_t chunk_idx);  // TSK076_Cache_Coherency
 
   size_t max_size_;
   size_t current_size_{0};
 
-  std::unordered_map<int64_t, std::shared_ptr<CachedChunk>> cache_;
+  std::unordered_map<int64_t, CacheEntry> cache_;
   std::list<int64_t> lru_list_;
   std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_map_;
 
   std::function<void(int64_t, const std::vector<uint8_t>&)> write_back_;
+
+  std::unordered_map<int64_t, uint64_t> cache_generations_;  // TSK096_Race_Conditions_and_Thread_Safety
 
   mutable std::shared_mutex mutex_;
 };
