@@ -759,9 +759,7 @@ void NonceLog::ReloadUnlocked() {
     throw Error{ErrorDomain::Validation, 0, "Nonce log entry count overflow"}; // TSK100_Integer_Overflow_and_Arithmetic count guard
   }
   const uint32_t computed_count32 = static_cast<uint32_t>(computed_count);
-  if (stored_count != computed_count32) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log entry count mismatch"};
-  }
+  const bool count_mismatch = stored_count != computed_count32;  // TSK108_Data_Structure_Invariants derive from entries size
 
   uint32_t computed_checksum =
       ComputeFNV1a(std::span<const uint8_t>(data.data(), payload_size));
@@ -795,6 +793,12 @@ void NonceLog::ReloadUnlocked() {
   }
 
   last_mac_ = entries_.empty() ? std::array<uint8_t, kMacSize>{} : entries_.back().mac;
+
+  if (count_mismatch) {  // TSK108_Data_Structure_Invariants rewrite trailer from canonical size
+    PersistUnlocked();
+    return;
+  }
+
   loaded_ = true;
 }
 

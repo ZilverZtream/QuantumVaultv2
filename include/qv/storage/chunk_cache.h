@@ -68,6 +68,8 @@ class ChunkCache {
 
   EraseResult EraseLocked(int64_t chunk_idx);  // TSK076_Cache_Coherency
 
+  void CheckInvariantsLocked() const;  // TSK108_Data_Structure_Invariants debug validation
+
   size_t max_size_;
   size_t current_size_{0};
 
