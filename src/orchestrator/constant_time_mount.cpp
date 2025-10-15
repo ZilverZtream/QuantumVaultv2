@@ -47,6 +47,22 @@ using namespace qv::orchestrator;
 
 namespace {
 
+void ConstantTimeDelay(std::chrono::nanoseconds duration) { // TSK102_Timing_Side_Channels
+  if (duration <= std::chrono::nanoseconds::zero()) {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + duration;
+  while (std::chrono::steady_clock::now() < deadline) {
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+  }
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+}
+
 template <typename To, typename From>
 To CheckedCast(From value) { // TSK099_Input_Validation_and_Sanitization
   static_assert(std::is_integral_v<From>, "CheckedCast requires integral source type");
@@ -822,11 +838,19 @@ std::optional<VolumeUuid> ReadVolumeUuid(const std::filesystem::path& container)
   }
   bool magic_ok = qv::crypto::ct::CompareEqual(header.magic, kHeaderMagic);
   auto version = FromLittleEndian32(header.version);
-  if (!magic_ok || version != kHeaderVersion) {
+  bool version_ok = version == kHeaderVersion;                     // TSK102_Timing_Side_Channels
+  uint32_t error_mask = 0;                                         // TSK102_Timing_Side_Channels
+  error_mask |= magic_ok ? 0u : 1u;                                // TSK102_Timing_Side_Channels
+  error_mask |= version_ok ? 0u : 2u;                              // TSK102_Timing_Side_Channels
+  bool all_ok = error_mask == 0;                                   // TSK102_Timing_Side_Channels
+  VolumeUuid uuid{};
+  for (size_t i = 0; i < uuid.size(); ++i) {                       // TSK102_Timing_Side_Channels
+    uuid[i] = qv::crypto::ct::Select<uint8_t>(0u, header.uuid[i], all_ok);
+  }
+  std::atomic_signal_fence(std::memory_order_seq_cst);             // TSK102_Timing_Side_Channels
+  if (!all_ok) {
     return std::nullopt;
   }
-  VolumeUuid uuid{};
-  std::copy(header.uuid.begin(), header.uuid.end(), uuid.begin());
   return uuid;
 }
 
@@ -836,6 +860,8 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
   std::vector<uint8_t> pass_bytes(password.begin(), password.end());
   std::array<uint8_t, 32> output{};
   std::span<const uint8_t> password_span(pass_bytes.data(), pass_bytes.size());
+  const auto kdf_start = std::chrono::steady_clock::now();            // TSK102_Timing_Side_Channels
+  bool used_argon2 = false;                                          // TSK102_Timing_Side_Channels
 
   if (parsed.algorithm == PasswordKdf::kArgon2id) { // TSK036_PBKDF2_Argon2_Migration_Path
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
@@ -849,6 +875,7 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
     if (rc != ARGON2_OK) {
       throw qv::Error{qv::ErrorDomain::Crypto, rc, "Argon2id derivation failed"};
     }
+    used_argon2 = true; // TSK102_Timing_Side_Channels
 #else
     throw qv::Error{qv::ErrorDomain::Dependency, 0,
                     "Argon2id support not available in this build"};
@@ -875,6 +902,20 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(iter.data(), iter.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(u.data(), u.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(block.data(), block.size()));
+  }
+  auto elapsed = std::chrono::steady_clock::now() - kdf_start; // TSK102_Timing_Side_Channels
+  if (!used_argon2) {                                          // TSK102_Timing_Side_Channels
+    uint32_t target_ms = parsed.have_argon2 && parsed.argon2.target_ms != 0
+                             ? parsed.argon2.target_ms
+                             : 150u;
+    auto target = std::chrono::milliseconds(target_ms);
+    if (elapsed < target) {
+      ConstantTimeDelay(target - elapsed); // TSK102_Timing_Side_Channels align PBKDF2 timing
+    } else {
+      std::atomic_signal_fence(std::memory_order_seq_cst); // TSK102_Timing_Side_Channels
+    }
+  } else {
+    std::atomic_signal_fence(std::memory_order_seq_cst); // TSK102_Timing_Side_Channels
   }
   if (!pass_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(pass_bytes.data(), pass_bytes.size()));
@@ -1081,20 +1122,7 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
 }
 
 void ConstantTimeMount::ConstantTimePadding(std::chrono::nanoseconds duration) {
-  auto remaining = duration;
-  if (remaining <= std::chrono::nanoseconds::zero()) {
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    return;
-  }
-  auto end = std::chrono::steady_clock::now() + remaining;
-  while (std::chrono::steady_clock::now() < end) {
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
-    _mm_pause();
-#else
-    std::this_thread::yield();
-#endif
-  }
-  std::atomic_signal_fence(std::memory_order_seq_cst);
+  ConstantTimeDelay(duration); // TSK102_Timing_Side_Channels reuse shared padding helper
 }
 
 std::optional<ConstantTimeMount::VolumeHandle>
@@ -1194,8 +1222,16 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
       std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
   bool mac_ok = qv::crypto::ct::CompareEqual(stored_mac, computed_mac);
 
-  bool result = size_known && within_limit && header_sized && io_ok && parsed.valid && classical_ok &&
-                pqc_ok && mac_ok;                                                // TSK070
+  uint32_t integrity_mask = 1u; // TSK102_Timing_Side_Channels
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, size_known);
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, within_limit);
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, header_sized);
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, io_ok);
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, parsed.valid);
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, classical_ok);
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, pqc_ok);
+  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, mac_ok);
+  bool result = integrity_mask != 0u;                                             // TSK102_Timing_Side_Channels
   uint32_t mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, result);              // TSK022, TSK070
   std::atomic_signal_fence(std::memory_order_seq_cst);                   // TSK022
   volatile uint32_t guard_mask = mask;                                   // TSK022
