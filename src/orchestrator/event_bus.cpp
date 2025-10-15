@@ -49,6 +49,27 @@
 namespace qv::orchestrator {
 namespace {
 
+struct EventBusSingletonStorage { // TSK110_Initialization_and_Cleanup_Order manage singleton lifetime
+  std::once_flag once;
+  std::unique_ptr<EventBus> instance;
+
+  void Reset() { // TSK110_Initialization_and_Cleanup_Order allow deterministic teardown
+    instance.reset();
+    this->~EventBusSingletonStorage();
+    new (this) EventBusSingletonStorage();
+  }
+};
+
+std::mutex& EventBusSingletonMutex() {
+  static std::mutex mutex; // TSK110_Initialization_and_Cleanup_Order synchronize init/reset
+  return mutex;
+}
+
+EventBusSingletonStorage& EventBusSingleton() {
+  static EventBusSingletonStorage storage; // TSK110_Initialization_and_Cleanup_Order lazy container
+  return storage;
+}
+
 struct PublishReentrancyGuard {  // TSK104_Concurrency_Deadlock_and_Lock_Ordering suppress recursive publish deadlocks
   explicit PublishReentrancyGuard(bool& flag) : flag_(flag) { flag_ = true; }
   ~PublishReentrancyGuard() { flag_ = false; }
@@ -1502,6 +1523,9 @@ EventBus::~EventBus() { // TSK081_EventBus_Throughput_and_Batching
   {
     std::lock_guard<std::mutex> guard(mutex_);
     stop_dispatcher_ = true;
+    subs_.clear();                              // TSK110_Initialization_and_Cleanup_Order drop subscribers before join
+    pending_syslog_.clear();                    // TSK110_Initialization_and_Cleanup_Order clear queued work
+    syslog_client_.reset();                     // TSK110_Initialization_and_Cleanup_Order release transport
   }
   syslog_cv_.notify_all();
   if (dispatcher_thread_.joinable()) {
@@ -1559,8 +1583,14 @@ void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
 }
 
 EventBus& EventBus::Instance() { // TSK029
-  static EventBus instance;
-  return instance;
+  auto& storage = EventBusSingleton();
+  {
+    std::lock_guard<std::mutex> guard(EventBusSingletonMutex());
+    std::call_once(storage.once, [&storage]() {
+      storage.instance = std::make_unique<EventBus>(); // TSK110_Initialization_and_Cleanup_Order lazy init
+    });
+  }
+  return *storage.instance;
 }
 
 void EventBus::Publish(const Event& event) { // TSK029
@@ -1621,6 +1651,12 @@ bool EventBus::ConfigureSyslog(const std::string& host, uint16_t port, std::stri
   StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching ensure worker active
   syslog_cv_.notify_one();
   return true;
+}
+
+void ResetEventBusForTesting() { // TSK110_Initialization_and_Cleanup_Order expose deterministic teardown
+  auto& storage = EventBusSingleton();
+  std::lock_guard<std::mutex> guard(EventBusSingletonMutex());
+  storage.Reset();
 }
 
 } // namespace qv::orchestrator

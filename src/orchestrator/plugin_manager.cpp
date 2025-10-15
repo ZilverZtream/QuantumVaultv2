@@ -1209,3 +1209,7 @@ void PluginManager::UnloadAll() {
 #endif
   }
 }
+
+void qv::orchestrator::ResetPluginSubsystemForTesting() { // TSK110_Initialization_and_Cleanup_Order release orchestrator singletons
+  ResetEventBusForTesting();
+}
