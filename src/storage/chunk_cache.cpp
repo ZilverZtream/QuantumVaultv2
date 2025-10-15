@@ -1,6 +1,7 @@
 #include "qv/storage/chunk_cache.h"
 
 #include <algorithm>
+#include <iterator> // TSK105_Resource_Leaks_and_Lifecycle
 #include <mutex> // TSK067_Nonce_Safety
 
 namespace qv::storage {
@@ -46,8 +47,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
 
     current_size_ += chunk->data.size();
     cache_[chunk_idx] = CacheEntry{chunk, chunk->version};
-    lru_list_.push_front(chunk_idx);
-    lru_map_[chunk_idx] = lru_list_.begin();
+    TouchLocked(chunk_idx, chunk);  // TSK105_Resource_Leaks_and_Lifecycle reuse LRU helper
     inserted = chunk;
     callback = write_back_;
   }
@@ -120,7 +120,7 @@ void ChunkCache::TouchLocked(int64_t chunk_idx, const std::shared_ptr<CachedChun
   if (map_it != lru_map_.end()) {
     lru_list_.erase(map_it->second);
   }
-  lru_list_.push_front(chunk_idx);
+  lru_list_.push_front(LruNode{chunk_idx, chunk});
   lru_map_[chunk_idx] = lru_list_.begin();
   chunk->last_access = std::chrono::steady_clock::now();
 }
@@ -131,10 +131,23 @@ ChunkCache::EvictedChunk ChunkCache::EvictLRULocked() {
     return evicted;
   }
 
-  auto victim_idx = lru_list_.back();
-  auto erased = EraseLocked(victim_idx);
-  evicted.index = victim_idx;
-  evicted.chunk = erased.chunk;
+  while (!lru_list_.empty()) {
+    auto node_it = std::prev(lru_list_.end());
+    if (node_it->chunk.expired()) {  // TSK105_Resource_Leaks_and_Lifecycle prune stale nodes
+      lru_map_.erase(node_it->index);
+      lru_list_.pop_back();
+      continue;
+    }
+
+    auto victim_idx = node_it->index;
+    auto erased = EraseLocked(victim_idx);
+    evicted.index = victim_idx;
+    evicted.chunk = erased.chunk;
+    if (!evicted.chunk) {
+      continue;
+    }
+    return evicted;
+  }
 
   return evicted;
 }
@@ -146,7 +159,9 @@ ChunkCache::EraseResult ChunkCache::EraseLocked(int64_t chunk_idx) {  // TSK076_
   result.generation = generation;
 
   if (auto existing = cache_.find(chunk_idx); existing != cache_.end()) {
-    current_size_ -= existing->second.chunk->data.size();
+    if (existing->second.chunk) {
+      current_size_ -= existing->second.chunk->data.size();  // TSK105_Resource_Leaks_and_Lifecycle guard null
+    }
     if (auto lru_it = lru_map_.find(chunk_idx); lru_it != lru_map_.end()) {
       lru_list_.erase(lru_it->second);
       lru_map_.erase(lru_it);
