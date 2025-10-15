@@ -107,6 +107,7 @@ add_library(qv_core
     src/crypto/aes_gcm.cpp
     src/crypto/hkdf.cpp
     src/crypto/hmac_sha256.cpp
+    src/crypto/pbkdf2.cpp # TSK111_Code_Duplication_and_Maintainability shared PBKDF2 implementation
     src/crypto/random.cpp
     src/crypto/provider.cpp
     src/crypto/sha256.cpp
@@ -153,6 +154,7 @@ add_library(qv_orchestrator
     src/orchestrator/volume_manager.cpp
     src/orchestrator/io_util.cpp # TSK068_Atomic_Header_Writes durability helper
     src/orchestrator/event_bus.cpp
+    src/tlv/parser.cpp # TSK111_Code_Duplication_and_Maintainability reusable TLV parser
 )
 target_include_directories(qv_orchestrator
     PUBLIC

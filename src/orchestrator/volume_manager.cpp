@@ -27,11 +27,15 @@
 #include "qv/crypto/aes_gcm.h" // TSK024_Key_Rotation_and_Lifecycle_Management
 #include "qv/crypto/random.h"  // TSK106_Cryptographic_Implementation_Weaknesses
 #include "qv/crypto/hmac_sha256.h"
+#include "qv/crypto/pbkdf2.h"  // TSK111_Code_Duplication_and_Maintainability shared PBKDF2
 #include "qv/error.h"
+#include "qv/errors.h"  // TSK111_Code_Duplication_and_Maintainability centralized messages
 #include "qv/orchestrator/event_bus.h" // TSK024_Key_Rotation_and_Lifecycle_Management
 #include "qv/orchestrator/io_util.h"   // TSK068_Atomic_Header_Writes atomic persistence
+#include "qv/orchestrator/header_serializer.h"  // TSK111_Code_Duplication_and_Maintainability
 #include "qv/security/secure_buffer.h" // TSK097_Cryptographic_Key_Management secure allocator for secrets
 #include "qv/security/zeroizer.h"
+#include "qv/tlv/parser.h"  // TSK111_Code_Duplication_and_Maintainability TLV iteration
 
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2 // TSK036_PBKDF2_Argon2_Migration_Path
 #include <argon2.h>
@@ -104,10 +108,12 @@ void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_
   constexpr size_t kMaxPasswordLen = 1024;
   const auto size = password.size();
   if (size < kMinPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too short"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooShort)};
   }
   if (size > kMaxPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Password too long"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooLong)};
   }
 }
 
@@ -120,13 +126,15 @@ std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sa
     std::error_code cwd_ec;
     base = std::filesystem::current_path(cwd_ec);
     if (cwd_ec) {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to resolve working directory"};
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kUnableToResolveWorkingDirectory)};
     }
   }
   std::error_code ec;
   auto canonical = std::filesystem::weakly_canonical(base, ec);
   if (ec) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Unable to canonicalize container root"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kUnableToCanonicalizeContainerRoot)};
   }
   return canonical;
 }
@@ -140,16 +148,19 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
   std::error_code ec;
   auto canonical = std::filesystem::weakly_canonical(path, ec);
   if (ec) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Failed to canonicalize container path"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kFailedToCanonicalizeContainerPath)};
   }
   const auto& base = AllowedContainerRoot();
   auto relative = std::filesystem::relative(canonical, base, ec);
   if (ec || relative.is_absolute()) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Container path escapes allowed root"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kContainerEscapesAllowedRoot)};
   }
   for (const auto& component : relative) {
     if (component == "..") {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path escape attempt detected"};
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kPathEscapeAttemptDetected)};
     }
   }
   return canonical;
@@ -205,23 +216,6 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
     std::array<uint8_t, kPbkdfSaltSize> salt{};
   };
 
-#if defined(_MSC_VER)
-  constexpr uint16_t ToLittleEndian16(uint16_t value) {
-    return qv::kIsLittleEndian ? value : _byteswap_ushort(value);
-  }
-#elif defined(__clang__) || defined(__GNUC__)
-  constexpr uint16_t ToLittleEndian16(uint16_t value) {
-    return qv::kIsLittleEndian ? value : __builtin_bswap16(value);
-  }
-#else
-  constexpr uint16_t ToLittleEndian16(uint16_t value) {
-    if (qv::kIsLittleEndian) {
-      return value;
-    }
-    return static_cast<uint16_t>(((value & 0xFF) << 8) | ((value >> 8) & 0xFF));
-  }
-#endif
-
   struct VolumeHeader { // TSK013
     std::array<char, 8> magic = kVolumeMagic;
     uint32_t version = qv::ToLittleEndian(kHeaderVersion);
@@ -231,8 +225,8 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
 
 #pragma pack(push, 1)
   struct ReservedV2Tlv { // TSK033 future ACL metadata placeholder
-    uint16_t type = ToLittleEndian16(kTlvTypeReservedV2);
-    uint16_t length = ToLittleEndian16(32);
+    uint16_t type = qv::ToLittleEndian16(kTlvTypeReservedV2);
+    uint16_t length = qv::ToLittleEndian16(32);
     std::array<uint8_t, 32> payload{};
   };
 #pragma pack(pop)
@@ -284,45 +278,10 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
   std::array<uint8_t, 32> DerivePasswordKey(std::span<const uint8_t> password,
                                             const std::array<uint8_t, kPbkdfSaltSize>& salt,
                                             uint32_t iterations,
-                                            ProgressCallback progress = {}) { // TSK036_PBKDF2_Argon2_Migration_Path
-    std::array<uint8_t, 32> output{};
-    qv::security::Zeroizer::ScopeWiper<uint8_t> output_guard(std::span<uint8_t>(output.data(), output.size())); // TSK097_Cryptographic_Key_Management ensure final wipe on failure
-    std::array<uint8_t, 20> block{};
-    qv::security::Zeroizer::ScopeWiper<uint8_t> block_guard(std::span<uint8_t>(block.data(), block.size())); // TSK097_Cryptographic_Key_Management wipe salt block
-    std::memcpy(block.data(), salt.data(), salt.size());
-    block[16] = 0;
-    block[17] = 0;
-    block[18] = 0;
-    block[19] = 1;
-
-    iterations = std::max<uint32_t>(iterations, 1u);                       // TSK036_PBKDF2_Argon2_Migration_Path guard zero
-
-    auto u = qv::crypto::HMAC_SHA256::Compute(password,
-                                              std::span<const uint8_t>(block.data(), block.size()));
-    qv::security::Zeroizer::ScopeWiper<uint8_t> u_guard(std::span<uint8_t>(u.data(), u.size())); // TSK097_Cryptographic_Key_Management wipe intermediate HMAC
-    output = u;
-    auto iter = u;
-    qv::security::Zeroizer::ScopeWiper<uint8_t> iter_guard(std::span<uint8_t>(iter.data(), iter.size())); // TSK097_Cryptographic_Key_Management wipe PBKDF2 accumulator
-    if (progress) { // TSK097_Cryptographic_Key_Management optional callback leaks timing; use only for UX feedback
-      progress(1, iterations);
-    }
-    for (uint32_t i = 1; i < iterations; ++i) {
-      iter = qv::crypto::HMAC_SHA256::Compute(password,
-                                              std::span<const uint8_t>(iter.data(), iter.size()));
-      for (size_t j = 0; j < output.size(); ++j) {
-        output[j] ^= iter[j];
-      }
-
-      if (progress && (i + 1) % 10'000 == 0) { // TSK097_Cryptographic_Key_Management throttle observable timing updates
-        progress(i + 1, iterations);
-      }
-    }
-
-    if (progress && iterations % 10'000 != 0) { // TSK097_Cryptographic_Key_Management final optional timing leak acknowledgement
-      progress(iterations, iterations);
-    }
-    output_guard.Release();
-    return output;
+                                            ProgressCallback progress = {}) { // TSK111_Code_Duplication_and_Maintainability
+    return qv::crypto::PBKDF2_HMAC_SHA256(
+        password, std::span<const uint8_t>(salt.data(), salt.size()), iterations,
+        progress);
   }
 
   std::array<uint8_t, 32> DerivePasswordKeyArgon2id(std::span<const uint8_t> password,
@@ -330,7 +289,8 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
     std::array<uint8_t, 32> output{};
     if (config.hash_length != output.size()) {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unsupported Argon2 hash length"};
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kUnsupportedArgon2HashLength)};
     }
     int rc = argon2id_hash_raw(static_cast<uint32_t>(config.time_cost),
                                static_cast<uint32_t>(config.memory_cost_kib),
@@ -338,14 +298,15 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
                                password.data(), password.size(), config.salt.data(), config.salt.size(),
                                output.data(), output.size());
     if (rc != ARGON2_OK) {
-      throw qv::Error{qv::ErrorDomain::Crypto, rc, "Argon2id derivation failed"};
+      throw qv::Error{qv::ErrorDomain::Crypto, rc,
+                      std::string(qv::errors::msg::kArgon2DerivationFailed)};
     }
     return output;
 #else
     (void)password;
     (void)config;
     throw qv::Error{qv::ErrorDomain::Dependency, 0,
-                    "Argon2id support not available in this build"};
+                    std::string(qv::errors::msg::kArgon2Unavailable)};
 #endif
   }
 
@@ -364,11 +325,6 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
         std::span<uint8_t>(metadata_root.data(),
                            metadata_root.size())); // TSK024_Key_Rotation_and_Lifecycle_Management
     return okm;
-  }
-
-  template <typename T> void AppendRaw(std::vector<uint8_t>& out, const T& value) {
-    auto bytes = qv::AsBytesConst(value);
-    out.insert(out.end(), bytes.begin(), bytes.end());
   }
 
   class VectorWipeGuard { // TSK028_Secure_Deletion_and_Data_Remanence
@@ -395,16 +351,6 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
     std::vector<uint8_t>& vec_;
     bool active_{true};
   };
-
-  void AppendUint16(std::vector<uint8_t>& out, uint16_t value) {
-    const uint16_t le = ToLittleEndian16(value);
-    AppendRaw(out, le);
-  }
-
-  void AppendUint32(std::vector<uint8_t>& out, uint32_t value) {
-    const uint32_t le = qv::ToLittleEndian(value);
-    AppendRaw(out, le);
-  }
 
   struct ParsedHeader {                        // TSK024_Key_Rotation_and_Lifecycle_Management
     VolumeHeader header{};                     // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -449,65 +395,63 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
       const std::optional<Argon2Config>& argon2,
       const std::array<uint8_t, kHybridSaltSize>& hybrid_salt, const qv::core::EpochTLV& epoch,
       const qv::core::PQC_KEM_TLV& kem_blob,
-      const ReservedV2Tlv& reserved) { // TSK024_Key_Rotation_and_Lifecycle_Management
-    std::vector<uint8_t> serialized;   // TSK024_Key_Rotation_and_Lifecycle_Management
-    serialized.reserve(1024);          // TSK024_Key_Rotation_and_Lifecycle_Management
+      const ReservedV2Tlv& reserved) { // TSK111_Code_Duplication_and_Maintainability
+    qv::orchestrator::HeaderSerializer serializer;
+    serializer.AddHeader(header);
 
-    AppendRaw(serialized, header); // TSK024_Key_Rotation_and_Lifecycle_Management
-
-    if (algorithm == PasswordKdf::kPbkdf2) { // TSK036_PBKDF2_Argon2_Migration_Path
-      AppendUint16(serialized, kTlvTypePbkdf2);
-      AppendUint16(serialized, CheckedCast<uint16_t>(4 + password_salt.size()));
-      AppendUint32(serialized, pbkdf_iterations);
-      serialized.insert(serialized.end(), password_salt.begin(), password_salt.end());
-    } else if (algorithm == PasswordKdf::kArgon2id) { // TSK036_PBKDF2_Argon2_Migration_Path
+    if (algorithm == PasswordKdf::kPbkdf2) {
+      std::array<uint8_t, sizeof(uint32_t) + kPbkdfSaltSize> pbkdf_payload{};
+      const uint32_t iter_le = qv::ToLittleEndian(pbkdf_iterations);
+      std::memcpy(pbkdf_payload.data(), &iter_le, sizeof(iter_le));
+      std::copy(password_salt.begin(), password_salt.end(), pbkdf_payload.begin() + sizeof(uint32_t));
+      serializer.AddTLV(kTlvTypePbkdf2, std::span<const uint8_t>(pbkdf_payload.data(), pbkdf_payload.size()));
+    } else if (algorithm == PasswordKdf::kArgon2id) {
       if (!argon2) {
-        throw qv::Error{qv::ErrorDomain::Internal, 0, "Missing Argon2 configuration"};
+        throw qv::Error{qv::ErrorDomain::Internal, 0, std::string(qv::errors::msg::kMissingArgon2Configuration)};
       }
-      AppendUint16(serialized, kTlvTypeArgon2);
-      constexpr uint16_t kArgon2PayloadSize = static_cast<uint16_t>(sizeof(uint32_t) * 6 + kPbkdfSaltSize);
-      AppendUint16(serialized, kArgon2PayloadSize);
-      AppendUint32(serialized, argon2->version);
-      AppendUint32(serialized, argon2->time_cost);
-      AppendUint32(serialized, argon2->memory_cost_kib);
-      AppendUint32(serialized, argon2->parallelism);
-      AppendUint32(serialized, argon2->hash_length);
-      AppendUint32(serialized, argon2->target_ms);
-      serialized.insert(serialized.end(), argon2->salt.begin(), argon2->salt.end());
+      std::array<uint8_t, sizeof(uint32_t) * 6 + kPbkdfSaltSize> argon_payload{};
+      auto write_field = [&](size_t index, uint32_t value) {
+        const uint32_t le = qv::ToLittleEndian(value);
+        std::memcpy(argon_payload.data() + index * sizeof(uint32_t), &le, sizeof(le));
+      };
+      write_field(0, argon2->version);
+      write_field(1, argon2->time_cost);
+      write_field(2, argon2->memory_cost_kib);
+      write_field(3, argon2->parallelism);
+      write_field(4, argon2->hash_length);
+      write_field(5, argon2->target_ms);
+      std::copy(argon2->salt.begin(), argon2->salt.end(),
+                argon_payload.begin() + sizeof(uint32_t) * 6);
+      serializer.AddTLV(kTlvTypeArgon2, std::span<const uint8_t>(argon_payload.data(), argon_payload.size()));
     }
 
-    AppendUint16(serialized, kTlvTypeHybridSalt); // TSK024_Key_Rotation_and_Lifecycle_Management
-    AppendUint16(serialized, CheckedCast<uint16_t>(hybrid_salt.size())); // TSK024_Key_Rotation_and_Lifecycle_Management
-    serialized.insert(serialized.end(), hybrid_salt.begin(),
-                      hybrid_salt.end()); // TSK024_Key_Rotation_and_Lifecycle_Management
+    serializer.AddTLV(kTlvTypeHybridSalt, std::span<const uint8_t>(hybrid_salt.data(), hybrid_salt.size()));
+    serializer.AddStruct(epoch);
 
-    AppendRaw(serialized, epoch); // TSK024_Key_Rotation_and_Lifecycle_Management
-
-    auto pqc_blob = kem_blob; // TSK024_Key_Rotation_and_Lifecycle_Management
-    pqc_blob.type =
-        ToLittleEndian16(kTlvTypePqcKem); // TSK024_Key_Rotation_and_Lifecycle_Management
-    pqc_blob.length = ToLittleEndian16(
+    auto pqc_copy = kem_blob;
+    pqc_copy.type = qv::ToLittleEndian16(kTlvTypePqcKem);
+    pqc_copy.length = qv::ToLittleEndian16(
         CheckedCast<uint16_t>(sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2));
-    pqc_blob.version =
-        ToLittleEndian16(pqc_blob.version); // TSK024_Key_Rotation_and_Lifecycle_Management
-    pqc_blob.kem_id =
-        ToLittleEndian16(pqc_blob.kem_id); // TSK024_Key_Rotation_and_Lifecycle_Management
-    AppendRaw(serialized, pqc_blob);       // TSK024_Key_Rotation_and_Lifecycle_Management
+    pqc_copy.version = qv::ToLittleEndian16(pqc_copy.version);
+    pqc_copy.kem_id = qv::ToLittleEndian16(pqc_copy.kem_id);
+    serializer.AddStruct(pqc_copy);
 
-    if (reserved.length > 0) {                         // TSK033 only emit when present
-      auto reserved_copy = reserved;                   // TSK024_Key_Rotation_and_Lifecycle_Management
-      uint16_t reserved_length = reserved_copy.length; // TSK033 clamp payload
-      if (reserved_length > reserved_copy.payload.size()) { // TSK033 clamp payload
+    if (reserved.length > 0) {
+      auto reserved_copy = reserved;
+      uint16_t reserved_length = reserved_copy.length;
+      if (reserved_length > reserved_copy.payload.size()) {
         reserved_length = CheckedCast<uint16_t>(reserved_copy.payload.size());
       }
-      reserved_copy.type =
-          ToLittleEndian16(kTlvTypeReservedV2); // TSK024_Key_Rotation_and_Lifecycle_Management
-      reserved_copy.length =
-          ToLittleEndian16(reserved_length); // TSK024_Key_Rotation_and_Lifecycle_Management
-      AppendRaw(serialized, reserved_copy);  // TSK024_Key_Rotation_and_Lifecycle_Management
+      reserved_copy.type = qv::ToLittleEndian16(kTlvTypeReservedV2);
+      reserved_copy.length = qv::ToLittleEndian16(reserved_length);
+      std::fill(reserved_copy.payload.begin(), reserved_copy.payload.end(), 0);
+      if (reserved_length > 0) {
+        std::copy_n(reserved.payload.begin(), reserved_length, reserved_copy.payload.begin());
+      }
+      serializer.AddStruct(reserved_copy);
     }
 
-    return serialized; // TSK024_Key_Rotation_and_Lifecycle_Management
+    return serializer.Finalize();
   }
 
   uint32_t DeterminePbkdfIterations(std::span<const uint8_t> password,
@@ -540,178 +484,156 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
   }
 
   ParsedHeader
-  ParseHeader(const std::vector<uint8_t>& blob) { // TSK024_Key_Rotation_and_Lifecycle_Management
+  ParseHeader(const std::vector<uint8_t>& blob) { // TSK111_Code_Duplication_and_Maintainability
     if (blob.size() <
         sizeof(VolumeHeader) +
-            qv::crypto::HMAC_SHA256::TAG_SIZE) { // TSK024_Key_Rotation_and_Lifecycle_Management
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Invalid container header"};
+            qv::crypto::HMAC_SHA256::TAG_SIZE) { // TSK111_Code_Duplication_and_Maintainability
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kInvalidContainerHeader)};
     }
 
-    ParsedHeader parsed{}; // TSK024_Key_Rotation_and_Lifecycle_Management
-    std::memcpy(&parsed.header, blob.data(),
-                sizeof(VolumeHeader)); // TSK024_Key_Rotation_and_Lifecycle_Management
-    parsed.header_version =
-        qv::ToLittleEndian(parsed.header.version); // TSK024_Key_Rotation_and_Lifecycle_Management
-    if (parsed.header.magic != kVolumeMagic) {     // TSK024_Key_Rotation_and_Lifecycle_Management
+    ParsedHeader parsed{};
+    std::memcpy(&parsed.header, blob.data(), sizeof(VolumeHeader));
+    parsed.header_version = qv::ToLittleEndian(parsed.header.version);
+    if (parsed.header.magic != kVolumeMagic) {
       throw qv::Error{qv::ErrorDomain::Validation, 0, "Unrecognized volume magic"};
     }
 
-    const size_t mac_size =
-        qv::crypto::HMAC_SHA256::TAG_SIZE; // TSK024_Key_Rotation_and_Lifecycle_Management
-    const size_t payload_size =
-        blob.size() - mac_size; // TSK024_Key_Rotation_and_Lifecycle_Management
-    parsed.payload.assign(
-        blob.begin(), blob.begin() + payload_size); // TSK024_Key_Rotation_and_Lifecycle_Management
-    std::copy(blob.begin() + payload_size, blob.end(),
-              parsed.mac.begin()); // TSK024_Key_Rotation_and_Lifecycle_Management
+    const size_t mac_size = qv::crypto::HMAC_SHA256::TAG_SIZE;
+    const size_t payload_size = blob.size() - mac_size;
+    parsed.payload.assign(blob.begin(), blob.begin() + payload_size);
+    std::copy(blob.begin() + payload_size, blob.end(), parsed.mac.begin());
 
-    size_t offset = sizeof(VolumeHeader); // TSK024_Key_Rotation_and_Lifecycle_Management
+    const auto header_span =
+        std::span<const uint8_t>(parsed.payload.data(), parsed.payload.size());
+    if (header_span.size() < sizeof(VolumeHeader)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kVolumeHeaderTruncated)};
+    }
+    const auto tlv_span = header_span.subspan(sizeof(VolumeHeader));
+    qv::tlv::Parser parser(tlv_span);
+    if (!parser.valid()) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kVolumeHeaderTruncated)};
+    }
+
     bool have_pbkdf = false;
     bool have_hybrid = false;
     bool have_epoch = false;
     bool have_pqc = false;
 
-    while (offset < payload_size) {
-      if (payload_size - offset < sizeof(uint16_t) * 2) {
-        throw qv::Error{qv::ErrorDomain::Validation, 0, "Volume header truncated"};
+    for (const auto& record : parser) {
+      switch (record.type) {
+        case kTlvTypePbkdf2: {
+          const size_t expected = sizeof(uint32_t) + kPbkdfSaltSize;
+          if (record.value.size() != expected) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0,
+                            std::string(qv::errors::msg::kPbkdf2Malformed)};
+          }
+          uint32_t iter_le = 0;
+          std::memcpy(&iter_le, record.value.data(), sizeof(iter_le));
+          parsed.pbkdf_iterations = qv::FromLittleEndian32(iter_le);
+          std::copy_n(record.value.data() + sizeof(uint32_t), kPbkdfSaltSize,
+                      parsed.pbkdf_salt.begin());
+          have_pbkdf = true;
+          parsed.algorithm = PasswordKdf::kPbkdf2;
+          break;
+        }
+        case kTlvTypeArgon2: {
+          constexpr size_t expected = sizeof(uint32_t) * 6 + kPbkdfSaltSize;
+          if (record.value.size() != expected) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0,
+                            std::string(qv::errors::msg::kArgon2Malformed)};
+          }
+          Argon2Config cfg{};
+          std::memcpy(&cfg.version, record.value.data(), sizeof(uint32_t));
+          std::memcpy(&cfg.time_cost, record.value.data() + sizeof(uint32_t), sizeof(uint32_t));
+          std::memcpy(&cfg.memory_cost_kib,
+                      record.value.data() + sizeof(uint32_t) * 2, sizeof(uint32_t));
+          std::memcpy(&cfg.parallelism,
+                      record.value.data() + sizeof(uint32_t) * 3, sizeof(uint32_t));
+          std::memcpy(&cfg.hash_length,
+                      record.value.data() + sizeof(uint32_t) * 4, sizeof(uint32_t));
+          std::memcpy(&cfg.target_ms,
+                      record.value.data() + sizeof(uint32_t) * 5, sizeof(uint32_t));
+          std::memcpy(cfg.salt.data(),
+                      record.value.data() + sizeof(uint32_t) * 6, cfg.salt.size());
+          cfg.version = qv::ToLittleEndian(cfg.version);
+          cfg.time_cost = qv::ToLittleEndian(cfg.time_cost);
+          cfg.memory_cost_kib = qv::ToLittleEndian(cfg.memory_cost_kib);
+          cfg.parallelism = qv::ToLittleEndian(cfg.parallelism);
+          cfg.hash_length = qv::ToLittleEndian(cfg.hash_length);
+          cfg.target_ms = qv::ToLittleEndian(cfg.target_ms);
+          parsed.argon2 = cfg;
+          parsed.have_argon2 = true;
+          parsed.algorithm = PasswordKdf::kArgon2id;
+          std::copy(cfg.salt.begin(), cfg.salt.end(), parsed.pbkdf_salt.begin());
+          break;
+        }
+        case kTlvTypeHybridSalt: {
+          if (record.value.size() != kHybridSaltSize) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0,
+                            std::string(qv::errors::msg::kHybridSaltMalformed)};
+          }
+          std::copy_n(record.value.data(), kHybridSaltSize, parsed.hybrid_salt.begin());
+          have_hybrid = true;
+          break;
+        }
+        case kTlvTypeEpoch: {
+          if (record.value.size() != sizeof(parsed.epoch_tlv.epoch)) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0,
+                            std::string(qv::errors::msg::kEpochMalformed)};
+          }
+          parsed.epoch_tlv.type = qv::ToLittleEndian16(kTlvTypeEpoch);
+          parsed.epoch_tlv.length =
+              qv::ToLittleEndian(CheckedCast<uint16_t>(record.value.size()));
+          std::memcpy(&parsed.epoch_tlv.epoch, record.value.data(),
+                      sizeof(parsed.epoch_tlv.epoch));
+          parsed.epoch_value = qv::FromLittleEndian32(parsed.epoch_tlv.epoch);
+          have_epoch = true;
+          break;
+        }
+        case kTlvTypePqcKem: {
+          const size_t expected = sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2;
+          if (record.value.size() != expected) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0,
+                            std::string(qv::errors::msg::kPqcMalformed)};
+          }
+          parsed.kem_blob.type = qv::ToLittleEndian16(kTlvTypePqcKem);
+          parsed.kem_blob.length = qv::ToLittleEndian16(CheckedCast<uint16_t>(expected));
+          std::memcpy(reinterpret_cast<uint8_t*>(&parsed.kem_blob) + sizeof(uint16_t) * 2,
+                      record.value.data(), expected);
+          parsed.kem_blob.version = qv::ToLittleEndian16(parsed.kem_blob.version);
+          parsed.kem_blob.kem_id = qv::ToLittleEndian16(parsed.kem_blob.kem_id);
+          have_pqc = true;
+          break;
+        }
+        case kTlvTypeReservedV2: {
+          if (record.value.size() > parsed.reserved_v2.payload.size()) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0,
+                            std::string(qv::errors::msg::kReservedMalformed)};
+          }
+          parsed.reserved_v2_present = record.value.size() > 0;
+          parsed.reserved_v2.type = qv::ToLittleEndian16(kTlvTypeReservedV2);
+          parsed.reserved_v2.length = CheckedCast<uint16_t>(record.value.size());
+          std::fill(parsed.reserved_v2.payload.begin(), parsed.reserved_v2.payload.end(), 0);
+          if (!record.value.empty()) {
+            std::copy(record.value.begin(), record.value.end(),
+                      parsed.reserved_v2.payload.begin());
+          }
+          break;
+        }
+        default:
+          break;
       }
-      uint16_t type_le = 0;
-      uint16_t length_le = 0;
-      std::memcpy(&type_le, parsed.payload.data() + offset, sizeof(type_le));
-      std::memcpy(&length_le, parsed.payload.data() + offset + sizeof(uint16_t), sizeof(length_le));
-      const uint16_t type = ToLittleEndian16(type_le);
-      const uint16_t length = ToLittleEndian16(length_le);
-      const size_t value_offset = offset + sizeof(uint16_t) * 2;
-      if (value_offset + length > payload_size) {
-        throw qv::Error{qv::ErrorDomain::Validation, 0, "Volume header truncated"};
-      }
-
-      const uint8_t* value = parsed.payload.data() + value_offset;
-
-      switch (type) {
-      case kTlvTypePbkdf2: {
-        if (length < sizeof(uint32_t)) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "PBKDF2 TLV malformed"};
-        }
-        std::memcpy(&parsed.pbkdf_iterations, value, sizeof(parsed.pbkdf_iterations));
-        parsed.pbkdf_iterations =
-            qv::ToLittleEndian(parsed.pbkdf_iterations); // TSK024_Key_Rotation_and_Lifecycle_Management
-        const size_t salt_bytes = length - sizeof(uint32_t);
-        if (salt_bytes != parsed.pbkdf_salt.size()) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "PBKDF2 salt length unexpected"};
-        }
-        std::memcpy(parsed.pbkdf_salt.data(), value + sizeof(uint32_t), salt_bytes);
-        have_pbkdf = true;
-        parsed.algorithm = PasswordKdf::kPbkdf2; // TSK036_PBKDF2_Argon2_Migration_Path
-        break;
-      }
-      case kTlvTypeArgon2: { // TSK036_PBKDF2_Argon2_Migration_Path
-        constexpr size_t kExpectedLength = sizeof(uint32_t) * 6 + kPbkdfSaltSize;
-        if (length != kExpectedLength) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Argon2 TLV malformed"};
-        }
-        Argon2Config cfg{};
-        std::memcpy(&cfg.version, value, sizeof(cfg.version));
-        std::memcpy(&cfg.time_cost, value + sizeof(uint32_t), sizeof(cfg.time_cost));
-        std::memcpy(&cfg.memory_cost_kib, value + sizeof(uint32_t) * 2, sizeof(cfg.memory_cost_kib));
-        std::memcpy(&cfg.parallelism, value + sizeof(uint32_t) * 3, sizeof(cfg.parallelism));
-        std::memcpy(&cfg.hash_length, value + sizeof(uint32_t) * 4, sizeof(cfg.hash_length));
-        std::memcpy(&cfg.target_ms, value + sizeof(uint32_t) * 5, sizeof(cfg.target_ms));
-        cfg.version = qv::ToLittleEndian(cfg.version);
-        cfg.time_cost = qv::ToLittleEndian(cfg.time_cost);
-        cfg.memory_cost_kib = qv::ToLittleEndian(cfg.memory_cost_kib);
-        cfg.parallelism = qv::ToLittleEndian(cfg.parallelism);
-        cfg.hash_length = qv::ToLittleEndian(cfg.hash_length);
-        cfg.target_ms = qv::ToLittleEndian(cfg.target_ms);
-        std::memcpy(cfg.salt.data(), value + sizeof(uint32_t) * 6, cfg.salt.size());
-        parsed.argon2 = cfg;
-        parsed.have_argon2 = true;
-        parsed.algorithm = PasswordKdf::kArgon2id;
-        std::copy(cfg.salt.begin(), cfg.salt.end(), parsed.pbkdf_salt.begin());
-        break;
-      }
-      case kTlvTypeHybridSalt: {
-        if (length != parsed.hybrid_salt.size()) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Hybrid salt TLV malformed"};
-        }
-        std::memcpy(parsed.hybrid_salt.data(), value, parsed.hybrid_salt.size());
-        have_hybrid = true;
-        break;
-      }
-      case kTlvTypeEpoch: {
-        if (length != sizeof(parsed.epoch_tlv.epoch)) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Epoch TLV malformed"};
-        }
-        if (value_offset < sizeof(uint16_t) * 2 ||
-            value_offset - sizeof(uint16_t) * 2 > parsed.payload.size() - sizeof(qv::core::EpochTLV)) { // TSK099_Input_Validation_and_Sanitization
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Epoch TLV truncated"};                         // TSK099_Input_Validation_and_Sanitization
-        }
-        const auto* epoch_tlv = reinterpret_cast<const qv::core::EpochTLV*>(
-            parsed.payload.data() + value_offset - sizeof(uint16_t) * 2);                                  // TSK099_Input_Validation_and_Sanitization
-        if (ToLittleEndian16(epoch_tlv->length) != sizeof(epoch_tlv->epoch)) {                             // TSK099_Input_Validation_and_Sanitization
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Epoch TLV length mismatch"};                   // TSK099_Input_Validation_and_Sanitization
-        }
-        parsed.epoch_tlv.type = ToLittleEndian16(kTlvTypeEpoch);
-        parsed.epoch_tlv.length = qv::ToLittleEndian(CheckedCast<uint16_t>(length));
-        std::memcpy(&parsed.epoch_tlv.epoch, value, sizeof(parsed.epoch_tlv.epoch));
-        parsed.epoch_value = qv::ToLittleEndian(parsed.epoch_tlv.epoch);
-        have_epoch = true;
-        break;
-      }
-      case kTlvTypePqcKem: {
-        if (length != sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "PQC TLV malformed"};
-        }
-        if (value_offset < sizeof(uint16_t) * 2 ||
-            value_offset - sizeof(uint16_t) * 2 > parsed.payload.size() - sizeof(qv::core::PQC_KEM_TLV)) { // TSK099_Input_Validation_and_Sanitization
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "PQC TLV truncated"};                            // TSK099_Input_Validation_and_Sanitization
-        }
-        const auto* pqc_tlv = reinterpret_cast<const qv::core::PQC_KEM_TLV*>(
-            parsed.payload.data() + value_offset - sizeof(uint16_t) * 2);                                   // TSK099_Input_Validation_and_Sanitization
-        if (ToLittleEndian16(pqc_tlv->length) != length) {                                                 // TSK099_Input_Validation_and_Sanitization
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "PQC TLV length mismatch"};                     // TSK099_Input_Validation_and_Sanitization
-        }
-        parsed.kem_blob.type = ToLittleEndian16(kTlvTypePqcKem);
-        parsed.kem_blob.length =
-            ToLittleEndian16(CheckedCast<uint16_t>(length)); // TSK024_Key_Rotation_and_Lifecycle_Management
-        std::memcpy(reinterpret_cast<uint8_t*>(&parsed.kem_blob) + sizeof(uint16_t) * 2, value,
-                    length);
-        parsed.kem_blob.version =
-            ToLittleEndian16(parsed.kem_blob.version); // TSK024_Key_Rotation_and_Lifecycle_Management
-        parsed.kem_blob.kem_id =
-            ToLittleEndian16(parsed.kem_blob.kem_id); // TSK024_Key_Rotation_and_Lifecycle_Management
-        have_pqc = true;
-        break;
-      }
-      case kTlvTypeReservedV2: {
-        if (length > parsed.reserved_v2.payload.size()) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Reserved TLV malformed"};
-        }
-        parsed.reserved_v2_present = length > 0;
-        parsed.reserved_v2.type = ToLittleEndian16(kTlvTypeReservedV2);
-        parsed.reserved_v2.length = CheckedCast<uint16_t>(length);
-        std::fill(parsed.reserved_v2.payload.begin(), parsed.reserved_v2.payload.end(), 0);
-        if (length > 0) {
-          std::memcpy(parsed.reserved_v2.payload.data(), value, length);
-        }
-        break;
-      }
-      default:
-        // TSK033 readers must skip unknown TLV types for forward compatibility
-        break;
-      }
-
-      offset = value_offset + length;
     }
 
-    if (offset != payload_size) {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unexpected trailing bytes in header"};
-    }
     if ((!have_pbkdf && !parsed.have_argon2) || !have_hybrid || !have_epoch || !have_pqc) {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Required TLV missing"};
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(qv::errors::msg::kRequiredTlvMissing)};
     }
 
-    return parsed; // TSK024_Key_Rotation_and_Lifecycle_Management
+    return parsed;
   }
 
   std::filesystem::path MetadataDirFor(
@@ -962,8 +884,8 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   qv::security::Zeroizer::ScopeWiper<uint8_t> classical_guard(classical_key.data(), classical_key.size());
 
   qv::core::EpochTLV epoch{};
-  epoch.type = ToLittleEndian16(kTlvTypeEpoch);
-  epoch.length = ToLittleEndian16(CheckedCast<uint16_t>(sizeof(epoch.epoch)));
+  epoch.type = qv::ToLittleEndian16(kTlvTypeEpoch);
+  epoch.length = qv::ToLittleEndian16(CheckedCast<uint16_t>(sizeof(epoch.epoch)));
   const uint32_t initial_epoch = 1;                                             // TSK099_Input_Validation_and_Sanitization
   if (initial_epoch >= qv::core::EpochOverflowWarningThreshold()) {             // TSK099_Input_Validation_and_Sanitization
     throw qv::Error{qv::ErrorDomain::Validation, 0,
