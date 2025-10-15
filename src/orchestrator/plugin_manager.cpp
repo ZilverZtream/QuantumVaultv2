@@ -17,6 +17,7 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include <thread> // TSK105_Resource_Leaks_and_Lifecycle
 
 #if !defined(_WIN32)
 #include <csignal>
@@ -785,7 +786,58 @@ PluginManager::PluginManager(std::vector<std::filesystem::path> search_paths) : 
 }
 
 PluginManager::~PluginManager() {
+#if !defined(_WIN32)
+  std::vector<pid_t> child_pids;                                  // TSK105_Resource_Leaks_and_Lifecycle
+  child_pids.reserve(loaded_.size());                             // TSK105_Resource_Leaks_and_Lifecycle
+  for (const auto& plugin : loaded_) {                            // TSK105_Resource_Leaks_and_Lifecycle
+    if (plugin && plugin->pid > 0) {                              // TSK105_Resource_Leaks_and_Lifecycle
+      child_pids.push_back(plugin->pid);                          // TSK105_Resource_Leaks_and_Lifecycle
+    }
+  }
+#endif
+
   UnloadAll();
+
+#if !defined(_WIN32)
+  const auto reap_timeout = std::chrono::seconds(5);              // TSK105_Resource_Leaks_and_Lifecycle
+  for (pid_t pid : child_pids) {                                  // TSK105_Resource_Leaks_and_Lifecycle
+    if (pid <= 0) {
+      continue;
+    }
+
+    bool reaped = false;
+    bool sigterm_sent = false;
+    const auto deadline = std::chrono::steady_clock::now() + reap_timeout;
+    while (!reaped && std::chrono::steady_clock::now() < deadline) {
+      pid_t rc = ::waitpid(pid, nullptr, WNOHANG);
+      if (rc == pid) {
+        reaped = true;
+        break;
+      }
+      if (rc < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        reaped = true;
+        break;
+      }
+      if (!sigterm_sent) {
+        ::kill(pid, SIGTERM);
+        sigterm_sent = true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    if (!reaped) {
+      ::kill(pid, SIGKILL);
+      while (::waitpid(pid, nullptr, 0) < 0) {
+        if (errno != EINTR) {
+          break;
+        }
+      }
+    }
+  }
+#endif
 }
 
 void PluginManager::AddSearchPath(std::filesystem::path path) {

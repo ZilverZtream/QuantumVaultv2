@@ -52,6 +52,11 @@ class ChunkCache {
     uint64_t version{0};
   };
 
+  struct LruNode { // TSK105_Resource_Leaks_and_Lifecycle
+    int64_t index{0};
+    std::weak_ptr<CachedChunk> chunk;
+  };
+
   struct EraseResult {
     std::shared_ptr<CachedChunk> chunk;
     uint64_t generation{0};
@@ -67,8 +72,8 @@ class ChunkCache {
   size_t current_size_{0};
 
   std::unordered_map<int64_t, CacheEntry> cache_;
-  std::list<int64_t> lru_list_;
-  std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_map_;
+  std::list<LruNode> lru_list_;                                    // TSK105_Resource_Leaks_and_Lifecycle
+  std::unordered_map<int64_t, std::list<LruNode>::iterator> lru_map_; // TSK105_Resource_Leaks_and_Lifecycle
 
   std::function<void(int64_t, const std::vector<uint8_t>&)> write_back_;
 
