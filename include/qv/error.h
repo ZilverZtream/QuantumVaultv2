@@ -3,6 +3,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>   // TSK109_Error_Code_Handling propagate context vectors
+#include <vector>    // TSK109_Error_Code_Handling retain error context stack
 
 namespace qv {
   // TSK020
@@ -52,6 +54,12 @@ namespace qv {
     return code >= ErrorDomainBase(domain) && code <= ErrorDomainMax(domain);
   }
 
+  enum class Retryability : std::uint8_t {  // TSK109_Error_Code_Handling
+    kFatal = 0,
+    kTransient,
+    kRetryable
+  };
+
   namespace errors {
     // Helper to construct reserved error codes. // TSK020
     inline constexpr int Make(ErrorDomain domain, int offset) {
@@ -83,9 +91,18 @@ namespace qv {
     ErrorDomain domain;
     int code;
     std::optional<int> native_code; // TSK027
-    explicit Error(ErrorDomain d, int c, const std::string& msg,
-                   std::optional<int> native = std::nullopt)
-        : std::runtime_error(msg), domain(d), code(c), native_code(native) {}
+    Retryability retryability{Retryability::kFatal};        // TSK109_Error_Code_Handling classify retries
+    std::vector<std::string> context;                       // TSK109_Error_Code_Handling preserve call stack
+    explicit Error(ErrorDomain d, int c, std::string msg,
+                   std::optional<int> native = std::nullopt,
+                   Retryability retry = Retryability::kFatal,
+                   std::vector<std::string> ctx = {})
+        : std::runtime_error(std::move(msg)),
+          domain(d),
+          code(c),
+          native_code(native),
+          retryability(retry),
+          context(std::move(ctx)) {}
   };
   struct AuthenticationFailureError : public std::runtime_error {
     explicit AuthenticationFailureError(const std::string& msg) : std::runtime_error(msg) {}

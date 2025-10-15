@@ -5,6 +5,7 @@
 #include <cstdint> // TSK107_Platform_Specific_Issues explicit 64-bit math
 #include <cstring>
 #include <filesystem>
+#include <iostream>   // TSK109_Error_Code_Handling surface rollback errors
 #include <fstream>
 #include <span>
 #include <system_error> // TSK098_Exception_Safety_and_Resource_Leaks
@@ -101,6 +102,10 @@ class ResizeRollbackGuard { // TSK098_Exception_Safety_and_Resource_Leaks
     if (!committed_) {
       std::error_code ec;
       std::filesystem::resize_file(path_, rollback_size_, ec);
+      if (ec) {
+        std::clog << "{\"event\":\"block_device_error\",\"message\":\"rollback resize failed\",\"error_code\":"
+                  << ec.value() << "}" << std::endl; // TSK109_Error_Code_Handling make failure visible
+      }
     }
   }
 
