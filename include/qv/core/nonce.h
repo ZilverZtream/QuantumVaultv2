@@ -155,6 +155,20 @@ namespace qv::core {
 
   inline constexpr std::array<uint8_t, 8> kAADContextChunkData = {'Q', 'V', 'C', 'H',
                                                                   'U', 'N', 'K', 'D'}; // TSK014
+
+  inline constexpr std::array<uint8_t, 8> BindChunkAADContext( // TSK083_AAD_Recompute_and_Binding
+      uint8_t cipher_id, uint8_t tag_size, uint8_t nonce_size) {
+    auto context = kAADContextChunkData;
+    context[0] ^= cipher_id;
+    context[1] ^= tag_size;
+    context[2] ^= nonce_size;
+    context[3] ^= static_cast<uint8_t>(cipher_id ^ tag_size);
+    context[4] ^= static_cast<uint8_t>(cipher_id ^ nonce_size);
+    context[5] ^= static_cast<uint8_t>(tag_size ^ nonce_size);
+    context[6] ^= static_cast<uint8_t>((cipher_id + tag_size) & 0xFFu);
+    context[7] ^= static_cast<uint8_t>((cipher_id + nonce_size) & 0xFFu);
+    return context;
+  }
   inline constexpr std::array<uint8_t, 8> kAADContextMetadata = {'Q', 'V', 'M', 'E',
                                                                  'T', 'A', 'D', 'T'}; // TSK014
   inline constexpr std::array<uint8_t, 8> kAADContextManifest = {'Q', 'V', 'M', 'A',
