@@ -32,7 +32,7 @@ NonceGenerator::NonceGenerator(uint32_t epoch, uint64_t start_counter)
   uint64_t persisted_next = (persisted == UINT64_MAX) ? UINT64_MAX : persisted + 1;
   uint64_t initial = has_entries ? std::max(start_counter, persisted_next) : start_counter;
   epoch_started_ = std::chrono::system_clock::now(); // TSK015
-  counter_.store(initial, std::memory_order_release);
+  counter_ = initial;  // TSK096_Race_Conditions_and_Thread_Safety
   base_counter_ = initial; // TSK015
   if (initial > kCounterHardLimit) { // TSK015
     throw Error{ErrorDomain::Security, 1, "Counter near overflow. Rekey required."};
@@ -61,44 +61,37 @@ NonceGenerator::RekeyReason NonceGenerator::DetermineRekeyReason(
 }
 
 NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated() {
-  std::lock_guard<std::mutex> lock(nonce_mutex_); // TSK067_Nonce_Safety
+  std::lock_guard<std::mutex> lock(state_mutex_); // TSK067_Nonce_Safety
   auto now = std::chrono::system_clock::now(); // TSK015
-  uint64_t next = 0;
-  while (true) { // TSK015
-    uint64_t current = counter_.load(std::memory_order_acquire);
-    if (current == std::numeric_limits<uint64_t>::max()) { // TSK067_Nonce_Safety
-      throw Error{ErrorDomain::Security, 6, "Counter exhausted. Rekey required."};
-    }
-    auto reason = DetermineRekeyReason(current, now); // TSK015
-    if (reason != RekeyReason::kNone) {
-      const char* msg = "Rekey required"; // TSK015
-      int code = 2; // TSK015
-      switch (reason) { // TSK015
-        case RekeyReason::kNone:
-          break;
-        case RekeyReason::kNonceBudget:
-          msg = "Nonce budget exhausted. Rekey required.";
-          code = 3;
-          break;
-        case RekeyReason::kEpochExpired:
-          msg = "Epoch lifetime exceeded. Rekey required.";
-          code = 4;
-          break;
-        case RekeyReason::kCounterLimit:
-          msg = "Counter near overflow. Rekey required.";
-          code = 5;
-          break;
-      }
-      throw Error{ErrorDomain::Security, code, msg};
-    }
-    uint64_t desired = current + 1;
-    if (counter_.compare_exchange_weak(current, desired,
-                                       std::memory_order_acq_rel,
-                                       std::memory_order_acquire)) {
-      next = current;
-      break;
-    }
+  if (counter_ == std::numeric_limits<uint64_t>::max()) { // TSK067_Nonce_Safety
+    throw Error{ErrorDomain::Security, 6, "Counter exhausted. Rekey required."};
   }
+  auto reason = DetermineRekeyReason(counter_, now); // TSK015
+  if (reason != RekeyReason::kNone) {
+    const char* msg = "Rekey required"; // TSK015
+    int code = 2; // TSK015
+    switch (reason) { // TSK015
+      case RekeyReason::kNone:
+        break;
+      case RekeyReason::kNonceBudget:
+        msg = "Nonce budget exhausted. Rekey required.";
+        code = 3;
+        break;
+      case RekeyReason::kEpochExpired:
+        msg = "Epoch lifetime exceeded. Rekey required.";
+        code = 4;
+        break;
+      case RekeyReason::kCounterLimit:
+        msg = "Counter near overflow. Rekey required.";
+        code = 5;
+        break;
+    }
+    throw Error{ErrorDomain::Security, code, msg};
+  }
+
+  uint64_t next = counter_;
+  counter_ += 1;  // TSK096_Race_Conditions_and_Thread_Safety
+
   auto mac = log_.Append(next); // TSK014
   NonceRecord record{}; // TSK014
   record.counter = next; // TSK014
@@ -123,26 +116,31 @@ NonceGenerator::Status NonceGenerator::EvaluateStatus(
     std::chrono::system_clock::time_point now) const { // TSK015
   Status status{};
   status.now = now;
-  status.epoch_started = epoch_started_;
-  status.counter = counter_.load(std::memory_order_acquire);
-  status.reason = DetermineRekeyReason(status.counter, now);
-  status.nonces_emitted = status.counter >= base_counter_ ? status.counter - base_counter_ : 0;
-  if (policy_.max_nonces != 0 && status.nonces_emitted < policy_.max_nonces) {
-    status.remaining_nonce_budget = policy_.max_nonces - status.nonces_emitted;
-  } else {
-    status.remaining_nonce_budget = 0;
-  }
-  if (status.reason == RekeyReason::kCounterLimit) {
-    status.remaining_nonce_budget = 0;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
+    status.epoch_started = epoch_started_;
+    status.counter = counter_;
+    status.reason = DetermineRekeyReason(status.counter, now);
+    status.nonces_emitted = status.counter >= base_counter_ ? status.counter - base_counter_ : 0;
+    if (policy_.max_nonces != 0 && status.nonces_emitted < policy_.max_nonces) {
+      status.remaining_nonce_budget = policy_.max_nonces - status.nonces_emitted;
+    } else {
+      status.remaining_nonce_budget = 0;
+    }
+    if (status.reason == RekeyReason::kCounterLimit) {
+      status.remaining_nonce_budget = 0;
+    }
   }
   return status;
 }
 
 void NonceGenerator::SetEpochStart(std::chrono::system_clock::time_point start) { // TSK015
+  std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
   epoch_started_ = start;
 }
 
 void NonceGenerator::SetPolicy(uint64_t max_nonces, std::chrono::hours max_age) { // TSK015
+  std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
   policy_.max_nonces = max_nonces;
   policy_.max_age = max_age;
 }

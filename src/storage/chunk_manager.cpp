@@ -311,26 +311,38 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
 QV_SENSITIVE_END
 
 void ChunkManager::HandleSequentialRead(int64_t chunk_index) {
-  std::unique_lock lock(sequential_mutex_);
-  if (last_read_chunk_ >= 0 && chunk_index == last_read_chunk_ + 1) {
-    sequential_read_count_ += 1;
-  } else if (chunk_index == last_read_chunk_) {
-    // repeated read of same chunk keeps streak intact
-  } else {
-    sequential_read_count_ = 1;
-  }
+  ReadAheadManager* read_ahead_ptr = nullptr;  // TSK096_Race_Conditions_and_Thread_Safety
+  uint64_t request_offset = 0;
+  size_t request_count = 0;
+  bool should_request = false;
 
-  if (sequential_read_count_ >= 3 && read_ahead_) {
-    int64_t start_chunk = chunk_index + 1;
-    if (start_chunk >= read_ahead_window_end_) {
-      read_ahead_window_end_ = start_chunk + 8;
-      lock.unlock();
-      read_ahead_->RequestReadAhead(static_cast<uint64_t>(start_chunk) * kChunkPayloadSize, 8);
-      lock.lock();
+  {
+    std::unique_lock lock(sequential_mutex_);
+    if (last_read_chunk_ >= 0 && chunk_index == last_read_chunk_ + 1) {
+      sequential_read_count_ += 1;
+    } else if (chunk_index == last_read_chunk_) {
+      // repeated read of same chunk keeps streak intact
+    } else {
+      sequential_read_count_ = 1;
     }
+
+    if (sequential_read_count_ >= 3 && read_ahead_) {
+      int64_t start_chunk = chunk_index + 1;
+      if (start_chunk >= read_ahead_window_end_) {
+        read_ahead_window_end_ = start_chunk + 8;
+        read_ahead_ptr = read_ahead_.get();
+        request_offset = static_cast<uint64_t>(start_chunk) * kChunkPayloadSize;
+        request_count = 8;
+        should_request = true;
+      }
+    }
+
+    last_read_chunk_ = chunk_index;
   }
 
-  last_read_chunk_ = chunk_index;
+  if (should_request && read_ahead_ptr) {
+    read_ahead_ptr->RequestReadAhead(request_offset, request_count);
+  }
 }
 
 }  // namespace qv::storage
