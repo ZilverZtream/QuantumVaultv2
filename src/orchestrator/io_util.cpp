@@ -1,12 +1,15 @@
 #include "qv/orchestrator/io_util.h"
 
 #include <cerrno>
+#include <chrono>   // TSK101_File_IO_Persistence_and_Atomicity retry backoff
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
-#include <string>
+#include <iostream> // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
 #include <span>
+#include <string>
 #include <system_error>
+#include <thread> // TSK101_File_IO_Persistence_and_Atomicity retry backoff
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -52,8 +55,9 @@ bool NativeRename(const std::filesystem::path& from,
 
 void SyncDirectory(const std::filesystem::path& dir) { // TSK068_Atomic_Header_Writes ensure metadata durability
   HANDLE handle = ::CreateFileW(
-      dir.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr);
+      dir.c_str(), GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr);
   if (handle == INVALID_HANDLE_VALUE) {
     throw Error{ErrorDomain::IO, static_cast<int>(::GetLastError()),
                 kAtomicReplaceErrorMessage};
@@ -100,12 +104,46 @@ void SyncDirectory(const std::filesystem::path& dir) { // TSK068_Atomic_Header_W
 
 #endif
 
+bool IsTransientFsyncError(int err) { // TSK101_File_IO_Persistence_and_Atomicity classify retryable failures
+#ifdef _WIN32
+  return err == EINTR || err == EAGAIN;
+#else
+  return err == EINTR || err == EAGAIN || err == EBUSY;
+#endif
+}
+
+void SyncFileWithRetry(int fd) { // TSK101_File_IO_Persistence_and_Atomicity durability retry loop
+  constexpr int kMaxRetries = 4;
+  std::chrono::milliseconds backoff{5};
+  for (int attempt = 0;; ++attempt) {
+    if (NativeFsync(fd) == 0) {
+      return;
+    }
+    int err = errno;
+    if (err == EINTR) {
+      continue;
+    }
+    if (attempt >= kMaxRetries || !IsTransientFsyncError(err)) {
+      throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
+    }
+    std::this_thread::sleep_for(backoff);
+    backoff *= 2;
+  }
+}
+
 void WriteAll(int fd, std::span<const uint8_t> payload) { // TSK068_Atomic_Header_Writes
   size_t written = 0;
   while (written < payload.size()) {
     auto chunk = NativeWrite(fd, payload.data() + written, payload.size() - written);
     if (chunk < 0) {
-      throw Error{ErrorDomain::IO, errno, kAtomicReplaceErrorMessage};
+      int err = errno;
+      if (err == EINTR) { // TSK101_File_IO_Persistence_and_Atomicity retry interrupted writes
+        continue;
+      }
+      throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
+    }
+    if (chunk == 0) {
+      throw Error{ErrorDomain::IO, 0, kAtomicReplaceErrorMessage}; // TSK101_File_IO_Persistence_and_Atomicity short write
     }
     written += static_cast<size_t>(chunk);
   }
@@ -119,7 +157,10 @@ class TempFileGuard { // TSK068_Atomic_Header_Writes ensure cleanup on failure
   ~TempFileGuard() noexcept {
     if (!path_.empty()) {
       std::error_code ec;
-      std::filesystem::remove(path_, ec);
+      if (!std::filesystem::remove(path_, ec) && ec) { // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
+        std::cerr << "TempFileGuard cleanup failed for " << path_ << ": " << ec.message()
+                  << '\n';
+      }
     }
   }
 
@@ -160,9 +201,7 @@ void AtomicReplace(const std::filesystem::path& target, std::span<const uint8_t>
 
   try {
     WriteAll(fd, payload);
-    if (NativeFsync(fd) != 0) {
-      throw Error{ErrorDomain::IO, errno, kAtomicReplaceErrorMessage};
-    }
+    SyncFileWithRetry(fd);
   } catch (...) {
     NativeClose(fd);
     throw;
@@ -184,6 +223,10 @@ void AtomicReplace(const std::filesystem::path& target, std::span<const uint8_t>
     }
 #endif
     throw Error{ErrorDomain::IO, err, kAtomicReplaceErrorMessage};
+  }
+  std::error_code verify_ec;
+  if (!std::filesystem::exists(target, verify_ec) || verify_ec) { // TSK101_File_IO_Persistence_and_Atomicity verify rename
+    throw Error{ErrorDomain::IO, verify_ec ? verify_ec.value() : 0, kAtomicReplaceErrorMessage};
   }
   cleanup.Release();
 
