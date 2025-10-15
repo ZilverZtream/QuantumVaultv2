@@ -198,6 +198,20 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   if (ciphertext.size() != kPayloadSize) {
     throw Error{ErrorDomain::Validation, 0, "Ciphertext must be exactly one chunk"};
   }
+  if (header.chunk_index < 0) {  // TSK108_Data_Structure_Invariants guard invalid chunk indices
+    throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};
+  }
+  const uint64_t chunk_index_u = static_cast<uint64_t>(header.chunk_index);
+  if (chunk_index_u > std::numeric_limits<uint64_t>::max() / kPayloadSize) {
+    throw Error{ErrorDomain::Validation, 0, "Logical offset overflow"};
+  }
+  const uint64_t expected_offset = chunk_index_u * kPayloadSize;  // TSK108_Data_Structure_Invariants
+  if (header.logical_offset != expected_offset) {
+    throw Error{ErrorDomain::Validation, 0, "Header logical offset mismatch"};
+  }
+  if (header.epoch != epoch_) {  // TSK108_Data_Structure_Invariants bind to nonce generator epoch
+    throw Error{ErrorDomain::Validation, 0, "Chunk epoch mismatch"};
+  }
   std::scoped_lock lock(io_mutex_);
   EnsureOpenUnlocked();
   auto offset = OffsetForChunk(header.chunk_index);
@@ -266,6 +280,9 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
 }
 
 ChunkReadResult BlockDevice::ReadChunk(int64_t chunk_index) {
+  if (chunk_index < 0) {  // TSK108_Data_Structure_Invariants prevent negative indices
+    throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};
+  }
   std::scoped_lock lock(io_mutex_);
   EnsureOpenUnlocked();
   auto offset = OffsetForChunk(chunk_index);
@@ -284,6 +301,19 @@ ChunkReadResult BlockDevice::ReadChunk(int64_t chunk_index) {
     throw Error{ErrorDomain::IO, 0, "Failed to read chunk payload"};
   }
   VerifyHeaderCRCOrThrow(result.header);  // TSK078_Chunk_Integrity_and_Bounds
+  if (result.header.chunk_index != chunk_index) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk index mismatch"};  // TSK108_Data_Structure_Invariants
+  }
+  if (result.header.epoch != epoch_) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk epoch mismatch"};
+  }
+  const uint64_t chunk_index_u = static_cast<uint64_t>(chunk_index);
+  if (chunk_index_u > std::numeric_limits<uint64_t>::max() / kPayloadSize) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk logical offset overflow"};
+  }
+  if (result.header.logical_offset != chunk_index_u * kPayloadSize) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk logical offset mismatch"};
+  }
   return result;
 }
 
