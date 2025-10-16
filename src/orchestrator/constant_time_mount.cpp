@@ -37,6 +37,7 @@
 #include "qv/crypto/pbkdf2.h"  // TSK111_Code_Duplication_and_Maintainability shared PBKDF2
 #include "qv/orchestrator/event_bus.h"  // TSK019
 #include "qv/orchestrator/ipc_lock.h"   // TSK075_Lockout_Persistence_and_IPC
+#include "qv/orchestrator/password_policy.h" // TSK135_Password_Complexity_Enforcement shared policy
 #include "qv/errors.h"  // TSK111_Code_Duplication_and_Maintainability centralized errors
 #include "qv/tlv/parser.h"  // TSK111_Code_Duplication_and_Maintainability TLV iteration
 #include "qv/security/zeroizer.h"
@@ -105,18 +106,8 @@ To CheckedCast(From value) { // TSK099_Input_Validation_and_Sanitization
   return static_cast<To>(value);
 }
 
-void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_and_Sanitization
-  constexpr size_t kMinPasswordLen = 8;
-  constexpr size_t kMaxPasswordLen = 1024;
-  const auto size = password.size();
-  if (size < kMinPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordTooShort)};
-  }
-  if (size > kMaxPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordTooLong)};
-  }
+void ValidatePassword(const std::string& password) { // TSK135_Password_Complexity_Enforcement centralized enforcement
+  EnforcePasswordPolicy(password);
 }
 
 std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sanitization

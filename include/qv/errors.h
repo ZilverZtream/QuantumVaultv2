@@ -6,6 +6,12 @@ namespace qv::errors::msg {
 // TSK111_Code_Duplication_and_Maintainability centralized message catalog
 inline constexpr std::string_view kPasswordTooShort{"Password too short"};
 inline constexpr std::string_view kPasswordTooLong{"Password too long"};
+inline constexpr std::string_view kPasswordComplexityMissing{"Password must include uppercase, lowercase, numeric, and special characters"}; // TSK135_Password_Complexity_Enforcement
+inline constexpr std::string_view kPasswordEntropyTooLow{"Password entropy too low"}; // TSK135_Password_Complexity_Enforcement
+inline constexpr std::string_view kPasswordTooCommon{"Password appears in common password list"}; // TSK135_Password_Complexity_Enforcement
+inline constexpr std::string_view kPasswordCommonListUnavailable{"Unable to load common password list"}; // TSK135_Password_Complexity_Enforcement
+inline constexpr std::string_view kPasswordReused{"Password has been used previously"}; // TSK135_Password_Complexity_Enforcement
+inline constexpr std::string_view kPasswordHistoryPersistFailed{"Failed to persist password history"}; // TSK135_Password_Complexity_Enforcement
 inline constexpr std::string_view kUnableToResolveWorkingDirectory{"Unable to resolve working directory"};
 inline constexpr std::string_view kUnableToCanonicalizeContainerRoot{"Unable to canonicalize container root"};
 inline constexpr std::string_view kFailedToCanonicalizeContainerPath{"Failed to canonicalize container path"};

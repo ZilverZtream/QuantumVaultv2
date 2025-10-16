@@ -163,6 +163,7 @@ add_library(qv_orchestrator
     src/orchestrator/ipc_lock.cpp
     src/orchestrator/plugin_manager.cpp
     src/orchestrator/volume_manager.cpp
+    src/orchestrator/password_policy.cpp
     src/orchestrator/io_util.cpp # TSK068_Atomic_Header_Writes durability helper
     src/orchestrator/event_bus.cpp
     src/tlv/parser.cpp # TSK111_Code_Duplication_and_Maintainability reusable TLV parser

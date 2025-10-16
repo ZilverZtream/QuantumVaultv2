@@ -33,6 +33,7 @@
 #include "qv/errors.h"  // TSK111_Code_Duplication_and_Maintainability centralized messages
 #include "qv/orchestrator/event_bus.h" // TSK024_Key_Rotation_and_Lifecycle_Management
 #include "qv/orchestrator/io_util.h"   // TSK068_Atomic_Header_Writes atomic persistence
+#include "qv/orchestrator/password_policy.h" // TSK135_Password_Complexity_Enforcement shared policy
 #include "qv/orchestrator/header_serializer.h"  // TSK111_Code_Duplication_and_Maintainability
 #include "qv/security/secure_buffer.h" // TSK097_Cryptographic_Key_Management secure allocator for secrets
 #include "qv/security/zeroizer.h"
@@ -104,18 +105,116 @@ To CheckedCast(From value) { // TSK099_Input_Validation_and_Sanitization
   return static_cast<To>(value);
 }
 
-void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_and_Sanitization
-  constexpr size_t kMinPasswordLen = 8;
-  constexpr size_t kMaxPasswordLen = 1024;
-  const auto size = password.size();
-  if (size < kMinPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordTooShort)};
+void ValidatePassword(const std::string& password) { // TSK135_Password_Complexity_Enforcement centralized enforcement
+  EnforcePasswordPolicy(password);
+}
+
+constexpr std::size_t kPasswordHistoryDepth = 5; // TSK135_Password_Complexity_Enforcement rotation window
+
+std::filesystem::path PasswordHistoryPath(const std::filesystem::path& container) { // TSK135_Password_Complexity_Enforcement
+  auto history_path = container;
+  history_path += ".history";
+  return history_path;
+}
+
+std::string BytesToHexLower(std::span<const uint8_t> bytes) { // TSK135_Password_Complexity_Enforcement utility hex encoder
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string encoded;
+  encoded.reserve(bytes.size() * 2);
+  for (auto byte : bytes) {
+    encoded.push_back(kHex[byte >> 4]);
+    encoded.push_back(kHex[byte & 0x0F]);
   }
-  if (size > kMaxPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordTooLong)};
+  return encoded;
+}
+
+std::string HashPasswordForHistory(const std::filesystem::path& container,
+                                   const std::string& password) { // TSK135_Password_Complexity_Enforcement
+  const auto container_utf8 = qv::PathToUtf8String(container);
+  std::vector<uint8_t> material;
+  material.reserve(container_utf8.size() + password.size() + 1);
+  material.insert(material.end(), container_utf8.begin(), container_utf8.end());
+  material.push_back(0x00);
+  material.insert(material.end(), password.begin(), password.end());
+  auto digest = qv::crypto::SHA256_Hash(std::span<const uint8_t>(material.data(), material.size()));
+  return BytesToHexLower(std::span<const uint8_t>(digest.data(), digest.size()));
+}
+
+std::vector<std::string> LoadPasswordHistory(const std::filesystem::path& container) { // TSK135_Password_Complexity_Enforcement
+  std::vector<std::string> history;
+  const auto path = PasswordHistoryPath(container);
+  std::error_code exists_ec;
+  if (!std::filesystem::exists(path, exists_ec) || exists_ec) {
+    return history;
   }
+
+  std::ifstream in(path);
+  if (!in) {
+    const int err = errno;
+    throw qv::Error{qv::ErrorDomain::IO, err,
+                    std::string(qv::errors::msg::kPasswordHistoryPersistFailed) + ": open"};
+  }
+
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    std::size_t begin = line.find_first_not_of(" \t");
+    if (begin == std::string::npos) {
+      continue;
+    }
+    if (line[begin] == '#') {
+      continue;
+    }
+    std::size_t end = line.find_last_not_of(" \t");
+    history.emplace_back(line.substr(begin, end - begin + 1));
+  }
+
+  if (in.bad()) {
+    const int err = errno;
+    throw qv::Error{qv::ErrorDomain::IO, err,
+                    std::string(qv::errors::msg::kPasswordHistoryPersistFailed) + ": read"};
+  }
+  return history;
+}
+
+void AppendHistoryEntry(std::vector<std::string>& history, const std::string& entry) { // TSK135_Password_Complexity_Enforcement
+  auto existing = std::find(history.begin(), history.end(), entry);
+  if (existing != history.end()) {
+    history.erase(existing);
+  }
+  history.push_back(entry);
+  if (history.size() > kPasswordHistoryDepth) {
+    history.erase(history.begin(), history.begin() + (history.size() - kPasswordHistoryDepth));
+  }
+}
+
+void PersistPasswordHistory(const std::filesystem::path& container,
+                            const std::vector<std::string>& history) { // TSK135_Password_Complexity_Enforcement
+  std::string serialized = "# TSK135_Password_Complexity_Enforcement\n";
+  for (const auto& entry : history) {
+    serialized.append(entry);
+    serialized.push_back('\n');
+  }
+  std::vector<uint8_t> payload(serialized.begin(), serialized.end());
+  try {
+    AtomicReplace(PasswordHistoryPath(container), std::span<const uint8_t>(payload.data(), payload.size()));
+  } catch (const qv::Error& err) {
+    throw qv::Error{err.domain(), err.code(),
+                    std::string(qv::errors::msg::kPasswordHistoryPersistFailed) + ": " + err.what()};
+  }
+}
+
+std::string EnsurePasswordNotReused(const std::filesystem::path& container,
+                                    const std::vector<std::string>& history,
+                                    const std::string& password) { // TSK135_Password_Complexity_Enforcement
+  const auto hashed = HashPasswordForHistory(container, password);
+  if (std::find(history.begin(), history.end(), hashed) != history.end()) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordReused)};
+  }
+  return hashed;
 }
 
 std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sanitization
@@ -946,6 +1045,10 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
                     "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
   }
 
+  auto history = LoadPasswordHistory(sanitized_container); // TSK135_Password_Complexity_Enforcement seed history
+  AppendHistoryEntry(history, HashPasswordForHistory(sanitized_container, password));
+  PersistPasswordHistory(sanitized_container, history);
+
   qv::orchestrator::Event created{}; // TSK029
   created.category = EventCategory::kLifecycle;
   created.severity = EventSeverity::kInfo;
@@ -1082,6 +1185,12 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
 
+  auto history = LoadPasswordHistory(sanitized_container); // TSK135_Password_Complexity_Enforcement maintain rotation ledger
+  AppendHistoryEntry(history, HashPasswordForHistory(sanitized_container, current_password));
+  PersistPasswordHistory(sanitized_container, history);
+  const auto new_history_entry =
+      EnsurePasswordNotReused(sanitized_container, history, new_password); // TSK135_Password_Complexity_Enforcement reuse guard
+
   const uint32_t old_epoch = parsed.epoch_value; // TSK024_Key_Rotation_and_Lifecycle_Management
   const uint32_t warning_threshold = qv::core::EpochOverflowWarningThreshold(); // TSK071_Epoch_Overflow_Safety shared policy
   const uint32_t unsafe_threshold = qv::core::EpochOverflowUnsafeThreshold();   // TSK071_Epoch_Overflow_Safety shared policy
@@ -1195,6 +1304,9 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
     throw qv::Error{err.domain(), err.code(),
                     "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
   }
+
+  AppendHistoryEntry(history, new_history_entry); // TSK135_Password_Complexity_Enforcement record new credential
+  PersistPasswordHistory(sanitized_container, history);
 
   std::optional<std::filesystem::path> backup_path; // TSK024_Key_Rotation_and_Lifecycle_Management
   if (backup_public_key) {
