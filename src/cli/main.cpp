@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream> // TSK028_Secure_Deletion_and_Data_Remanence
 #include <iomanip> // TSK032_Backup_Recovery_and_Disaster_Recovery
+#include <exception> // TSK116_Incorrect_Error_Propagation suppress diagnostics fanout
 #include <iostream>
 #include <memory>   // TSK082_Backup_Verification_and_Schema
 #include <optional>
@@ -1316,7 +1317,15 @@ namespace {
       event.fields.emplace_back("native_code", std::to_string(*err.native_code),
                                 qv::orchestrator::FieldPrivacy::kHash, true);
     }
-    qv::orchestrator::EventBus::Instance().Publish(event);
+    try {
+      qv::orchestrator::EventBus::Instance().Publish(event);
+    } catch (const std::exception& publish_error) {
+      std::clog << "{\"event\":\"eventbus_error\",\"message\":\"error report publish failed\",\"detail\":\""
+                << publish_error.what() << "\"}" << std::endl; // TSK116_Incorrect_Error_Propagation do not terminate on diagnostics
+    } catch (...) {
+      std::clog << "{\"event\":\"eventbus_error\",\"message\":\"error report publish failed\",\"detail\":\"unknown\"}"
+                << std::endl; // TSK116_Incorrect_Error_Propagation suppress unexpected exceptions
+    }
   }
 
   int ExitCodeFor(const qv::Error& err) {
@@ -1819,9 +1828,10 @@ namespace {
     }
     struct FileGuard { // TSK028_Secure_Deletion_and_Data_Remanence
       int fd;
-      ~FileGuard() {
+      ~FileGuard() noexcept {
         if (fd >= 0) {
-          NativeClose(fd);
+          (void)NativeClose(fd);
+          fd = -1; // TSK116_Incorrect_Error_Propagation guarantee fd released during unwinding
         }
       }
     } guard{fd};
