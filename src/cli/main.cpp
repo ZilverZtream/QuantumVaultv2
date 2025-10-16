@@ -927,7 +927,8 @@ namespace {
     if (value.empty()) {
       return std::nullopt;
     }
-    constexpr uint32_t kMaxMigrationVersion = 0x040100u; // TSK129_Unvalidated_User_Input_in_CLI
+    constexpr uint32_t kMaxMigrationVersion =
+        qv::orchestrator::VolumeManager::kLatestHeaderVersion; // TSK129_Unvalidated_User_Input_in_CLI honor backend ceiling
     if (value.find('.') != std::string_view::npos) {      // TSK129_Unvalidated_User_Input_in_CLI
       std::array<uint64_t, 3> components{0, 0, 0};
       std::string_view remaining = value;
