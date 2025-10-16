@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>   // TSK116_Incorrect_Error_Propagation propagate validation errno details
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -15,7 +16,6 @@
 #include <vector>
 
 #if defined(__linux__)
-#include <cerrno>
 #include <unistd.h>
 #endif
 
@@ -62,9 +62,17 @@ constexpr uint64_t kChunkPayloadSize = storage::kChunkSize;
 
 #if defined(__linux__)
 int FuseErrorFrom(const qv::Error& error) {
+  // TSK116_Incorrect_Error_Propagation surface native error mapping when available
+  if (error.native_code.has_value() && *error.native_code != 0) {
+    const int native = *error.native_code;
+    return native < 0 ? native : -native;
+  }
   // TSK084_WinFSP_Normalization_and_Traversal normalize errno mapping for validation failures
   if (error.domain == qv::ErrorDomain::Validation) {
     return -EINVAL;
+  }
+  if (error.domain == qv::ErrorDomain::IO) {
+    return -EIO;
   }
   return -EIO;
 }
@@ -79,15 +87,18 @@ std::string NormalizePath(const std::string& raw_path) {
   std::replace(cleaned.begin(), cleaned.end(), '\\', '/');
 
   if (cleaned.find(':') != std::string::npos) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Drive-qualified paths are not allowed"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Drive-qualified paths are not allowed", EINVAL}; // TSK116_Incorrect_Error_Propagation propagate errno for validation
   }
   if (cleaned.size() >= 2 && cleaned[0] == '/' && cleaned[1] == '/') {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "UNC paths are not allowed"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "UNC paths are not allowed", EINVAL};
   }
 
   std::filesystem::path fs_path(cleaned);
   if (fs_path.has_root_name()) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Rooted paths are not allowed"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Rooted paths are not allowed", EINVAL};
   }
 
   auto normalized = fs_path.lexically_normal();
@@ -117,12 +128,14 @@ std::string NormalizePath(const std::string& raw_path) {
     if (len > 0) {
       auto segment = result.substr(pos, len);
       if (segment == "..") {
-        throw qv::Error{qv::ErrorDomain::Validation, 0, "Path traversal outside root is not allowed"};
+        throw qv::Error{qv::ErrorDomain::Validation, 0,
+                        "Path traversal outside root is not allowed", EINVAL};
       }
       if (segment != ".") {
         ++depth;
         if (depth > kMaxPathDepth) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Path depth exceeds maximum"};
+          throw qv::Error{qv::ErrorDomain::Validation, 0,
+                          "Path depth exceeds maximum", EINVAL};
         }
       }
     }
@@ -133,7 +146,8 @@ std::string NormalizePath(const std::string& raw_path) {
   }
 
   if (result.size() > kMaxPathLength) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Path length exceeds maximum"};
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Path length exceeds maximum", EINVAL};
   }
 
   return result;

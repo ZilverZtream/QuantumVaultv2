@@ -177,10 +177,12 @@ const struct fuse_operations kOperations = {
 }  // namespace
 
 FUSEAdapter::FUSEAdapter(std::shared_ptr<storage::BlockDevice> device)
-    : filesystem_(std::make_unique<VolumeFilesystem>(std::move(device))) {
+    : filesystem_(nullptr) {
+  auto filesystem = std::make_unique<VolumeFilesystem>(std::move(device));
   g_inflight_calls.store(0, std::memory_order_release);
   g_draining.store(false, std::memory_order_release);
-  g_filesystem.store(filesystem_.get(), std::memory_order_release);
+  filesystem_ = std::move(filesystem);
+  g_filesystem.store(filesystem_.get(), std::memory_order_release); // TSK116_Incorrect_Error_Propagation ensure global set post-construction
 }
 
 FUSEAdapter::~FUSEAdapter() {

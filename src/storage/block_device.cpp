@@ -4,10 +4,12 @@
 #include <array>
 #include <cstdint> // TSK107_Platform_Specific_Issues explicit 64-bit math
 #include <cstring>
+#include <exception> // TSK116_Incorrect_Error_Propagation preserve original failure details
 #include <filesystem>
 #include <iostream>   // TSK109_Error_Code_Handling surface rollback errors
 #include <fstream>
 #include <span>
+#include <string>     // TSK116_Incorrect_Error_Propagation enrich rollback diagnostics
 #include <system_error> // TSK098_Exception_Safety_and_Resource_Leaks
 #include <limits>       // TSK100_Integer_Overflow_and_Arithmetic overflow guards
 #include <vector>
@@ -265,6 +267,9 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   try {
     write_buffer(offset);
   } catch (...) {
+    const std::exception_ptr original = std::current_exception();
+    bool rollback_failed = false;
+    std::string rollback_message;
     if (!previous_record.empty()) {
       try {
         file_.clear();
@@ -274,11 +279,28 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
                       static_cast<std::streamsize>(previous_record.size()));
           file_.flush();
         }
+      } catch (const std::exception& rollback_error) {
+        rollback_failed = true;
+        rollback_message = rollback_error.what();
       } catch (...) {
-        // Swallow secondary failure and rethrow original error.
+        rollback_failed = true;
+        rollback_message = "unknown rollback error"; // TSK116_Incorrect_Error_Propagation capture secondary failure
       }
     }
-    throw;
+    if (rollback_failed) {
+      try {
+        std::rethrow_exception(original);
+      } catch (const Error& error) {
+        auto context = error.context;
+        context.emplace_back("rollback_restore_failed");
+        auto message = std::string(error.what()) + " (rollback failed: " + rollback_message + ")";
+        throw Error{error.domain, error.code, std::move(message), error.native_code, error.retryability,
+                    std::move(context)}; // TSK116_Incorrect_Error_Propagation preserve rollback diagnostics
+      } catch (...) {
+        std::rethrow_exception(original);
+      }
+    }
+    std::rethrow_exception(original);
   }
   std::filesystem::resize_file(path_, final_size);  // TSK078_Chunk_Integrity_and_Bounds
   rollback.Commit();
