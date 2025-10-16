@@ -1580,6 +1580,7 @@ class SyslogPublisher { // TSK029
   int socket_{-1};
 #endif
   bool configured_{false};
+  bool ready_{false};                                          // TSK144_Network_Protocol_Security_Issues track TLS session state
   std::string hostname_ = DetectHostname();
   std::string app_name_ = "quantumvault";
   std::string procid_ = DetectProcessId();
@@ -1616,7 +1617,7 @@ void SyslogPublisher::ResetTransport() { // TSK144_Network_Protocol_Security_Iss
     socket_ = -1;
   }
 #endif
-  configured_ = false;
+  ready_ = false;                                              // TSK144_Network_Protocol_Security_Issues preserve configuration on failure
 }
 
 bool SyslogPublisher::VerifyCertificatePin() { // TSK144_Network_Protocol_Security_Issues pin enforcement
@@ -1692,7 +1693,7 @@ bool SyslogPublisher::VerifyCertificatePin() { // TSK144_Network_Protocol_Securi
 }
 
 bool SyslogPublisher::EnsureConnected(std::chrono::steady_clock::time_point attempt_time, std::string* error) { // TSK144_Network_Protocol_Security_Issues reconnect
-  if (ssl_ && configured_) {
+  if (ssl_ && ready_) {
     return true;
   }
   ResetTransport();
@@ -1862,6 +1863,7 @@ bool SyslogPublisher::EnsureConnected(std::chrono::steady_clock::time_point atte
     return false;
   }
   configured_ = true;
+  ready_ = true;                                               // TSK144_Network_Protocol_Security_Issues resume retries after reconnect
   backoff_exp_ = 0;
   next_allowed_send_ = attempt_time;
   return true;
