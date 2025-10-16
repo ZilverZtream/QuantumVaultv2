@@ -96,6 +96,13 @@ ChunkManager::ChunkManager(const std::filesystem::path& container,
   read_ahead_ = std::make_unique<ReadAheadManager>(*this, cache_);
 }
 
+ChunkManager::~ChunkManager() {
+  qv::security::Zeroizer::Wipe(
+      std::span<uint8_t>(data_key_.data(), data_key_.size())); // TSK125_Missing_Secure_Deletion_for_Keys
+  qv::security::Zeroizer::Wipe(
+      std::span<uint8_t>(master_key_.data(), master_key_.size())); // TSK125_Missing_Secure_Deletion_for_Keys
+}
+
 std::vector<uint8_t> ChunkManager::MakeNonce(const qv::core::NonceGenerator::NonceRecord& record,
                                              int64_t chunk_index) const {
   if (record.chunk_index != qv::core::NonceGenerator::kUnboundChunkIndex &&
@@ -294,15 +301,21 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
   std::copy_n(data.begin(), copy_size, plaintext.begin());
   try {
     auto nonce = MakeNonce(nonce_record, chunk_index);
+    qv::security::Zeroizer::ScopeWiper<uint8_t> nonce_guard(nonce.data(), nonce.size()); // TSK125_Missing_Secure_Deletion_for_Keys scoped nonce wipe
     if (nonce.size() != expected_nonce_size) {
       throw Error{ErrorDomain::Crypto, 0, "Nonce length mismatch"};
     }
     auto context = MakeChunkContext(cipher_, static_cast<uint8_t>(expected_tag_size),
                                     static_cast<uint8_t>(expected_nonce_size));      // TSK083
+    qv::security::Zeroizer::ScopeWiper<uint8_t> context_guard(context.data(), context.size()); // TSK125_Missing_Secure_Deletion_for_Keys scoped context wipe
     auto aad_data = qv::core::MakeAADData(epoch_, chunk_index, logical_offset,
                                           static_cast<uint32_t>(copy_size), context);
+    qv::security::Zeroizer::ScopeWiper<uint8_t> aad_data_guard(
+        reinterpret_cast<uint8_t*>(&aad_data), sizeof(aad_data)); // TSK125_Missing_Secure_Deletion_for_Keys scoped AAD wipe
     auto aad_envelope =
         qv::core::MakeAADEnvelope(aad_data, nonce_record.mac);                        // TSK083
+    qv::security::Zeroizer::ScopeWiper<uint8_t> aad_envelope_guard(
+        reinterpret_cast<uint8_t*>(&aad_envelope), sizeof(aad_envelope)); // TSK125_Missing_Secure_Deletion_for_Keys envelope wipe
     auto aad_bytes = qv::AsBytesConst(aad_envelope);
     auto encrypt_result = qv::crypto::AEAD_Encrypt(
         cipher_,
