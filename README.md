@@ -137,6 +137,33 @@ For SELinux deployments the policy stub at `contrib/selinux/qv.te` grants the
 minimal capabilities needed for TPM access and credential caching inside user
 directories.
 
+<!-- TSK712_Header_Backup_and_Restore_Tooling -->
+### Header backup and recovery tooling
+
+QuantumVault provides dedicated commands for exporting an encrypted copy of a
+container header. The primary CLI exposes a guarded workflow:
+
+```text
+qv header --container=<container> --backup=<file>
+qv header --container=<container> --restore=<file>
+qv header --inspect=<file>
+```
+
+Backups are sealed using a recovery password-derived key and contain KDF
+parameters, header UUID, and versioning metadata so future releases can perform
+strict compatibility checks during restore.
+
+The standalone `qv-header` utility offers non-interactive flows:
+
+```text
+qv-header backup --container=<container> --out=<file> [--password-file=<file>]
+qv-header restore --container=<container> --in=<file> [--password-file=<file>]
+qv-header inspect --in=<file>
+```
+
+> **Warning:** Store the backup file and the recovery password separately from
+> the container to avoid a single point of compromise.
+
 ## Project Layout
 
 ```text

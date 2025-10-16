@@ -55,7 +55,9 @@
 #endif
 
 #include "qv/common.h" // TSK029
+#include "qv/core/header_io.h"   // TSK712_Header_Backup_and_Restore_Tooling header backup CLI wiring
 #include "qv/core/nonce.h"
+#include "qv/security/secure_buffer.h" // TSK712_Header_Backup_and_Restore_Tooling recovery key storage
 #include "qv/crypto/sha256.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/error.h"
 #include "qv/orchestrator/constant_time_mount.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -63,6 +65,9 @@
 #include "qv/orchestrator/io_util.h"             // TSK143_Missing_Fsync_And_Durability_Issues durable manifest writes
 #include "qv/orchestrator/volume_manager.h"
 #include "qv/security/zeroizer.h" // TSK125_Missing_Secure_Deletion_for_Keys scoped wiping
+#if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
+#include <argon2.h> // TSK712_Header_Backup_and_Restore_Tooling recovery key derivation
+#endif
 #if defined(__linux__)
 #include "qv/platform/fuse_adapter.h" // TSK062_FUSE_Filesystem_Integration_Linux
 #endif
@@ -369,6 +374,104 @@ namespace {
                       "Failed to restrict file permissions: " + SanitizePath(path)};
     }
 #endif
+  }
+
+  std::string HexEncode(std::span<const uint8_t> data) { // TSK712_Header_Backup_and_Restore_Tooling hex utility
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (auto byte : data) {
+      oss << std::setw(2) << static_cast<int>(byte);
+    }
+    return oss.str();
+  }
+
+  std::string FormatUuid(const std::array<uint8_t, 16>& uuid) { // TSK712_Header_Backup_and_Restore_Tooling UUID formatter
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < uuid.size(); ++i) {
+      oss << std::setw(2) << static_cast<int>(uuid[i]);
+      if (i == 3 || i == 5 || i == 7 || i == 9) {
+        oss << '-';
+      }
+    }
+    return oss.str();
+  }
+
+  const char* RecoveryAlgorithmToString(qv::core::RecoveryKdfAlgorithm algo) { // TSK712_Header_Backup_and_Restore_Tooling
+    switch (algo) {
+      case qv::core::RecoveryKdfAlgorithm::kArgon2id:
+        return "argon2id";
+    }
+    return "unknown";
+  }
+
+  qv::core::RecoveryKdfMetadata MakeDefaultRecoveryMetadata() { // TSK712_Header_Backup_and_Restore_Tooling defaults
+    qv::core::RecoveryKdfMetadata metadata{};
+    metadata.params.time_cost = 4;
+    metadata.params.memory_cost_kib = 128u * 1024u;
+    metadata.params.parallelism = 4;
+    qv::crypto::SystemRandomBytes(std::span<uint8_t>(metadata.salt)); // TSK712_Header_Backup_and_Restore_Tooling random salt
+    return metadata;
+  }
+
+  qv::security::SecureBuffer<uint8_t>
+  DeriveRecoveryKey(const std::string& password, const qv::core::RecoveryKdfMetadata& metadata) { // TSK712
+#if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
+    if (metadata.algorithm != qv::core::RecoveryKdfAlgorithm::kArgon2id) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Unsupported recovery KDF"};
+    }
+    qv::security::SecureBuffer<uint8_t> key_buf(qv::crypto::AES256_GCM::KEY_SIZE);
+    auto span = key_buf.AsSpan();
+    int rc = argon2id_hash_raw(metadata.params.time_cost, metadata.params.memory_cost_kib,
+                               metadata.params.parallelism,
+                               reinterpret_cast<const uint8_t*>(password.data()), password.size(),
+                               metadata.salt.data(), metadata.salt.size(), span.data(), span.size());
+    if (rc != ARGON2_OK) {
+      throw qv::Error{qv::ErrorDomain::Crypto, rc, std::string("Recovery key derivation failed: ") + argon2_error_message(rc)};
+    }
+    return key_buf;
+#else
+    (void)password;
+    (void)metadata;
+    throw qv::Error{qv::ErrorDomain::Dependency, 0, "Argon2 support unavailable"};
+#endif
+  }
+
+  void PrintContainerKdfInfo(const qv::core::ContainerKdfMetadata& kdf) { // TSK712_Header_Backup_and_Restore_Tooling reporting
+    if (kdf.have_pbkdf2) {
+      std::cout << "  PBKDF2 iterations: " << kdf.pbkdf_iterations << '\n';
+      std::cout << "  PBKDF2 salt: "
+                << HexEncode(std::span<const uint8_t>(kdf.pbkdf_salt.data(), kdf.pbkdf_salt.size())) << '\n';
+    }
+    if (kdf.have_argon2) {
+      std::cout << "  Argon2id v" << kdf.argon2_version << " time=" << kdf.argon2_params.time_cost
+                << " memory KiB=" << kdf.argon2_params.memory_cost_kib
+                << " parallelism=" << kdf.argon2_params.parallelism << '\n';
+      std::cout << "  Argon2 hash length: " << kdf.argon2_hash_length
+                << " bytes, target " << kdf.argon2_target_ms << " ms" << '\n';
+      std::cout << "  Argon2 salt: "
+                << HexEncode(std::span<const uint8_t>(kdf.argon2_salt.data(), kdf.argon2_salt.size()))
+                << '\n';
+    }
+  }
+
+  void PrintHeaderBackupMetadata(const qv::core::HeaderBackupMetadata& metadata) { // TSK712_Header_Backup_and_Restore_Tooling
+    std::cout << "Backup format version: " << metadata.format_version << '\n';
+    std::cout << "Container UUID: " << FormatUuid(metadata.container.uuid) << '\n';
+    std::ostringstream version_hex;
+    version_hex << "0x" << std::hex << std::setw(8) << std::setfill('0') << metadata.container.version;
+    std::ostringstream flags_hex;
+    flags_hex << "0x" << std::hex << std::setw(8) << std::setfill('0') << metadata.container.flags;
+    std::cout << "Container header version: " << version_hex.str() << '\n';
+    std::cout << "Container flags: " << flags_hex.str() << '\n';
+    PrintContainerKdfInfo(metadata.container.kdf);
+    std::cout << "Recovery KDF: " << RecoveryAlgorithmToString(metadata.recovery.algorithm) << '\n';
+    std::cout << "  Time cost: " << metadata.recovery.params.time_cost
+              << "  Memory KiB: " << metadata.recovery.params.memory_cost_kib
+              << "  Parallelism: " << metadata.recovery.params.parallelism << '\n';
+    std::cout << "  Salt: "
+              << HexEncode(std::span<const uint8_t>(metadata.recovery.salt.data(), metadata.recovery.salt.size()))
+              << '\n';
   }
 
   int OpenFileForWrite(const std::filesystem::path& path) { // TSK143_Missing_Fsync_And_Durability_Issues platform-safe open
@@ -809,6 +912,9 @@ namespace {
     std::cerr << "  qv migrate-nonces <container>\n";
     std::cerr
         << "  qv backup --output=<dir> <container>\n"; // TSK032_Backup_Recovery_and_Disaster_Recovery
+    std::cerr << "  qv header --backup=<file> --container=<container>\n"; // TSK712_Header_Backup_and_Restore_Tooling
+    std::cerr << "  qv header --restore=<file> --container=<container>\n"; // TSK712_Header_Backup_and_Restore_Tooling
+    std::cerr << "  qv header --inspect=<file>\n"; // TSK712_Header_Backup_and_Restore_Tooling
     std::cerr << "  qv fsck <container>\n";    // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::cerr << "  qv destroy <container>\n"; // TSK028_Secure_Deletion_and_Data_Remanence
     std::cerr << "\nGlobal flags:\n"; // TSK035_Platform_Specific_Security_Integration
@@ -2985,6 +3091,67 @@ namespace {
     return kExitOk;
   }
 
+  int HandleHeaderBackup(const std::filesystem::path& container,
+                         const std::filesystem::path& backup) { // TSK712_Header_Backup_and_Restore_Tooling
+    auto password = ReadPassword("Recovery password: ");
+    auto confirm = ReadPassword("Confirm recovery password: ");
+    const auto wipe = [&]() {
+      SecureZero(password);
+      SecureZero(confirm);
+    };
+    if (!PasswordsEqual(password, confirm)) {
+      wipe();
+      std::cerr << "Validation error: Recovery passwords do not match." << std::endl;
+      return kExitUsage;
+    }
+    auto metadata = MakeDefaultRecoveryMetadata();
+    qv::security::SecureBuffer<uint8_t> key(0);
+    try {
+      key = DeriveRecoveryKey(password, metadata);
+    } catch (...) {
+      wipe();
+      throw;
+    }
+    wipe();
+
+    qv::core::RecoveryKeyDescriptor descriptor;
+    descriptor.key = std::move(key);
+    descriptor.metadata = metadata;
+
+    qv::core::BackupHeader(container, backup, descriptor);
+    std::cout << "Header backup written to " << SanitizePath(backup) << "." << std::endl;
+    std::cout << "Store this file and the recovery password separately from the container." << std::endl;
+    return kExitOk;
+  }
+
+  int HandleHeaderRestore(const std::filesystem::path& container,
+                          const std::filesystem::path& backup) { // TSK712_Header_Backup_and_Restore_Tooling
+    auto metadata = qv::core::InspectHeaderBackup(backup);
+    auto password = ReadPassword("Recovery password: ");
+    qv::security::SecureBuffer<uint8_t> key(0);
+    try {
+      key = DeriveRecoveryKey(password, metadata.recovery);
+    } catch (...) {
+      SecureZero(password);
+      throw;
+    }
+    SecureZero(password);
+
+    qv::core::RecoveryKeyDescriptor descriptor;
+    descriptor.key = std::move(key);
+    descriptor.metadata = metadata.recovery;
+
+    qv::core::RestoreHeader(container, backup, descriptor);
+    std::cout << "Header restored for " << SanitizePath(container) << "." << std::endl;
+    return kExitOk;
+  }
+
+  int HandleHeaderInspect(const std::filesystem::path& backup) { // TSK712_Header_Backup_and_Restore_Tooling
+    auto metadata = qv::core::InspectHeaderBackup(backup);
+    PrintHeaderBackupMetadata(metadata);
+    return kExitOk;
+  }
+
   int HandleDestroy(
       const std::filesystem::path& container) { // TSK028_Secure_Deletion_and_Data_Remanence
     if (!std::filesystem::exists(container)) {
@@ -3390,6 +3557,95 @@ int main(int argc, char** argv) {
         return kExitUsage;
       }
       return HandleFsck(container_path);
+    }
+    if (cmd == "header") { // TSK712_Header_Backup_and_Restore_Tooling
+      enum class HeaderMode { None, Backup, Restore, Inspect } mode = HeaderMode::None;
+      std::optional<std::filesystem::path> container_path;
+      std::optional<std::filesystem::path> header_path;
+      for (int i = index; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg.rfind("--container=", 0) == 0) {
+          auto value = arg.substr(std::string_view("--container=").size());
+          std::filesystem::path parsed_container;
+          if (!TryParsePathArgument(value, parsed_container, "container path")) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          container_path = parsed_container;
+          continue;
+        }
+        if (arg.rfind("--backup=", 0) == 0) {
+          if (mode != HeaderMode::None) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          auto value = arg.substr(std::string_view("--backup=").size());
+          std::filesystem::path parsed_backup;
+          if (!TryParsePathArgument(value, parsed_backup, "backup path")) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          header_path = parsed_backup;
+          mode = HeaderMode::Backup;
+          continue;
+        }
+        if (arg.rfind("--restore=", 0) == 0) {
+          if (mode != HeaderMode::None) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          auto value = arg.substr(std::string_view("--restore=").size());
+          std::filesystem::path parsed_backup;
+          if (!TryParsePathArgument(value, parsed_backup, "backup path")) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          header_path = parsed_backup;
+          mode = HeaderMode::Restore;
+          continue;
+        }
+        if (arg.rfind("--inspect=", 0) == 0) {
+          if (mode != HeaderMode::None) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          auto value = arg.substr(std::string_view("--inspect=").size());
+          std::filesystem::path parsed_backup;
+          if (!TryParsePathArgument(value, parsed_backup, "backup path")) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          header_path = parsed_backup;
+          mode = HeaderMode::Inspect;
+          continue;
+        }
+        PrintUsage();
+        return kExitUsage;
+      }
+      switch (mode) {
+        case HeaderMode::Backup:
+          if (!container_path || !header_path) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          return HandleHeaderBackup(*container_path, *header_path);
+        case HeaderMode::Restore:
+          if (!container_path || !header_path) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          return HandleHeaderRestore(*container_path, *header_path);
+        case HeaderMode::Inspect:
+          if (!header_path) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          return HandleHeaderInspect(*header_path);
+        case HeaderMode::None:
+          PrintUsage();
+          return kExitUsage;
+      }
+      return kExitUsage;
     }
     if (cmd == "destroy") { // TSK028_Secure_Deletion_and_Data_Remanence
       if (argc - index != 1) {
