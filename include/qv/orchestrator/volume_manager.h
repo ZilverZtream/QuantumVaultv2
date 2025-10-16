@@ -1,19 +1,26 @@
 #pragma once
-#include "qv/core/nonce.h"                                 // TSK040_AAD_Binding_and_Chunk_Authentication nonce binding
+#include "qv/core/header.h"                               // TSK710_Implement_Hidden_Volumes hidden descriptor parsing
+#include "qv/core/nonce.h"                                // TSK040_AAD_Binding_and_Chunk_Authentication nonce binding
 #include "qv/crypto/aes_gcm.h"                              // TSK040_AAD_Binding_and_Chunk_Authentication GCM sizes
 #include "qv/orchestrator/constant_time_mount.h"
+#include "qv/storage/chunk_layout.h"                       // TSK710_Implement_Hidden_Volumes protected extent map
 #include <array>      // TSK040_AAD_Binding_and_Chunk_Authentication chunk sealing
 #include <chrono>     // TSK036_PBKDF2_Argon2_Migration_Path progress configuration
 #include <cstdint>    // TSK033 header version constants
 #include <filesystem>
 #include <functional> // TSK036_PBKDF2_Argon2_Migration_Path progress callbacks
 #include <optional>
+#include <shared_mutex> // TSK710_Implement_Hidden_Volumes guard protected extent state
 #include <span>       // TSK040_AAD_Binding_and_Chunk_Authentication keyed spans
 #include <string>
 #include <utility>    // TSK083_AAD_Recompute_and_Binding move-only sealed payload
 #include <vector>     // TSK040_AAD_Binding_and_Chunk_Authentication ciphertext storage
 
 namespace qv::orchestrator {
+struct MountParams { // TSK710_Implement_Hidden_Volumes mount mode flags
+  bool hidden{false};
+  bool decoy{false};
+};
   class VolumeManager {
   public:
     static constexpr uint32_t kLatestHeaderVersion =
@@ -37,6 +44,8 @@ namespace qv::orchestrator {
   private:
     ConstantTimeMount ctm_;
     KdfPolicy kdf_policy_{}; // TSK036_PBKDF2_Argon2_Migration_Path
+    mutable std::shared_mutex protected_mutex_; // TSK710_Implement_Hidden_Volumes shared guard
+    std::vector<qv::storage::Extent> protected_extents_;   // TSK710_Implement_Hidden_Volumes active regions
 
   public:
     VolumeManager();                           // TSK036_PBKDF2_Argon2_Migration_Path initialize default policy
@@ -48,7 +57,8 @@ namespace qv::orchestrator {
     std::optional<ConstantTimeMount::VolumeHandle> Create(const std::filesystem::path& container,
                                                           const std::string& password);
     std::optional<ConstantTimeMount::VolumeHandle> Mount(const std::filesystem::path& container,
-                                                         const std::string& password);
+                                                         const std::string& password,
+                                                         const MountParams& params = {}); // TSK710_Implement_Hidden_Volumes
     std::optional<ConstantTimeMount::VolumeHandle>
     Rekey(const std::filesystem::path& container, const std::string& current_password,
           const std::string& new_password,
@@ -60,6 +70,12 @@ namespace qv::orchestrator {
 
     static void ValidateHeaderForBackup(
         const std::filesystem::path& container); // TSK082_Backup_Verification_and_Schema
+
+    void SetProtectedExtents(std::vector<qv::storage::Extent> exts);             // TSK710_Implement_Hidden_Volumes guard config
+    [[nodiscard]] bool IsProtected(uint64_t offset, uint64_t length) const;      // TSK710_Implement_Hidden_Volumes lookup helper
+
+    std::vector<qv::storage::Extent> LoadHiddenDescriptor(                       // TSK710_Implement_Hidden_Volumes descriptor IO
+        const std::filesystem::path& container, const std::string& password);
 
     struct ChunkEncryptionResult { // TSK040_AAD_Binding_and_Chunk_Authentication bundle integrity inputs
       ChunkEncryptionResult(uint32_t epoch_in, int64_t chunk_index_in,           // TSK083_AAD_Recompute_and_Binding immutable sealed payload

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint> // TSK107_Platform_Specific_Issues explicit 64-bit math
 #include <cstring>
 #include <exception> // TSK116_Incorrect_Error_Propagation preserve original failure details
@@ -13,6 +14,7 @@
 #include <system_error> // TSK098_Exception_Safety_and_Resource_Leaks
 #include <limits>       // TSK100_Integer_Overflow_and_Arithmetic overflow guards
 #include <vector>
+#include <shared_mutex>  // TSK710_Implement_Hidden_Volumes guard queries
 
 #include "qv/crypto/ct.h"              // TSK122_Weak_CRC32_for_Chunk_Headers constant-time MAC verify
 #include "qv/crypto/hmac_sha256.h"      // TSK122_Weak_CRC32_for_Chunk_Headers header authentication
@@ -168,6 +170,22 @@ BlockDevice::~BlockDevice() {
   }
   file_.close();
 }
+void BlockDevice::SetProtectedExtents(std::vector<Extent> exts) { // TSK710_Implement_Hidden_Volumes update guard
+  NormalizeExtents(exts);
+  std::unique_lock<std::shared_mutex> guard(protected_mutex_);
+  protected_extents_ = std::move(exts);
+}
+
+bool BlockDevice::IsProtected(uint64_t offset, uint64_t length) const { // TSK710_Implement_Hidden_Volumes query guard
+  std::shared_lock<std::shared_mutex> guard(protected_mutex_);
+  for (const auto& extent : protected_extents_) {
+    if (extent.Intersects(offset, length)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 
 void BlockDevice::Flush() {
   std::scoped_lock lock(io_mutex_);
@@ -251,6 +269,9 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   }
   if (header.epoch != epoch_) {  // TSK108_Data_Structure_Invariants bind to nonce generator epoch
     throw Error{ErrorDomain::Validation, 0, "Chunk epoch mismatch"};
+  }
+  if (IsProtected(expected_offset, kPayloadSize)) {
+    throw Error{ErrorDomain::Fs, EROFS, "Write intersects hidden volume region"}; // TSK710_Implement_Hidden_Volumes guard writes
   }
   std::scoped_lock lock(io_mutex_);
   EnsureOpenUnlocked();

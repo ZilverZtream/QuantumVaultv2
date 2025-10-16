@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -87,9 +88,17 @@ class VolumeFilesystem {
   size_t last_metadata_skipped_entries_ = 0;    // TSK127_Incorrect_Filesystem_Metadata_Recovery recovery accounting
   size_t last_metadata_rescued_entries_ = 0;    // TSK127_Incorrect_Filesystem_Metadata_Recovery salvage accounting
   bool last_metadata_best_effort_ = false;      // TSK127_Incorrect_Filesystem_Metadata_Recovery remember recovery mode
+  std::vector<qv::storage::Extent> protected_extents_; // TSK710_Implement_Hidden_Volumes protected regions
+  mutable std::mutex protected_mutex_;                // TSK710_Implement_Hidden_Volumes guard map
+  std::optional<qv::storage::Extent>
+      layout_region_;                            // TSK710_Implement_Hidden_Volumes hidden region bounds
+  bool has_payload_limit_{false};                // TSK710_Implement_Hidden_Volumes enforce region capacity
+  uint64_t payload_base_chunk_{0};               // TSK710_Implement_Hidden_Volumes base chunk index
+  uint64_t payload_limit_chunk_{std::numeric_limits<uint64_t>::max()}; // TSK710_Implement_Hidden_Volumes end-exclusive limit
 
 public:
-  explicit VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device);
+  explicit VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device,
+                            std::optional<qv::storage::Extent> accessible_region = std::nullopt);
   ~VolumeFilesystem();  // TSK115_Memory_Leaks_and_Resource_Management ensure metadata persisted
 
 #if defined(__linux__)
@@ -127,6 +136,7 @@ public:
 
   std::shared_ptr<storage::BlockDevice> BlockDeviceHandle() const { return device_; }
   void FlushStorage();  // TSK131_Missing_Flush_on_Close ensure chunk persistence coordination
+  void SetProtectedExtents(std::vector<qv::storage::Extent> exts); // TSK710_Implement_Hidden_Volumes guard configuration
 
 private:
   class MetadataWritebackGuard;  // TSK117_Race_Conditions_in_Filesystem scoped metadata batching
@@ -139,6 +149,8 @@ private:
   void WriteFileContent(FileEntry& file, const std::vector<uint8_t>& data);
   uint64_t AllocateChunks(uint64_t count, uint64_t* previous_next);
   void RestoreAllocationState(uint64_t previous_next);
+  bool IsProtectedRange(uint64_t offset, uint64_t length, uint64_t* next_safe) const; // TSK710_Implement_Hidden_Volumes guard helper
+  void ConfigureLayout(std::optional<qv::storage::Extent> region);                    // TSK710_Implement_Hidden_Volumes layout derivation
 
   void MarkMetadataDirtyLocked();
   void FlushMetadataLocked();

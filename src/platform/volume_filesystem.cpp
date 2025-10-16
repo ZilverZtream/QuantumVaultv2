@@ -3,6 +3,8 @@
 // TSK062_FUSE_Filesystem_Integration_Linux simple chunk-backed filesystem façade
 
 #include <algorithm>
+#include <limits>
+#include "qv/storage/chunk_layout.h"
 #include <array>     // TSK127_Incorrect_Filesystem_Metadata_Recovery base64 decoding table
 #include <cassert>
 #include <cerrno>   // TSK116_Incorrect_Error_Propagation propagate validation errno details
@@ -735,7 +737,8 @@ class VolumeFilesystem::MetadataWritebackGuard {
   bool dirty_ = false;
 };
 
-VolumeFilesystem::VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device)
+VolumeFilesystem::VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device,
+                                   std::optional<qv::storage::Extent> accessible_region)
     : device_(std::move(device)),
       root_(std::make_shared<DirectoryEntry>()) {
   if (!device_) {
@@ -744,8 +747,21 @@ VolumeFilesystem::VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device)
   root_->name = "/";
   root_->mtime = CurrentTimespec();
 
+  ConfigureLayout(accessible_region); // TSK710_Implement_Hidden_Volumes derive payload bounds
   metadata_chunk_count_ = (metadata_size_ + kChunkPayloadSize - 1) / kChunkPayloadSize;
+  if (has_payload_limit_) { // TSK710_Implement_Hidden_Volumes ensure hidden layout can host metadata
+    const uint64_t span_chunks = payload_limit_chunk_ - payload_base_chunk_;
+    const uint64_t required_chunks = metadata_chunk_count_ + 1; // reserved lead chunk + metadata
+    if (span_chunks <= required_chunks) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Hidden volume region too small for metadata reservation"};
+    }
+  }
   data_start_chunk_ = metadata_chunk_start_ + metadata_chunk_count_;
+  if (has_payload_limit_ && data_start_chunk_ >= payload_limit_chunk_) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Hidden volume region lacks writable capacity"}; // TSK710_Implement_Hidden_Volumes
+  }
   next_chunk_index_ = data_start_chunk_;
   next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
 
@@ -776,6 +792,76 @@ VolumeFilesystem::~VolumeFilesystem() {
   } catch (...) {
     // Destructors must not throw; metadata persistence errors are logged by callers.
   }
+}
+
+void VolumeFilesystem::ConfigureLayout(std::optional<qv::storage::Extent> region) { // TSK710_Implement_Hidden_Volumes layout derivation
+  layout_region_ = region;
+  has_payload_limit_ = false;
+  payload_base_chunk_ = 0;
+  payload_limit_chunk_ = std::numeric_limits<uint64_t>::max();
+  metadata_chunk_start_ = 1;
+  if (!region.has_value() || region->length == 0) {
+    return;
+  }
+  if (kChunkPayloadSize == 0) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Chunk payload size is zero"};
+  }
+  if (region->offset % kChunkPayloadSize != 0 || region->length % kChunkPayloadSize != 0) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Hidden layout must align to chunk payload size"};
+  }
+  payload_base_chunk_ = region->offset / kChunkPayloadSize;
+  const uint64_t span_chunks = region->length / kChunkPayloadSize;
+  if (span_chunks == 0) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Hidden layout length invalid"};
+  }
+  if (payload_base_chunk_ > std::numeric_limits<uint64_t>::max() - span_chunks) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Hidden layout offset overflow"};
+  }
+  payload_limit_chunk_ = payload_base_chunk_ + span_chunks;
+  metadata_chunk_start_ = payload_base_chunk_ + 1;
+  has_payload_limit_ = true;
+}
+
+void VolumeFilesystem::SetProtectedExtents(std::vector<qv::storage::Extent> exts) { // TSK710_Implement_Hidden_Volumes guard configuration
+  qv::storage::NormalizeExtents(exts);
+  std::lock_guard<std::mutex> guard(protected_mutex_);
+  protected_extents_ = std::move(exts);
+}
+
+bool VolumeFilesystem::IsProtectedRange(uint64_t offset, uint64_t length, uint64_t* next_safe) const {
+  std::lock_guard<std::mutex> guard(protected_mutex_);
+  if (length == 0) {
+    if (next_safe) {
+      *next_safe = offset;
+    }
+    return false;
+  }
+  const uint64_t max_value = std::numeric_limits<uint64_t>::max();
+  uint64_t query_end = max_value;
+  bool overflowed = true;
+  if (length != 0) {
+    const uint64_t extent_length = length - 1;
+    if (offset <= max_value - extent_length) {
+      query_end = offset + extent_length + 1;
+      overflowed = false;
+    }
+  }
+  for (const auto& extent : protected_extents_) {
+    if (!overflowed && extent.offset >= query_end) {
+      break;
+    }
+    if (extent.Intersects(offset, length)) {
+      if (next_safe) {
+        *next_safe = extent.EndExclusive();
+      }
+      return true;
+    }
+  }
+  if (next_safe) {
+    *next_safe = offset;
+  }
+  return false;
 }
 
 FileEntry* VolumeFilesystem::FindFile(const std::string& path) {
@@ -985,11 +1071,59 @@ uint64_t VolumeFilesystem::AllocateChunks(uint64_t count, uint64_t* previous_nex
   if (count == 0) {
     return 0;
   }
+  if (kChunkPayloadSize == 0) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Chunk payload size is zero"};
+  }
+  if (count > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Chunk requirement overflow"};
+  }
+  uint64_t allocation_start = next_chunk_index_;
+  if (has_payload_limit_ && allocation_start >= payload_limit_chunk_) {
+    throw qv::Error{qv::ErrorDomain::Fs, ENOSPC, "Hidden volume region exhausted"};
+  }
+  uint64_t candidate_chunk = allocation_start;
+  while (true) {
+    if (has_payload_limit_ && count > payload_limit_chunk_ - candidate_chunk) {
+      throw qv::Error{qv::ErrorDomain::Fs, ENOSPC, "Hidden volume region exhausted"};
+    }
+    if (candidate_chunk > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Chunk offset overflow"};
+    }
+    const uint64_t requested_offset = candidate_chunk * kChunkPayloadSize;
+    const uint64_t requested_length = count * kChunkPayloadSize;
+    uint64_t next_safe = requested_offset;
+    if (!IsProtectedRange(requested_offset, requested_length, &next_safe)) {
+      allocation_start = candidate_chunk;
+      break;
+    }
+    uint64_t safe_chunk;
+    if (next_safe >= std::numeric_limits<uint64_t>::max() - (kChunkPayloadSize - 1)) {
+      safe_chunk = std::numeric_limits<uint64_t>::max();
+    } else {
+      safe_chunk = (next_safe + (kChunkPayloadSize - 1)) / kChunkPayloadSize;
+    }
+    if (safe_chunk <= candidate_chunk) {
+      if (candidate_chunk == std::numeric_limits<uint64_t>::max()) {
+        throw qv::Error{qv::ErrorDomain::Fs, EROFS, "Protected region exhausts allocation space"};
+      }
+      ++candidate_chunk;
+    } else {
+      candidate_chunk = safe_chunk;
+    }
+    if (has_payload_limit_ && candidate_chunk >= payload_limit_chunk_) {
+      throw qv::Error{qv::ErrorDomain::Fs, ENOSPC, "Hidden volume region exhausted"};
+    }
+  }
+  next_chunk_index_ = allocation_start;
+  const auto start = next_chunk_index_;
+  if (has_payload_limit_ && count > payload_limit_chunk_ - next_chunk_index_) {
+    throw qv::Error{qv::ErrorDomain::Fs, ENOSPC, "Hidden volume region exhausted"};
+  }
   if (next_chunk_index_ > std::numeric_limits<uint64_t>::max() - count) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
                     "Chunk index allocation overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard addition
   }
-  const auto start = next_chunk_index_;
   next_chunk_index_ += count;
   if (next_chunk_index_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
@@ -1007,6 +1141,9 @@ uint64_t VolumeFilesystem::AllocateChunks(uint64_t count, uint64_t* previous_nex
 void VolumeFilesystem::RestoreAllocationState(uint64_t previous_next) {
   std::lock_guard allocation_lock(allocation_mutex_);
   next_chunk_index_ = previous_next;
+  if (has_payload_limit_ && next_chunk_index_ > payload_limit_chunk_) {
+    throw qv::Error{qv::ErrorDomain::Fs, ENOSPC, "Hidden volume region exhausted"}; // TSK710_Implement_Hidden_Volumes limit check
+  }
   if (next_chunk_index_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
                     "Restored chunk index exceeds signed range"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard cast
@@ -1093,6 +1230,10 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
   for (uint64_t i = 0; i < required_chunks; ++i) {
     std::vector<uint8_t> chunk_buffer(kChunkPayloadSize, 0);
     auto offset = static_cast<size_t>(i * kChunkPayloadSize);
+    uint64_t chunk_offset_bytes = (start_chunk + i) * kChunkPayloadSize;
+    if (IsProtectedRange(chunk_offset_bytes, kChunkPayloadSize, nullptr)) {
+      throw qv::Error{qv::ErrorDomain::Fs, EROFS, "Write intersects hidden volume region"}; // TSK710_Implement_Hidden_Volumes guard chunk write
+    }
     auto remaining = data.size() > offset ? data.size() - offset : 0;
     auto copy_size = std::min<size_t>(kChunkPayloadSize, remaining);
     if (copy_size > 0) {
@@ -1223,16 +1364,23 @@ uint64_t VolumeFilesystem::TotalSizeBytes() const {
                                         ? next_chunk_index_ - data_start_chunk_
                                         : 0;
   const uint64_t data_bytes = allocated_chunks * kChunkPayloadSize;
-  return metadata_bytes + data_bytes;
+  const uint64_t used = metadata_bytes + data_bytes;
+  if (has_payload_limit_ && layout_region_) {
+    return std::min<uint64_t>(used, layout_region_->length); // TSK710_Implement_Hidden_Volumes clamp to hidden span
+  }
+  return used;
 }
 
 uint64_t VolumeFilesystem::FreeSpaceBytes() const {
   constexpr uint64_t kAssumedCapacity = 512ull * 1024ull * 1024ull * 1024ull;  // 512 GiB
+  const uint64_t capacity = (has_payload_limit_ && layout_region_)
+                                ? layout_region_->length
+                                : kAssumedCapacity; // TSK710_Implement_Hidden_Volumes hidden capacity bound
   auto used = TotalSizeBytes();
-  if (used >= kAssumedCapacity) {
+  if (used >= capacity) {
     return 0;
   }
-  return kAssumedCapacity - used;
+  return capacity - used;
 }
 
 std::optional<NodeMetadata> VolumeFilesystem::StatPath(const std::string& path) {
