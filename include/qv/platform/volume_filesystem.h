@@ -73,6 +73,7 @@ class VolumeFilesystem {
   std::shared_ptr<storage::BlockDevice> device_;
   std::shared_ptr<DirectoryEntry> root_;
   std::mutex fs_mutex_;
+  std::mutex allocation_mutex_;  // TSK117_Race_Conditions_in_Filesystem guard chunk cursor
 
   // Metadata stored at start of volume
   uint64_t metadata_size_ = 1024ull * 1024ull;  // 1MB for metadata
@@ -81,6 +82,7 @@ class VolumeFilesystem {
   uint64_t metadata_chunk_count_ = 0;
   uint64_t data_start_chunk_ = 0;
   uint64_t next_chunk_index_ = 0;
+  bool metadata_dirty_ = false;  // TSK117_Race_Conditions_in_Filesystem batch metadata persistence
 
 public:
   explicit VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device);
@@ -121,15 +123,21 @@ public:
   std::shared_ptr<storage::BlockDevice> BlockDeviceHandle() const { return device_; }
 
 private:
+  class MetadataWritebackGuard;  // TSK117_Race_Conditions_in_Filesystem scoped metadata batching
+
   FileEntry* FindFile(const std::string& path);
   DirectoryEntry* FindDirectory(const std::string& path);
   DirectoryEntry* EnsureDirectory(const std::string& path);
 
   std::vector<uint8_t> ReadFileContent(const FileEntry& file);
   void WriteFileContent(FileEntry& file, const std::vector<uint8_t>& data);
-  uint64_t AllocateChunks(uint64_t count);
+  uint64_t AllocateChunks(uint64_t count, uint64_t* previous_next);
+  void RestoreAllocationState(uint64_t previous_next);
 
+  void MarkMetadataDirtyLocked();
+  void FlushMetadataLocked();
   void SaveMetadata();
+  void PersistMetadataLocked();
   void LoadMetadata();
   void SerializeDirectory(std::ostringstream& out, const DirectoryEntry* dir,
                           const std::string& path);

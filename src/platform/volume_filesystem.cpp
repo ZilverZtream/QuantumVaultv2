@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <span>
@@ -161,6 +162,39 @@ timespec TimespecFrom(std::time_t sec, long nsec) {
 }
 }  // namespace
 
+class VolumeFilesystem::MetadataWritebackGuard {
+ public:
+  explicit MetadataWritebackGuard(VolumeFilesystem& filesystem) : filesystem_(filesystem) {}
+
+  void MarkDirty() {
+    if (dirty_) {
+      return;
+    }
+    filesystem_.MarkMetadataDirtyLocked();  // TSK117_Race_Conditions_in_Filesystem batch metadata changes
+    dirty_ = true;
+  }
+
+  void Commit() {
+    if (!dirty_) {
+      return;
+    }
+    filesystem_.FlushMetadataLocked();
+    dirty_ = false;
+  }
+
+  ~MetadataWritebackGuard() {
+#if !defined(NDEBUG)
+    if (!std::uncaught_exceptions()) {
+      assert(!dirty_ && "MetadataWritebackGuard::Commit must be invoked before scope exit");
+    }
+#endif
+  }
+
+ private:
+  VolumeFilesystem& filesystem_;
+  bool dirty_ = false;
+};
+
 VolumeFilesystem::VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device)
     : device_(std::move(device)),
       root_(std::make_shared<DirectoryEntry>()) {
@@ -178,14 +212,18 @@ VolumeFilesystem::VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device)
   try {
     LoadMetadata();
   } catch (...) {
-    SaveMetadata();
+    FilesystemMutexGuard lock(fs_mutex_);
+    MetadataWritebackGuard metadata_guard(*this);
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
   }
 }
 
 VolumeFilesystem::~VolumeFilesystem() {
   // TSK115_Memory_Leaks_and_Resource_Management persist pending directory updates on teardown
   try {
-    SaveMetadata();
+    FilesystemMutexGuard lock(fs_mutex_);
+    FlushMetadataLocked();
   } catch (...) {
     // Destructors must not throw; metadata persistence errors are logged by callers.
   }
@@ -374,14 +412,24 @@ std::vector<uint8_t> VolumeFilesystem::ReadFileContent(const FileEntry& file) {
   return data;
 }
 
-uint64_t VolumeFilesystem::AllocateChunks(uint64_t count) {
+uint64_t VolumeFilesystem::AllocateChunks(uint64_t count, uint64_t* previous_next) {
+  std::lock_guard allocation_lock(allocation_mutex_);
+  if (previous_next) {
+    *previous_next = next_chunk_index_;
+  }
   if (count == 0) {
     return 0;
   }
-  auto start = next_chunk_index_;
+  const auto start = next_chunk_index_;
   next_chunk_index_ += count;
   next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
   return start;
+}
+
+void VolumeFilesystem::RestoreAllocationState(uint64_t previous_next) {
+  std::lock_guard allocation_lock(allocation_mutex_);
+  next_chunk_index_ = previous_next;
+  next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
 }
 
 void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8_t>& data) {
@@ -394,12 +442,11 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
     file.start_offset = 0;
     return;
   }
-  uint64_t previous_next_chunk = next_chunk_index_;
+  uint64_t previous_next_chunk = 0;
   bool allocated_new_range = false;
   if (old_chunks == 0 || start_chunk < data_start_chunk_ || required_chunks > old_chunks) {
     allocated_new_range = true;
-    previous_next_chunk = next_chunk_index_;
-    start_chunk = AllocateChunks(required_chunks);
+    start_chunk = AllocateChunks(required_chunks, &previous_next_chunk);
   }
 
   struct ChunkAllocationGuard {  // TSK115_Memory_Leaks_and_Resource_Management rollback leaked chunks
@@ -411,8 +458,7 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
       if (!committed_) {
         file_.start_offset = original_offset_;
         if (allocated_new_) {
-          owner_.next_chunk_index_ = previous_next_;
-          owner_.next_file_offset_ = owner_.next_chunk_index_ * kChunkPayloadSize;
+          owner_.RestoreAllocationState(previous_next_);
         }
       }
     }
@@ -475,6 +521,7 @@ int VolumeFilesystem::Read(const char* path, char* buf, size_t size, off_t offse
 int VolumeFilesystem::Write(const char* path, const char* buf, size_t size, off_t offset) {
   try {
     FilesystemMutexGuard lock(fs_mutex_);
+    MetadataWritebackGuard metadata_guard(*this);
     auto* file = FindFile(path);
     if (!file) {
       return -ENOENT;
@@ -494,7 +541,8 @@ int VolumeFilesystem::Write(const char* path, const char* buf, size_t size, off_
     file->size = data.size();
     auto now = CurrentTimespec();
     file->mtime = now;
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
     return static_cast<int>(size);
   } catch (const qv::Error& error) {
     return FuseErrorFrom(error);
@@ -507,6 +555,7 @@ int VolumeFilesystem::Create(const char* path, mode_t mode, struct fuse_file_inf
   (void)fi;
   try {
     FilesystemMutexGuard lock(fs_mutex_);
+    MetadataWritebackGuard metadata_guard(*this);
     auto normalized = NormalizePath(path);
     auto parent_path = std::filesystem::path(normalized).parent_path().string();
     if (parent_path.empty()) {
@@ -533,7 +582,8 @@ int VolumeFilesystem::Create(const char* path, mode_t mode, struct fuse_file_inf
     entry.gid = fuse_get_context() ? fuse_get_context()->gid : getgid();
     dir->files.push_back(entry);
     dir->mtime = entry.mtime;
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
     return 0;
   } catch (const qv::Error& error) {
     return FuseErrorFrom(error);
@@ -654,6 +704,7 @@ std::vector<uint8_t> VolumeFilesystem::ReadFileRange(const std::string& path, ui
 size_t VolumeFilesystem::WriteFileRange(const std::string& path, uint64_t offset,
                                         std::span<const uint8_t> data) {
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto* file = FindFile(path);
   if (!file) {
     throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
@@ -669,13 +720,15 @@ size_t VolumeFilesystem::WriteFileRange(const std::string& path, uint64_t offset
   WriteFileContent(*file, existing);
   file->size = existing.size();
   file->mtime = CurrentTimespec();
-  SaveMetadata();
+  metadata_guard.MarkDirty();
+  metadata_guard.Commit();
   return data.size();
 }
 
 void VolumeFilesystem::CreateFileNode(const std::string& path, uint32_t mode, uint32_t uid,
                                       uint32_t gid) {
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -703,7 +756,8 @@ void VolumeFilesystem::CreateFileNode(const std::string& path, uint32_t mode, ui
   entry.gid = static_cast<gid_t>(gid);
   dir->files.push_back(entry);
   dir->mtime = entry.mtime;
-  SaveMetadata();
+  metadata_guard.MarkDirty();
+  metadata_guard.Commit();
 }
 
 void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mode, uint32_t uid,
@@ -712,6 +766,7 @@ void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mod
   (void)uid;
   (void)gid;
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -731,11 +786,13 @@ void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mod
   dir->mtime = CurrentTimespec();
   parent->subdirs.push_back(dir);
   parent->mtime = dir->mtime;
-  SaveMetadata();
+  metadata_guard.MarkDirty();
+  metadata_guard.Commit();
 }
 
 void VolumeFilesystem::RemoveFileNode(const std::string& path) {
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
   auto parent_path = std::filesystem::path(normalized).parent_path().string();
   if (parent_path.empty()) {
@@ -755,11 +812,13 @@ void VolumeFilesystem::RemoveFileNode(const std::string& path) {
     throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
   }
   dir->mtime = CurrentTimespec();
-  SaveMetadata();
+  metadata_guard.MarkDirty();
+  metadata_guard.Commit();
 }
 
 void VolumeFilesystem::RemoveDirectoryNode(const std::string& path) {
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
   if (normalized == "/") {
     throw qv::Error{qv::ErrorDomain::Validation, 0, "Cannot remove root directory"};
@@ -784,11 +843,13 @@ void VolumeFilesystem::RemoveDirectoryNode(const std::string& path) {
   }
   parent->subdirs.erase(it);
   parent->mtime = CurrentTimespec();
-  SaveMetadata();
+  metadata_guard.MarkDirty();
+  metadata_guard.Commit();
 }
 
 void VolumeFilesystem::TruncateFileNode(const std::string& path, uint64_t size) {
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto* file = FindFile(path);
   if (!file) {
     throw qv::Error{qv::ErrorDomain::IO, 0, "File not found: " + path};
@@ -802,12 +863,14 @@ void VolumeFilesystem::TruncateFileNode(const std::string& path, uint64_t size) 
   WriteFileContent(*file, data);
   file->size = data.size();
   file->mtime = CurrentTimespec();
-  SaveMetadata();
+  metadata_guard.MarkDirty();
+  metadata_guard.Commit();
 }
 
 void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to,
                                   bool replace_existing) {
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto from_norm = NormalizePath(from);
   auto to_norm = NormalizePath(to);
   if (from_norm == "/" || to_norm == "/") {
@@ -833,21 +896,22 @@ void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to
 
   if (is_directory) {
     // Check for conflicts
-    auto existing_dir = FindDirectory(to_norm);
-    if (existing_dir) {
+    auto existing_it = std::find_if(dest_parent->subdirs.begin(), dest_parent->subdirs.end(),
+                                    [&](const std::shared_ptr<DirectoryEntry>& child) {
+                                      return child->name == dest_name;
+                                    });
+    if (existing_it != dest_parent->subdirs.end()) {
       if (!replace_existing) {
         throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
       }
-      if (!existing_dir->files.empty() || !existing_dir->subdirs.empty()) {
+      if (!(*existing_it)->files.empty() || !(*existing_it)->subdirs.empty()) {
         throw qv::Error{qv::ErrorDomain::State, 0, "Destination directory not empty"};
       }
-      auto existing_it = std::find_if(dest_parent->subdirs.begin(), dest_parent->subdirs.end(),
-                                      [&](const std::shared_ptr<DirectoryEntry>& child) {
-                                        return child->name == dest_name;
-                                      });
-      if (existing_it != dest_parent->subdirs.end()) {
-        dest_parent->subdirs.erase(existing_it);
-      }
+      dest_parent->subdirs.erase(existing_it);
+    }
+    if (std::any_of(dest_parent->files.begin(), dest_parent->files.end(),
+                    [&](const FileEntry& f) { return f.name == dest_name; })) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
     }
 
     auto from_parent_path = std::filesystem::path(from_norm).parent_path().string();
@@ -865,6 +929,10 @@ void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to
     }
     auto moved = *it;
     from_parent->subdirs.erase(it);
+    if (std::any_of(dest_parent->subdirs.begin(), dest_parent->subdirs.end(),
+                    [&](const std::shared_ptr<DirectoryEntry>& child) { return child->name == dest_name; })) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
+    }
     moved->name = dest_name;
     dest_parent->subdirs.push_back(moved);
     dest_parent->mtime = CurrentTimespec();
@@ -878,6 +946,10 @@ void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to
         throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
       }
       dest_parent->files.erase(dest_file_it);
+    }
+    if (std::any_of(dest_parent->subdirs.begin(), dest_parent->subdirs.end(),
+                    [&](const std::shared_ptr<DirectoryEntry>& child) { return child->name == dest_name; })) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
     }
 
     auto from_parent_path = std::filesystem::path(from_norm).parent_path().string();
@@ -893,18 +965,25 @@ void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to
     }
     FileEntry entry = *it;
     from_parent->files.erase(it);
+    auto final_conflict = std::find_if(dest_parent->files.begin(), dest_parent->files.end(),
+                                       [&](const FileEntry& f) { return f.name == dest_name; });
+    if (final_conflict != dest_parent->files.end()) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "Destination exists"};
+    }
     entry.name = dest_name;
     dest_parent->files.push_back(entry);
     dest_parent->mtime = CurrentTimespec();
     from_parent->mtime = dest_parent->mtime;
   }
 
-  SaveMetadata();
+  metadata_guard.MarkDirty();
+  metadata_guard.Commit();
 }
 
 void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<timespec> modification,
                                         std::optional<timespec> change) {
   FilesystemMutexGuard lock(fs_mutex_);
+  MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
   if (auto* dir = FindDirectory(normalized)) {
     if (modification) {
@@ -913,7 +992,8 @@ void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<t
     if (change) {
       dir->mtime = *change;
     }
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
     return;
   }
   if (auto* file = FindFile(normalized)) {
@@ -923,7 +1003,8 @@ void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<t
     if (change) {
       file->ctime = *change;
     }
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
   }
 }
 
@@ -931,6 +1012,7 @@ void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<t
 int VolumeFilesystem::Unlink(const char* path) {
   try {
     FilesystemMutexGuard lock(fs_mutex_);
+    MetadataWritebackGuard metadata_guard(*this);
     auto normalized = NormalizePath(path);
     auto parent_path = std::filesystem::path(normalized).parent_path().string();
     if (parent_path.empty()) {
@@ -949,7 +1031,8 @@ int VolumeFilesystem::Unlink(const char* path) {
       return -ENOENT;
     }
     dir->mtime = CurrentTimespec();
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
     return 0;
   } catch (const qv::Error& error) {
     return FuseErrorFrom(error);
@@ -962,6 +1045,7 @@ int VolumeFilesystem::Mkdir(const char* path, mode_t mode) {
   (void)mode;
   try {
     FilesystemMutexGuard lock(fs_mutex_);
+    MetadataWritebackGuard metadata_guard(*this);
     auto normalized = NormalizePath(path);
     auto parent_path = std::filesystem::path(normalized).parent_path().string();
     if (parent_path.empty()) {
@@ -980,7 +1064,8 @@ int VolumeFilesystem::Mkdir(const char* path, mode_t mode) {
     dir->mtime = CurrentTimespec();
     parent->subdirs.push_back(dir);
     parent->mtime = dir->mtime;
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
     return 0;
   } catch (const qv::Error& error) {
     return FuseErrorFrom(error);
@@ -992,6 +1077,7 @@ int VolumeFilesystem::Mkdir(const char* path, mode_t mode) {
 int VolumeFilesystem::Rmdir(const char* path) {
   try {
     FilesystemMutexGuard lock(fs_mutex_);
+    MetadataWritebackGuard metadata_guard(*this);
     auto normalized = NormalizePath(path);
     if (normalized == "/") {
       return -EBUSY;
@@ -1015,7 +1101,8 @@ int VolumeFilesystem::Rmdir(const char* path) {
     }
     parent->subdirs.erase(it);
     parent->mtime = CurrentTimespec();
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
     return 0;
   } catch (const qv::Error& error) {
     return FuseErrorFrom(error);
@@ -1043,7 +1130,8 @@ int VolumeFilesystem::Truncate(const char* path, off_t size) {
     WriteFileContent(*file, data);
     file->size = data.size();
     file->mtime = CurrentTimespec();
-    SaveMetadata();
+    metadata_guard.MarkDirty();
+    metadata_guard.Commit();
     return 0;
   } catch (const qv::Error& error) {
     return FuseErrorFrom(error);
@@ -1073,6 +1161,24 @@ void VolumeFilesystem::SerializeDirectory(std::ostringstream& out, const Directo
 }
 
 void VolumeFilesystem::SaveMetadata() {
+  FilesystemMutexGuard lock(fs_mutex_);
+  MarkMetadataDirtyLocked();
+  FlushMetadataLocked();
+}
+
+void VolumeFilesystem::MarkMetadataDirtyLocked() {
+  metadata_dirty_ = true;
+}
+
+void VolumeFilesystem::FlushMetadataLocked() {
+  if (!metadata_dirty_) {
+    return;
+  }
+  PersistMetadataLocked();
+  metadata_dirty_ = false;
+}
+
+void VolumeFilesystem::PersistMetadataLocked() {
   std::ostringstream serialized;
   serialized << "NEXT " << next_chunk_index_ << '\n';
   SerializeDirectory(serialized, root_.get(), "/");
