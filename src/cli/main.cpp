@@ -5,6 +5,7 @@
 #include <charconv>  // TSK029
 #include <chrono>    // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <csignal>
+#include <cctype>   // TSK129_Unvalidated_User_Input_in_CLI lowercase system path guards
 #include <cstddef>   // TSK028_Secure_Deletion_and_Data_Remanence
 #include <cstring>   // TSK035_Platform_Specific_Security_Integration
 #include <ctime>     // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -166,6 +167,30 @@ namespace {
 #else
     return path.string();
 #endif
+  }
+
+  bool ValidateNoEmbeddedNull(std::string_view value,
+                               std::string_view description) { // TSK129_Unvalidated_User_Input_in_CLI
+    if (value.find('\0') != std::string_view::npos) {
+      std::cerr << "Validation error: " << description
+                << " contains embedded NUL byte." << std::endl;
+      return false;
+    }
+    return true;
+  }
+
+  bool TryParsePathArgument(std::string_view raw,
+                            std::filesystem::path& out,
+                            std::string_view description) { // TSK129_Unvalidated_User_Input_in_CLI
+    if (!ValidateNoEmbeddedNull(raw, description)) {
+      return false;
+    }
+    if (raw.empty()) {
+      std::cerr << "Validation error: " << description << " is required." << std::endl;
+      return false;
+    }
+    out = std::filesystem::path(std::string(raw));
+    return true;
   }
 
   // TSK009
@@ -902,6 +927,46 @@ namespace {
     if (value.empty()) {
       return std::nullopt;
     }
+    constexpr uint32_t kMaxMigrationVersion = 0x040100u; // TSK129_Unvalidated_User_Input_in_CLI
+    if (value.find('.') != std::string_view::npos) {      // TSK129_Unvalidated_User_Input_in_CLI
+      std::array<uint64_t, 3> components{0, 0, 0};
+      std::string_view remaining = value;
+      for (size_t idx = 0; idx < components.size(); ++idx) { // TSK129_Unvalidated_User_Input_in_CLI
+        auto dot = remaining.find('.');
+        auto token = remaining.substr(0, dot);
+        if (token.empty()) {
+          return std::nullopt;
+        }
+        if (idx < components.size() - 1 && dot == std::string_view::npos) {
+          return std::nullopt;
+        }
+        if (idx == components.size() - 1 && dot != std::string_view::npos) {
+          return std::nullopt;
+        }
+        std::from_chars_result parsed{
+            std::from_chars(token.data(), token.data() + token.size(), components[idx])};
+        if (parsed.ec != std::errc() || parsed.ptr != token.data() + token.size()) {
+          return std::nullopt;
+        }
+        if (dot == std::string_view::npos) {
+          remaining = std::string_view{};
+        } else {
+          remaining = remaining.substr(dot + 1);
+        }
+      }
+      if (!remaining.empty()) {
+        return std::nullopt;
+      }
+      const uint64_t major = components[0];
+      const uint64_t minor = components[1];
+      const uint64_t patch = components[2];
+      const uint64_t version = (major << 16) | (minor << 8) | patch;
+      if (major > 0xFFFFull || minor > 0xFFull || patch > 0xFFull || version > kMaxMigrationVersion) {
+        return std::nullopt;
+      }
+      return static_cast<uint32_t>(version);
+    }
+
     uint32_t version = 0;
     std::from_chars_result result{};
     if (value.size() > 2 && (value[0] == '0') && (value[1] == 'x' || value[1] == 'X')) {
@@ -909,7 +974,7 @@ namespace {
     } else {
       result = std::from_chars(value.data(), value.data() + value.size(), version, 10);
     }
-    if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size() || version > kMaxMigrationVersion) {
       return std::nullopt;
     }
     return version;
@@ -1408,9 +1473,25 @@ namespace {
                       qv::errors::io::kContainerMissing, // TSK020
                       "Container not found: " + SanitizePath(container)};
     }
-    if (!std::filesystem::exists(mountpoint) || !std::filesystem::is_directory(mountpoint)) {
+    std::error_code mount_ec;
+    auto status = std::filesystem::status(mountpoint, mount_ec); // TSK129_Unvalidated_User_Input_in_CLI
+    if (mount_ec || !std::filesystem::exists(status) || !std::filesystem::is_directory(status)) {
       throw qv::Error{qv::ErrorDomain::Validation, 0,
                       "Mount point unavailable: " + SanitizePath(mountpoint)};
+    }
+    std::error_code empty_ec;
+    const bool is_empty_mount = std::filesystem::is_empty(mountpoint, empty_ec); // TSK129_Unvalidated_User_Input_in_CLI
+    if (empty_ec) {
+      throw qv::Error{qv::ErrorDomain::Validation, empty_ec.value(),
+                      "Unable to inspect mount point: " + SanitizePath(mountpoint)};
+    }
+    if (!is_empty_mount) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Mount point must be empty: " + SanitizePath(mountpoint)};
+    }
+    if (::access(mountpoint.c_str(), R_OK | W_OK | X_OK) != 0) { // TSK129_Unvalidated_User_Input_in_CLI
+      throw qv::Error{qv::ErrorDomain::Validation, errno,
+                      "Insufficient permissions for mount point: " + SanitizePath(mountpoint)};
     }
     auto lock_path = container;
     lock_path += ".locked"; // TSK026
@@ -1557,6 +1638,58 @@ namespace {
       const std::filesystem::path& container, std::optional<std::filesystem::path> backup_key,
       qv::orchestrator::VolumeManager& vm,
       const SecurityIntegrationFlags& security_flags) { // TSK024_Key_Rotation_and_Lifecycle_Management, TSK035_Platform_Specific_Security_Integration
+    if (backup_key) { // TSK129_Unvalidated_User_Input_in_CLI
+      std::filesystem::path& backup_target = *backup_key;
+      auto parent = backup_target.parent_path();
+      std::error_code parent_ec;
+      if (!parent.empty()) {
+        auto parent_status = std::filesystem::status(parent, parent_ec);
+        if (parent_ec) {
+          std::cerr << "Validation error: Unable to access backup key directory." << std::endl;
+          return kExitUsage;
+        }
+        if (!std::filesystem::exists(parent_status)) {
+          parent_ec.clear();
+          if (!std::filesystem::create_directories(parent, parent_ec) || parent_ec) {
+            std::cerr << "I/O error: Cannot prepare backup key directory." << std::endl;
+            return kExitIO;
+          }
+        } else if (!std::filesystem::is_directory(parent_status)) {
+          std::cerr << "Validation error: Backup key parent is not a directory." << std::endl;
+          return kExitUsage;
+        }
+      }
+      std::error_code target_status_ec;
+      auto target_status = std::filesystem::status(backup_target, target_status_ec);
+      if (target_status_ec && target_status_ec.value() != ENOENT) {
+        std::cerr << "Validation error: Unable to inspect backup key path." << std::endl;
+        return kExitUsage;
+      }
+      const bool target_exists = std::filesystem::exists(target_status);
+      if (target_exists && !std::filesystem::is_regular_file(target_status)) {
+        std::cerr << "Validation error: Backup key path must be a file." << std::endl;
+        return kExitUsage;
+      }
+      bool remove_probe = false;
+      {
+        std::ofstream probe;
+        if (!target_exists) {
+          probe.open(backup_target, std::ios::binary | std::ios::trunc);
+          remove_probe = true;
+        } else {
+          probe.open(backup_target, std::ios::binary | std::ios::app);
+        }
+        if (!probe.is_open()) {
+          std::cerr << "I/O error: Backup key path not writable." << std::endl;
+          return kExitIO;
+        }
+      }
+      if (remove_probe) {
+        std::error_code remove_ec;
+        std::filesystem::remove(backup_target, remove_ec);
+      }
+    }
+
     auto current = ReadPassword("Current password: ");
     qv::security::Zeroizer::ScopeWiper<char> current_guard(current.data(), current.size());
     auto next = ReadPassword("New password: ");
@@ -1647,11 +1780,66 @@ namespace {
       return kExitIO;
     }
 
+    if (output_dir.empty()) { // TSK129_Unvalidated_User_Input_in_CLI
+      std::cerr << "Validation error: Backup directory not specified." << std::endl;
+      return kExitUsage;
+    }
+
+    std::error_code canonical_ec;
+    auto canonical = std::filesystem::weakly_canonical(output_dir, canonical_ec); // TSK129_Unvalidated_User_Input_in_CLI
+    if (canonical_ec) {
+      canonical = std::filesystem::absolute(output_dir, canonical_ec);
+    }
+    if (canonical_ec) {
+      std::cerr << "Validation error: Backup directory is invalid." << std::endl;
+      return kExitUsage;
+    }
+
+    if (canonical == canonical.root_path()) { // TSK129_Unvalidated_User_Input_in_CLI
+      std::cerr << "Validation error: Refusing to back up to filesystem root." << std::endl;
+      return kExitUsage;
+    }
+
+#if defined(_WIN32)
+    auto canonical_str = canonical.generic_string();
+    std::transform(canonical_str.begin(), canonical_str.end(), canonical_str.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    if (canonical_str == "c:/" || canonical_str.rfind("c:/windows", 0) == 0) { // TSK129_Unvalidated_User_Input_in_CLI
+      std::cerr << "Validation error: Refusing to back up to system directory." << std::endl;
+      return kExitUsage;
+    }
+#else
+    auto canonical_str = canonical.generic_string();
+    if (canonical_str == "/" || canonical_str.rfind("/etc", 0) == 0 ||
+        canonical_str.rfind("/sys", 0) == 0 || canonical_str.rfind("/proc", 0) == 0) { // TSK129_Unvalidated_User_Input_in_CLI
+      std::cerr << "Validation error: Refusing to back up to system directory." << std::endl;
+      return kExitUsage;
+    }
+#endif
+
     try {
       std::filesystem::create_directories(output_dir);
     } catch (const std::filesystem::filesystem_error& err) {
       throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
                       "Failed to prepare backup directory: " + SanitizePath(output_dir)};
+    }
+
+    const auto probe_path = output_dir / ".qv_backup_write_test"; // TSK129_Unvalidated_User_Input_in_CLI
+    {
+      std::error_code remove_ec;
+      std::filesystem::remove(probe_path, remove_ec);
+    }
+    {
+      std::ofstream probe(probe_path, std::ios::binary | std::ios::trunc);
+      if (!probe.is_open()) {
+        std::cerr << "I/O error: Output directory not writable." << std::endl;
+        return kExitIO;
+      }
+    }
+    {
+      std::error_code remove_ec;
+      std::filesystem::remove(probe_path, remove_ec);
     }
 
 #if !defined(_WIN32)
@@ -2019,15 +2207,25 @@ int main(int argc, char** argv) {
         PrintUsage();
         return kExitUsage;
       }
-      return HandleCreate(argv[index], vm, security_flags);
+      std::filesystem::path container_path; // TSK129_Unvalidated_User_Input_in_CLI
+      if (!TryParsePathArgument(std::string_view(argv[index]), container_path, "container path")) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleCreate(container_path, vm, security_flags);
     }
     if (cmd == "mount") {
       if (argc - index != 2) {
         PrintUsage();
         return kExitUsage;
       }
-      std::filesystem::path container_path = argv[index];
-      std::filesystem::path mount_path = argv[index + 1];
+      std::filesystem::path container_path; // TSK129_Unvalidated_User_Input_in_CLI
+      std::filesystem::path mount_path;     // TSK129_Unvalidated_User_Input_in_CLI
+      if (!TryParsePathArgument(std::string_view(argv[index]), container_path, "container path") ||
+          !TryParsePathArgument(std::string_view(argv[index + 1]), mount_path, "mount point")) {
+        PrintUsage();
+        return kExitUsage;
+      }
       return HandleMount(container_path, mount_path, vm, security_flags);
     }
     if (cmd == "rekey") {
@@ -2037,7 +2235,7 @@ int main(int argc, char** argv) {
       }
       std::optional<std::filesystem::path>
           backup_path; // TSK024_Key_Rotation_and_Lifecycle_Management
-      std::filesystem::path container_path;
+      std::optional<std::filesystem::path> container_path; // TSK129_Unvalidated_User_Input_in_CLI
       for (int i = index; i < argc; ++i) {
         std::string_view arg = argv[i];
         if (arg.rfind("--backup-key=", 0) == 0) {
@@ -2046,21 +2244,31 @@ int main(int argc, char** argv) {
             PrintUsage();
             return kExitUsage;
           }
-          backup_path = std::filesystem::path(std::string(value));
+          std::filesystem::path parsed_backup;
+          if (!TryParsePathArgument(value, parsed_backup, "backup key path")) { // TSK129_Unvalidated_User_Input_in_CLI
+            PrintUsage();
+            return kExitUsage;
+          }
+          backup_path = parsed_backup;
           continue;
         }
-        if (container_path.empty()) {
-          container_path = argv[i];
+        if (!container_path) {
+          std::filesystem::path parsed_container;
+          if (!TryParsePathArgument(arg, parsed_container, "container path")) { // TSK129_Unvalidated_User_Input_in_CLI
+            PrintUsage();
+            return kExitUsage;
+          }
+          container_path = parsed_container;
         } else {
           PrintUsage();
           return kExitUsage;
         }
       }
-      if (container_path.empty()) {
+      if (!container_path) {
         PrintUsage();
         return kExitUsage;
       }
-      return HandleRekey(container_path, backup_path, vm, security_flags);
+      return HandleRekey(*container_path, backup_path, vm, security_flags);
     }
     if (cmd == "migrate") { // TSK033
       if (argc - index < 1 || argc - index > 2) {
@@ -2073,6 +2281,10 @@ int main(int argc, char** argv) {
         std::string_view arg = argv[i];
         if (arg.rfind("--migrate-to=", 0) == 0) {
           auto value = arg.substr(std::string_view("--migrate-to=").size());
+          if (!ValidateNoEmbeddedNull(value, "migration target")) { // TSK129_Unvalidated_User_Input_in_CLI
+            PrintUsage();
+            return kExitUsage;
+          }
           auto parsed = ParseVersionFlag(value);
           if (!parsed) {
             PrintUsage();
@@ -2082,7 +2294,12 @@ int main(int argc, char** argv) {
           continue;
         }
         if (!container_path) {
-          container_path = std::filesystem::path(std::string(arg));
+          std::filesystem::path parsed_container;
+          if (!TryParsePathArgument(arg, parsed_container, "container path")) { // TSK129_Unvalidated_User_Input_in_CLI
+            PrintUsage();
+            return kExitUsage;
+          }
+          container_path = parsed_container;
         } else {
           PrintUsage();
           return kExitUsage;
@@ -2099,7 +2316,12 @@ int main(int argc, char** argv) {
         PrintUsage();
         return kExitUsage;
       }
-      return HandleMigrateNonces(argv[index]);
+      std::filesystem::path container_path; // TSK129_Unvalidated_User_Input_in_CLI
+      if (!TryParsePathArgument(std::string_view(argv[index]), container_path, "container path")) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleMigrateNonces(container_path);
     }
     if (cmd == "backup") { // TSK032_Backup_Recovery_and_Disaster_Recovery
       std::optional<std::filesystem::path> output_dir;
@@ -2112,11 +2334,21 @@ int main(int argc, char** argv) {
             PrintUsage();
             return kExitUsage;
           }
-          output_dir = std::filesystem::path(std::string(value));
+          std::filesystem::path parsed_output;
+          if (!TryParsePathArgument(value, parsed_output, "backup directory")) { // TSK129_Unvalidated_User_Input_in_CLI
+            PrintUsage();
+            return kExitUsage;
+          }
+          output_dir = parsed_output;
           continue;
         }
         if (!container_path) {
-          container_path = std::filesystem::path(std::string(arg));
+          std::filesystem::path parsed_container;
+          if (!TryParsePathArgument(arg, parsed_container, "container path")) { // TSK129_Unvalidated_User_Input_in_CLI
+            PrintUsage();
+            return kExitUsage;
+          }
+          container_path = parsed_container;
         } else {
           PrintUsage();
           return kExitUsage;
@@ -2133,14 +2365,24 @@ int main(int argc, char** argv) {
         PrintUsage();
         return kExitUsage;
       }
-      return HandleFsck(argv[index]);
+      std::filesystem::path container_path; // TSK129_Unvalidated_User_Input_in_CLI
+      if (!TryParsePathArgument(std::string_view(argv[index]), container_path, "container path")) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleFsck(container_path);
     }
     if (cmd == "destroy") { // TSK028_Secure_Deletion_and_Data_Remanence
       if (argc - index != 1) {
         PrintUsage();
         return kExitUsage;
       }
-      return HandleDestroy(argv[index]);
+      std::filesystem::path container_path; // TSK129_Unvalidated_User_Input_in_CLI
+      if (!TryParsePathArgument(std::string_view(argv[index]), container_path, "container path")) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleDestroy(container_path);
     }
 
     PrintUsage();
