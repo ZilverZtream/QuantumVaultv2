@@ -161,6 +161,15 @@ int qv_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
   return filesystem->Truncate(path, size);
 }
 
+int qv_release(const char* path, struct fuse_file_info* fi) {
+  FilesystemInvocationGuard guard;
+  auto* filesystem = guard.get();
+  if (!filesystem) {
+    return -EIO;
+  }
+  return filesystem->Release(path, fi);  // TSK131_Missing_Flush_on_Close propagate close-time flush
+}
+
 const struct fuse_operations kOperations = {
     .getattr = qv_getattr,
     .mkdir = qv_mkdir,
@@ -172,6 +181,7 @@ const struct fuse_operations kOperations = {
     .write = qv_write,
     .readdir = qv_readdir,
     .create = qv_create,
+    .release = qv_release,
 };
 
 }  // namespace

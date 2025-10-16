@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
+#include <iostream>
 #include <limits> // TSK100_Integer_Overflow_and_Arithmetic bounds checks
 #include <mutex>  // TSK067_Nonce_Safety
 
@@ -115,6 +117,13 @@ ChunkManager::ChunkManager(const std::filesystem::path& container,
 }
 
 ChunkManager::~ChunkManager() {
+  try {
+    Flush();  // TSK131_Missing_Flush_on_Close persist cached chunk data before shutdown
+  } catch (const std::exception& error) {
+    std::cerr << "ChunkManager flush failed: " << error.what() << std::endl;  // TSK131_Missing_Flush_on_Close diagnostics
+  } catch (...) {
+    std::cerr << "ChunkManager flush failed: unknown error" << std::endl;  // TSK131_Missing_Flush_on_Close diagnostics
+  }
   qv::security::Zeroizer::Wipe(
       std::span<uint8_t>(data_key_.data(), data_key_.size())); // TSK125_Missing_Secure_Deletion_for_Keys
   qv::security::Zeroizer::Wipe(

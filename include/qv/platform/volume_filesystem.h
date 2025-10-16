@@ -104,6 +104,7 @@ public:
   int Mkdir(const char* path, mode_t mode);
   int Rmdir(const char* path);
   int Truncate(const char* path, off_t size);
+  int Release(const char* path, struct fuse_file_info* fi);  // TSK131_Missing_Flush_on_Close flush chunk cache on close
 #endif  // defined(__linux__)
 
   // Generic helpers shared by platform adapters. // TSK063_WinFsp_Windows_Driver_Integration
@@ -125,6 +126,7 @@ public:
                         std::optional<timespec> change);
 
   std::shared_ptr<storage::BlockDevice> BlockDeviceHandle() const { return device_; }
+  void FlushStorage();  // TSK131_Missing_Flush_on_Close ensure chunk persistence coordination
 
 private:
   class MetadataWritebackGuard;  // TSK117_Race_Conditions_in_Filesystem scoped metadata batching

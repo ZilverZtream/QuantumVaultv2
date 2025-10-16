@@ -610,11 +610,17 @@ NTSTATUS WinFspAdapter::Impl::Overwrite(FSP_FILE_SYSTEM* fs, PVOID context, UINT
 VOID WinFspAdapter::Impl::Cleanup(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR filename,
                                   ULONG flags) {
   (void)filename;
+  auto* self = FromFs(fs);
   auto* node = static_cast<NodeContext*>(context);
-  if (!node) {
+  if (!self || !node) {
     return;
   }
   if (flags & FspCleanupDelete) {
+    try {
+      self->volume_fs_->FlushStorage();  // TSK131_Missing_Flush_on_Close ensure dirty chunks reach the device before delete
+    } catch (...) {
+      // Best-effort; WinFsp will surface subsequent errors via Close.
+    }
     node->delete_on_close = true;
   }
 }
@@ -624,6 +630,11 @@ VOID WinFspAdapter::Impl::Close(FSP_FILE_SYSTEM* fs, PVOID context) {
   auto* node = static_cast<NodeContext*>(context);
   if (!node) {
     return;
+  }
+  try {
+    self->volume_fs_->FlushStorage();  // TSK131_Missing_Flush_on_Close persist cached chunks before metadata updates
+  } catch (...) {
+    // Continue with close to avoid leaking handles; metadata flush handles remaining errors.
   }
   if (node->delete_on_close) {
     try {

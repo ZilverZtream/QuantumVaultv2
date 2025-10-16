@@ -1762,6 +1762,19 @@ int VolumeFilesystem::Truncate(const char* path, off_t size) {
   }
 }
 
+int VolumeFilesystem::Release(const char* path, struct fuse_file_info* fi) {
+  (void)path;
+  (void)fi;
+  try {
+    FlushStorage();  // TSK131_Missing_Flush_on_Close ensure dirty chunks reach disk before release
+    return 0;
+  } catch (const qv::Error& error) {
+    return FuseErrorFrom(error);
+  } catch (...) {
+    return -EIO;
+  }
+}
+
 #endif  // defined(__linux__)
 
 void VolumeFilesystem::SerializeDirectory(std::ostringstream& out, const DirectoryEntry* dir,
@@ -1800,6 +1813,11 @@ void VolumeFilesystem::SaveMetadata() {
   FilesystemMutexGuard lock(fs_mutex_);
   MarkMetadataDirtyLocked();
   FlushMetadataLocked();
+}
+
+void VolumeFilesystem::FlushStorage() {
+  FilesystemMutexGuard lock(fs_mutex_);
+  device_->Flush();  // TSK131_Missing_Flush_on_Close coordinate chunk persistence with metadata updates
 }
 
 void VolumeFilesystem::MarkMetadataDirtyLocked() {
