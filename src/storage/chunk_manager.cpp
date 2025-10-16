@@ -268,10 +268,18 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
   if (expected_tag_size == 0 || expected_nonce_size == 0) {
     throw Error{ErrorDomain::Crypto, 0, "Unsupported cipher parameters"};
   }
+  if (chunk_index < 0) {
+    throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard bounds
+  }
+  const uint64_t chunk_index_u = static_cast<uint64_t>(chunk_index);
+  if (chunk_index_u > 0 &&
+      kChunkPayloadSize > std::numeric_limits<uint64_t>::max() / chunk_index_u) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard logical offset
+  }
   std::array<uint8_t, kChunkPayloadSize> plaintext{};
   qv::security::Zeroizer::ScopeWiper plaintext_guard(plaintext.data(), plaintext.size()); // TSK028A_Memory_Wiping_Gaps
   std::fill(plaintext.begin(), plaintext.end(), 0);
-  auto logical_offset = static_cast<uint64_t>(chunk_index) * kChunkPayloadSize;
+  auto logical_offset = chunk_index_u * kChunkPayloadSize;  // TSK119_Integer_Overflow_in_Chunk_Calculations
   auto copy_size = std::min<size_t>(data.size(), plaintext.size());
   if (copy_size > std::numeric_limits<uint32_t>::max()) {
     throw Error{ErrorDomain::Validation, 0, "Chunk payload too large"}; // TSK100_Integer_Overflow_and_Arithmetic guard cast
