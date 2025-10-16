@@ -63,6 +63,7 @@
 #include "qv/orchestrator/constant_time_mount.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/orchestrator/event_bus.h"           // TSK027
 #include "qv/orchestrator/io_util.h"             // TSK143_Missing_Fsync_And_Durability_Issues durable manifest writes
+#include "qv/orchestrator/sealed_key.h"          // TSK713_TPM_SecureEnclave_Key_Sealing hardware sealing interface
 #include "qv/orchestrator/volume_manager.h"
 #include "qv/security/zeroizer.h" // TSK125_Missing_Secure_Deletion_for_Keys scoped wiping
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
@@ -71,6 +72,7 @@
 #if defined(__linux__)
 #include "qv/platform/fuse_adapter.h" // TSK062_FUSE_Filesystem_Integration_Linux
 #endif
+#include "qv/platform/sealed_key_registration.h" // TSK713_TPM_SecureEnclave_Key_Sealing provider wiring
 
 #ifdef _WIN32
 #include <fcntl.h>    // TSK028_Secure_Deletion_and_Data_Remanence
@@ -199,7 +201,10 @@ namespace {
 
   struct SecurityIntegrationFlags { // TSK035_Platform_Specific_Security_Integration
     bool use_os_store = false;
-    bool use_tpm_seal = false;
+    std::string seal_provider;          // TSK713_TPM_SecureEnclave_Key_Sealing requested provider
+    std::vector<uint8_t> seal_policy;   // TSK713_TPM_SecureEnclave_Key_Sealing policy TLV cache
+
+    bool HasHardwareSeal() const noexcept { return !seal_provider.empty(); }
   };
 
 #if defined(__linux__)
@@ -232,12 +237,6 @@ namespace {
   constexpr bool kSupportsOsCredentialStore = true; // TSK035_Platform_Specific_Security_Integration
 #else
   constexpr bool kSupportsOsCredentialStore = false; // TSK035_Platform_Specific_Security_Integration
-#endif
-
-#if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
-  constexpr bool kSupportsTpmSealing = true; // TSK035_Platform_Specific_Security_Integration
-#else
-  constexpr bool kSupportsTpmSealing = false; // TSK035_Platform_Specific_Security_Integration
 #endif
 
   constexpr int kCredentialPersistFailed = // TSK035_Platform_Specific_Security_Integration
@@ -920,7 +919,7 @@ namespace {
     std::cerr << "\nGlobal flags:\n"; // TSK035_Platform_Specific_Security_Integration
     std::cerr << "  --syslog=host:port   Forward audit logs to syslog collector\n";
     std::cerr << "  --keychain           Persist credentials in OS key store\n"; // TSK035_Platform_Specific_Security_Integration
-    std::cerr << "  --tpm-seal           Seal credentials with TPM PCR policy\n"; // TSK035_Platform_Specific_Security_Integration
+    std::cerr << "  --seal=<provider>   Seal credentials with hardware-backed provider\n"; // TSK713_TPM_SecureEnclave_Key_Sealing
     std::cerr << "  --kdf-iterations=N   Override PBKDF2 iteration count for new headers\n"; // TSK036_PBKDF2_Argon2_Migration_Path
     std::cerr << "\nMount flags:\n"; // TSK710_Implement_Hidden_Volumes document hidden options
     std::cerr << "  --hidden            Mount the hidden volume region when available\n";
@@ -1163,8 +1162,8 @@ namespace {
 #endif
 
 #if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
-  std::filesystem::path TpmSealPath(const std::filesystem::path& container) { // TSK035_Platform_Specific_Security_Integration
-    return MetadataDirFor(container) / "credential.tpm";
+  std::filesystem::path SealedKeyPath(const std::filesystem::path& container) { // TSK713_TPM_SecureEnclave_Key_Sealing generic path
+    return MetadataDirFor(container) / "credential.seal";
   }
 
   ESYS_CONTEXT* InitializeTpmContext() { // TSK035_Platform_Specific_Security_Integration
@@ -1222,12 +1221,7 @@ namespace {
     return primary_handle;
   }
 
-  struct SealedCredential { // TSK035_Platform_Specific_Security_Integration
-    std::vector<uint8_t> public_area;
-    std::vector<uint8_t> private_area;
-  };
-
-  SealedCredential SealWithTpm(std::string_view password) { // TSK035_Platform_Specific_Security_Integration
+  qv::orchestrator::SealedKey SealWithTpm(std::string_view password) { // TSK713_TPM_SecureEnclave_Key_Sealing TPM sealing
     TPM2B_SENSITIVE_DATA max_buffer{};
     if (password.size() > sizeof(max_buffer.buffer)) {
       throw qv::Error{qv::ErrorDomain::Validation, kCredentialPersistFailed,
@@ -1299,44 +1293,67 @@ namespace {
       private_data.resize(offset);
 
       FinalizeTpmContext(ctx, primary);
-      return SealedCredential{std::move(public_data), std::move(private_data)};
+
+      std::vector<uint8_t> blob;
+      blob.reserve(sizeof(uint32_t) * 2 + public_data.size() + private_data.size());
+      auto append_u32 = [&blob](uint32_t value) {
+        for (int i = 0; i < 4; ++i) {
+          blob.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+        }
+      };
+      append_u32(static_cast<uint32_t>(public_data.size()));
+      blob.insert(blob.end(), public_data.begin(), public_data.end());
+      append_u32(static_cast<uint32_t>(private_data.size()));
+      blob.insert(blob.end(), private_data.begin(), private_data.end());
+
+      qv::orchestrator::SealedKey sealed{};
+      sealed.provider_id = "tpm2";
+      sealed.blob = std::move(blob);
+      sealed.policy_mask = (1u << 7);
+      sealed.policy_tlv = {0x01, 0x01, 0x07};
+      return sealed;
     } catch (...) {
       FinalizeTpmContext(ctx, primary);
       throw;
     }
   }
 
-  void WriteTpmSealFile(const std::filesystem::path& container, const SealedCredential& blob) { // TSK035_Platform_Specific_Security_Integration
+  void WriteSealedKeyFile(const std::filesystem::path& container,
+                          const qv::orchestrator::SealedKey& key) { // TSK713_TPM_SecureEnclave_Key_Sealing metadata writer
     EnsureCredentialDir(container);
-    auto path = TpmSealPath(container);
+    auto path = SealedKeyPath(container);
     std::vector<uint8_t> buffer;
-    buffer.reserve(sizeof(uint32_t) * 2 + blob.public_area.size() + blob.private_area.size());
+    buffer.reserve(sizeof(uint32_t) * 4 + key.provider_id.size() + key.policy_tlv.size() + key.blob.size());
     auto append_u32 = [&buffer](uint32_t value) {
       for (int i = 0; i < 4; ++i) {
         buffer.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
       }
     };
-    append_u32(static_cast<uint32_t>(blob.public_area.size()));
-    buffer.insert(buffer.end(), blob.public_area.begin(), blob.public_area.end());
-    append_u32(static_cast<uint32_t>(blob.private_area.size()));
-    buffer.insert(buffer.end(), blob.private_area.begin(), blob.private_area.end());
+    append_u32(static_cast<uint32_t>(key.provider_id.size()));
+    buffer.insert(buffer.end(), key.provider_id.begin(), key.provider_id.end());
+    append_u32(key.policy_mask);
+    append_u32(static_cast<uint32_t>(key.policy_tlv.size()));
+    buffer.insert(buffer.end(), key.policy_tlv.begin(), key.policy_tlv.end());
+    append_u32(static_cast<uint32_t>(key.blob.size()));
+    buffer.insert(buffer.end(), key.blob.begin(), key.blob.end());
     WriteBinaryFile(path, std::span<const uint8_t>(buffer.data(), buffer.size()));
   }
 
-  std::optional<SealedCredential> ReadTpmSealFile(const std::filesystem::path& container) { // TSK035_Platform_Specific_Security_Integration
-    auto path = TpmSealPath(container);
+  std::optional<qv::orchestrator::SealedKey> ReadSealedKeyFile(
+      const std::filesystem::path& container) { // TSK713_TPM_SecureEnclave_Key_Sealing metadata reader
+    auto path = SealedKeyPath(container);
     if (!std::filesystem::exists(path)) {
       return std::nullopt;
     }
     auto buffer = ReadBinaryFile(path);
-    if (buffer.size() < sizeof(uint32_t) * 2) {
+    if (buffer.size() < sizeof(uint32_t) * 4) {
       throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
-                      "Corrupt TPM credential blob: " + SanitizePath(path)};
+                      "Corrupt sealed credential blob: " + SanitizePath(path)};
     }
     auto read_u32 = [&buffer](size_t& offset) -> uint32_t {
       if (offset + 4 > buffer.size()) {
         throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
-                        "Corrupt TPM credential blob length"};
+                        "Corrupt sealed credential length"};
       }
       uint32_t value = 0;
       for (int i = 0; i < 4; ++i) {
@@ -1345,25 +1362,43 @@ namespace {
       return value;
     };
     size_t offset = 0;
-    uint32_t public_size = read_u32(offset);
-    if (offset + public_size > buffer.size()) {
+    const uint32_t provider_len = read_u32(offset);
+    if (offset + provider_len > buffer.size()) {
       throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
-                      "Corrupt TPM credential public blob"};
+                      "Corrupt sealed credential provider length"};
     }
-    std::vector<uint8_t> public_blob(buffer.begin() + static_cast<std::ptrdiff_t>(offset),
-                                     buffer.begin() + static_cast<std::ptrdiff_t>(offset + public_size));
-    offset += public_size;
-    uint32_t private_size = read_u32(offset);
-    if (offset + private_size > buffer.size()) {
+    std::string provider(reinterpret_cast<const char*>(buffer.data() + offset), provider_len);
+    offset += provider_len;
+    const uint32_t policy_mask = read_u32(offset);
+    const uint32_t policy_len = read_u32(offset);
+    if (offset + policy_len > buffer.size()) {
       throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
-                      "Corrupt TPM credential private blob"};
+                      "Corrupt sealed credential policy length"};
     }
-    std::vector<uint8_t> private_blob(buffer.begin() + static_cast<std::ptrdiff_t>(offset),
-                                      buffer.begin() + static_cast<std::ptrdiff_t>(offset + private_size));
-    return SealedCredential{std::move(public_blob), std::move(private_blob)};
+    std::vector<uint8_t> policy(buffer.begin() + static_cast<std::ptrdiff_t>(offset),
+                                buffer.begin() + static_cast<std::ptrdiff_t>(offset + policy_len));
+    offset += policy_len;
+    const uint32_t blob_len = read_u32(offset);
+    if (offset + blob_len > buffer.size()) {
+      throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
+                      "Corrupt sealed credential blob length"};
+    }
+    std::vector<uint8_t> blob(buffer.begin() + static_cast<std::ptrdiff_t>(offset),
+                              buffer.begin() + static_cast<std::ptrdiff_t>(offset + blob_len));
+    offset += blob_len;
+    if (offset != buffer.size()) {
+      throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
+                      "Corrupt sealed credential trailing data"};
+    }
+    qv::orchestrator::SealedKey key{};
+    key.provider_id = std::move(provider);
+    key.policy_mask = policy_mask;
+    key.policy_tlv = std::move(policy);
+    key.blob = std::move(blob);
+    return key;
   }
 
-  std::optional<std::string> UnsealWithTpm(const SealedCredential& blob) { // TSK035_Platform_Specific_Security_Integration
+  std::optional<std::string> UnsealWithTpm(const qv::orchestrator::SealedKey& key) { // TSK713_TPM_SecureEnclave_Key_Sealing TPM unseal
     ESYS_CONTEXT* ctx = InitializeTpmContext();
     ESYS_TR primary = ESYS_TR_NONE;
     ESYS_TR sealed = ESYS_TR_NONE;
@@ -1371,24 +1406,49 @@ namespace {
       primary = CreatePrimarySealingParent(ctx);
 
       size_t offset = 0;
+      auto read_u32 = [&](std::string_view message) {
+        if (offset + sizeof(uint32_t) > key.blob.size()) {
+          throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed, std::string(message)};
+        }
+        uint32_t value = 0;
+        for (int i = 0; i < 4; ++i) {
+          value |= static_cast<uint32_t>(static_cast<uint8_t>(key.blob[offset + i])) << (i * 8);
+        }
+        offset += sizeof(uint32_t);
+        return value;
+      };
+      const uint32_t public_len = read_u32("TPM public length truncated");
+      if (offset + public_len + sizeof(uint32_t) > key.blob.size()) {
+        throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
+                        "TPM blob missing private data"};
+      }
       TPM2B_PUBLIC public_data{};
-      TSS2_RC rc = Tss2_MU_TPM2B_PUBLIC_Unmarshal(blob.public_area.data(), blob.public_area.size(), &offset,
-                                                  &public_data);
+      size_t marshal_offset = 0;
+      TSS2_RC rc = Tss2_MU_TPM2B_PUBLIC_Unmarshal(key.blob.data() + offset, public_len, &marshal_offset, &public_data);
       if (rc != TSS2_RC_SUCCESS) {
         throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
                         "Failed to unmarshal TPM public blob", static_cast<int>(rc)};
       }
-      offset = 0;
+      offset += public_len;
+      const uint32_t private_len = read_u32("TPM private length truncated");
+      if (offset + private_len > key.blob.size()) {
+        throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
+                        "TPM blob truncated private data"};
+      }
       TPM2B_PRIVATE private_data{};
-      rc = Tss2_MU_TPM2B_PRIVATE_Unmarshal(blob.private_area.data(), blob.private_area.size(), &offset,
-                                           &private_data);
+      marshal_offset = 0;
+      rc = Tss2_MU_TPM2B_PRIVATE_Unmarshal(key.blob.data() + offset, private_len, &marshal_offset, &private_data);
+      if (rc != TSS2_RC_SUCCESS) {
+        throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
+                        "Failed to unmarshal TPM private blob", static_cast<int>(rc)};
+      }
+      offset += private_len;
       if (rc != TSS2_RC_SUCCESS) {
         throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
                         "Failed to unmarshal TPM private blob", static_cast<int>(rc)};
       }
 
-      rc = Esys_Load(ctx, primary, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, &private_data, &public_data,
-                     &sealed);
+      rc = Esys_Load(ctx, primary, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, &private_data, &public_data, &sealed);
       if (rc != TSS2_RC_SUCCESS) {
         throw qv::Error{qv::ErrorDomain::Security, kCredentialLoadFailed,
                         "TPM Load failed", static_cast<int>(rc)};
@@ -1416,22 +1476,54 @@ namespace {
       throw;
     }
   }
+
+  class NativeTpmSealedKeyProvider final : public qv::orchestrator::SealedKeyProvider { // TSK713_TPM_SecureEnclave_Key_Sealing TPM provider
+   public:
+    std::string_view Id() const noexcept override { return "tpm2"; }
+    std::string_view Description() const noexcept override {
+      return "Integrated TPM 2.0 sealed key provider";
+    }
+    bool IsAvailable() const noexcept override { return true; }
+
+    qv::orchestrator::SealedKey Seal(const qv::orchestrator::SealRequest& request) override {
+      std::string password(reinterpret_cast<const char*>(request.key.data()),
+                           reinterpret_cast<const char*>(request.key.data()) + request.key.size());
+      return SealWithTpm(password);
+    }
+
+    std::vector<uint8_t> Unseal(const qv::orchestrator::SealedKey& sealed) override {
+      auto password = UnsealWithTpm(sealed);
+      if (!password) {
+        return {};
+      }
+      return std::vector<uint8_t>(password->begin(), password->end());
+    }
+  };
+
+  void RegisterNativeTpmSealer() { // TSK713_TPM_SecureEnclave_Key_Sealing register TPM provider
+    qv::orchestrator::SealedKeyRegistry::Instance().RegisterProvider(
+        std::make_unique<NativeTpmSealedKeyProvider>());
+  }
 #endif
 
   void PersistCredential(const std::filesystem::path& container, std::string_view password,
                          const SecurityIntegrationFlags& flags) { // TSK035_Platform_Specific_Security_Integration
-    if (!flags.use_os_store && !flags.use_tpm_seal) {
+    if (!flags.use_os_store && !flags.HasHardwareSeal()) {
       return;
     }
-    if (flags.use_tpm_seal) {
-      if (!kSupportsTpmSealing) {
+    if (flags.HasHardwareSeal()) {
+      auto& registry = qv::orchestrator::SealedKeyRegistry::Instance();
+      auto* provider = registry.FindProvider(flags.seal_provider);
+      if (!provider || !provider->IsAvailable()) {
         throw qv::Error{qv::ErrorDomain::Config, kCredentialPersistFailed,
-                        "TPM sealing requested but not available"};
+                        "Requested hardware sealing provider unavailable"};
       }
-#if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
-      auto sealed = SealWithTpm(password);
-      WriteTpmSealFile(container, sealed);
-#endif
+      std::vector<uint8_t> key(password.begin(), password.end());
+      qv::orchestrator::SealRequest request{std::span<const uint8_t>(key.data(), key.size()), flags.seal_policy};
+      request.label = CredentialAccountName(container);
+      auto sealed = provider->Seal(request);
+      WriteSealedKeyFile(container, sealed);
+      std::fill(key.begin(), key.end(), 0);
     }
     if (flags.use_os_store) {
       if (!kSupportsOsCredentialStore) {
@@ -1465,15 +1557,19 @@ namespace {
   LoadPersistedCredential(const std::filesystem::path& container,
                           const SecurityIntegrationFlags& flags) { // TSK035_Platform_Specific_Security_Integration
     try {
-      if (flags.use_tpm_seal && kSupportsTpmSealing) {
-#if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
-        if (auto sealed = ReadTpmSealFile(container)) {
-          auto password = UnsealWithTpm(*sealed);
-          if (password) {
-            return password;
+      if (flags.HasHardwareSeal()) {
+        if (auto sealed = ReadSealedKeyFile(container)) {
+          auto& registry = qv::orchestrator::SealedKeyRegistry::Instance();
+          auto* provider = registry.FindProvider(sealed->provider_id);
+          if (!provider || !provider->IsAvailable()) {
+            throw qv::Error{qv::ErrorDomain::Config, kCredentialLoadFailed,
+                            "Hardware sealing provider unavailable"};
           }
+          auto plaintext = provider->Unseal(*sealed);
+          std::string password(plaintext.begin(), plaintext.end());
+          std::fill(plaintext.begin(), plaintext.end(), 0);
+          return password;
         }
-#endif
       }
       if (flags.use_os_store && kSupportsOsCredentialStore) {
         auto account = CredentialAccountName(container);
@@ -2425,7 +2521,7 @@ namespace {
         std::cerr << "I/O error: Failed to create volume." << std::endl;
         return kExitIO;
       }
-      if (security_flags.use_os_store || security_flags.use_tpm_seal) {
+      if (security_flags.use_os_store || security_flags.HasHardwareSeal()) {
         PersistCredential(container, password, security_flags);
       }
     } catch (...) {
@@ -2476,7 +2572,7 @@ namespace {
     }
     bool cached = false; // TSK035_Platform_Specific_Security_Integration
     std::string password;
-    if ((security_flags.use_os_store || security_flags.use_tpm_seal)) {
+    if ((security_flags.use_os_store || security_flags.HasHardwareSeal())) {
       if (auto persisted = LoadPersistedCredential(container, security_flags)) {
         password = *persisted;
         cached = true;
@@ -2554,7 +2650,7 @@ namespace {
 
     bool cached = false;
     std::string password;
-    if ((security_flags.use_os_store || security_flags.use_tpm_seal)) {
+    if ((security_flags.use_os_store || security_flags.HasHardwareSeal())) {
       if (auto persisted = LoadPersistedCredential(container, security_flags)) {
         password = *persisted;
         cached = true;
@@ -2740,7 +2836,7 @@ namespace {
         std::cerr << "I/O error: Failed to rekey volume." << std::endl;
         return kExitIO;
       }
-      if (security_flags.use_os_store || security_flags.use_tpm_seal) {
+      if (security_flags.use_os_store || security_flags.HasHardwareSeal()) {
         PersistCredential(container, next, security_flags);
       }
     } catch (...) {
@@ -3243,6 +3339,10 @@ int main(int argc, char** argv) {
     }
 
     SecurityIntegrationFlags security_flags{}; // TSK035_Platform_Specific_Security_Integration
+    qv::platform::RegisterPlatformSealedKeyProviders(qv::orchestrator::SealedKeyRegistry::Instance());
+#if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
+    RegisterNativeTpmSealer();
+#endif
     int index = 1;                             // TSK029 parse global flags
     std::optional<uint32_t> kdf_iterations_override; // TSK036_PBKDF2_Argon2_Migration_Path
     for (; index < argc; ++index) {
@@ -3258,12 +3358,40 @@ int main(int argc, char** argv) {
         security_flags.use_os_store = true;
         continue;
       }
-      if (arg == "--tpm-seal") { // TSK035_Platform_Specific_Security_Integration
-        if (!kSupportsTpmSealing) {
-          std::cerr << "Configuration error: TPM sealing support not available." << std::endl;
+      if (arg == "--seal") { // TSK713_TPM_SecureEnclave_Key_Sealing
+        if (index + 1 >= argc) {
+          PrintUsage();
           return kExitUsage;
         }
-        security_flags.use_tpm_seal = true;
+        std::string provider = std::string(argv[++index]);
+        if (provider.empty()) {
+          PrintUsage();
+          return kExitUsage;
+        }
+        auto* sealing_provider =
+            qv::orchestrator::SealedKeyRegistry::Instance().FindProvider(provider);
+        if (!sealing_provider || !sealing_provider->IsAvailable()) {
+          std::cerr << "Configuration error: hardware sealing provider '" << provider
+                    << "' not available." << std::endl;
+          return kExitUsage;
+        }
+        security_flags.seal_provider = std::string(sealing_provider->Id());
+        continue;
+      }
+      if (arg.rfind("--seal=", 0) == 0) { // TSK713_TPM_SecureEnclave_Key_Sealing
+        std::string provider = std::string(arg.substr(std::string_view("--seal=").size()));
+        if (provider.empty()) {
+          PrintUsage();
+          return kExitUsage;
+        }
+        auto* sealing_provider =
+            qv::orchestrator::SealedKeyRegistry::Instance().FindProvider(provider);
+        if (!sealing_provider || !sealing_provider->IsAvailable()) {
+          std::cerr << "Configuration error: hardware sealing provider '" << provider
+                    << "' not available." << std::endl;
+          return kExitUsage;
+        }
+        security_flags.seal_provider = std::string(sealing_provider->Id());
         continue;
       }
       if (arg.rfind("--syslog=", 0) == 0) {
