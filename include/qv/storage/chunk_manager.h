@@ -24,6 +24,7 @@ public:
                std::array<uint8_t, 32> master_key,
                uint32_t epoch,
                qv::crypto::CipherType cipher = qv::crypto::CipherType::AEGIS_128X);
+  ~ChunkManager(); // TSK125_Missing_Secure_Deletion_for_Keys explicit key wiping
 
   void WriteChunk(uint64_t logical_offset, std::span<const uint8_t> data);
   std::vector<uint8_t> ReadChunk(uint64_t logical_offset, bool for_prefetch = false);

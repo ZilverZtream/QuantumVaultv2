@@ -56,6 +56,7 @@
 #include "qv/orchestrator/constant_time_mount.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/orchestrator/event_bus.h"           // TSK027
 #include "qv/orchestrator/volume_manager.h"
+#include "qv/security/zeroizer.h" // TSK125_Missing_Secure_Deletion_for_Keys scoped wiping
 #if defined(__linux__)
 #include "qv/platform/fuse_adapter.h" // TSK062_FUSE_Filesystem_Integration_Linux
 #endif
@@ -1350,18 +1351,16 @@ namespace {
   int HandleCreate(const std::filesystem::path& container, qv::orchestrator::VolumeManager& vm,
                    const SecurityIntegrationFlags& security_flags) { // TSK035_Platform_Specific_Security_Integration
     auto password = ReadPassword("Password: ");
+    qv::security::Zeroizer::ScopeWiper<char> password_guard(password.data(), password.size());
     auto confirm = ReadPassword("Confirm password: ");
+    qv::security::Zeroizer::ScopeWiper<char> confirm_guard(confirm.data(), confirm.size());
     if (password != confirm) {
-      SecureZero(password);
-      SecureZero(confirm);
       std::cerr << "Validation error: Passwords do not match." << std::endl;
-      return kExitUsage;
+      return kExitUsage; // TSK125_Missing_Secure_Deletion_for_Keys guards zero on scope exit
     }
     try {
       auto handle = vm.Create(container, password);
       if (!handle) {
-        SecureZero(password);
-        SecureZero(confirm);
         std::cerr << "I/O error: Failed to create volume." << std::endl;
         return kExitIO;
       }
@@ -1369,12 +1368,8 @@ namespace {
         PersistCredential(container, password, security_flags);
       }
     } catch (...) {
-      SecureZero(password);
-      SecureZero(confirm);
       throw;
     }
-    SecureZero(password);
-    SecureZero(confirm);
     std::cout << "Created." << std::endl;
     return kExitOk;
   }
@@ -1540,20 +1535,21 @@ namespace {
       qv::orchestrator::VolumeManager& vm,
       const SecurityIntegrationFlags& security_flags) { // TSK024_Key_Rotation_and_Lifecycle_Management, TSK035_Platform_Specific_Security_Integration
     auto current = ReadPassword("Current password: ");
+    qv::security::Zeroizer::ScopeWiper<char> current_guard(current.data(), current.size());
     auto next = ReadPassword("New password: ");
+    qv::security::Zeroizer::ScopeWiper<char> next_guard(next.data(), next.size());
     auto confirm = ReadPassword("Confirm new password: ");
+    qv::security::Zeroizer::ScopeWiper<char> confirm_guard(confirm.data(), confirm.size());
+    const auto wipe_passwords = [&]() noexcept {
+      SecureZero(current);   // TSK125_Missing_Secure_Deletion_for_Keys ensure buffer length cleared
+      SecureZero(next);      // TSK125_Missing_Secure_Deletion_for_Keys ensure buffer length cleared
+      SecureZero(confirm);   // TSK125_Missing_Secure_Deletion_for_Keys ensure buffer length cleared
+    };
     if (next != confirm) {
-      SecureZero(current);
-      SecureZero(next);
-      SecureZero(confirm);
+      wipe_passwords();
       std::cerr << "Validation error: Passwords do not match." << std::endl;
       return kExitUsage;
     }
-    const auto wipe_passwords = [&]() noexcept {
-      SecureZero(current);   // TSK028A_Memory_Wiping_Gaps
-      SecureZero(next);      // TSK028A_Memory_Wiping_Gaps
-      SecureZero(confirm);   // TSK028A_Memory_Wiping_Gaps
-    };
     try {
       auto handle = vm.Rekey(container, current, next, std::move(backup_key));
       if (!handle) {

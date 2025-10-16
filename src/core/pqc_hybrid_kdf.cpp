@@ -187,7 +187,8 @@ PQCHybridKDF::Mount(std::span<const uint8_t, 32> classical_key,
     throw Error(ErrorDomain::Validation, -1, "Unsupported PQC KEM identifier");
   }
 
-  const auto aad = MakeStableAad(volume_uuid, header_version, epoch_tlv);
+  auto aad = MakeStableAad(volume_uuid, header_version, epoch_tlv);
+  ByteScopeWiper aad_guard(std::span<uint8_t>(aad.data(), aad.size())); // TSK125_Missing_Secure_Deletion_for_Keys scoped AAD wipe
 
   std::vector<uint8_t> sk_plain;
   try {
@@ -204,6 +205,7 @@ PQCHybridKDF::Mount(std::span<const uint8_t, 32> classical_key,
     Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe transient buffer on generic failure
     throw AuthenticationFailureError(std::string("Failed to decrypt PQC secret key: ") + ex.what());
   }
+  ByteScopeWiper sk_plain_vector_guard(std::span<uint8_t>(sk_plain.data(), sk_plain.size())); // TSK125_Missing_Secure_Deletion_for_Keys decrypt buffer wipe
   if (sk_plain.size() != PQC::SECRET_KEY_SIZE) {
     Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe rejected plaintext
     throw Error(ErrorDomain::Validation, -1, "PQC secret key length mismatch");
