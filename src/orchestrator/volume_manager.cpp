@@ -14,6 +14,7 @@
 #include <optional>     // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV control
 #include <span>
 #include <sstream>      // TSK033 version formatting
+#include <string>       // TSK149_Path_Traversal_And_Injection string assembly for validation
 #include <string_view>
 #include <system_error> // TSK074_Migration_Rollback_and_Backup non-throwing filesystem ops
 #include <type_traits>  // TSK099_Input_Validation_and_Sanitization checked casts
@@ -341,6 +342,181 @@ std::string EnsurePasswordNotReused(const std::filesystem::path& container,
   return hashed;
 }
 
+enum class Utf8ValidationResult { // TSK149_Path_Traversal_And_Injection
+  kOk,
+  kInvalidEncoding,
+  kDisallowed,
+};
+
+bool ContainsForbiddenAsciiChar(char32_t cp) noexcept { // TSK149_Path_Traversal_And_Injection
+  switch (cp) {
+    case '|':
+    case '&':
+    case ';':
+    case '<':
+    case '>':
+    case '\'':
+    case '"':
+    case '`':
+    case '$':
+    case '\n':
+    case '\r':
+    case '\t':
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsDisallowedUnicodeCodePoint(char32_t cp) noexcept { // TSK149_Path_Traversal_And_Injection
+  if (cp == 0x7F) {
+    return true;
+  }
+  if (cp >= 0x200B && cp <= 0x200F) {
+    return true;
+  }
+  if (cp >= 0x202A && cp <= 0x202E) {
+    return true;
+  }
+  if (cp >= 0x2066 && cp <= 0x2069) {
+    return true;
+  }
+  if (cp >= 0x2000 && cp <= 0x200A) {
+    return true;
+  }
+  switch (cp) {
+    case 0x00A0:
+    case 0x034F:
+    case 0x1680:
+    case 0x2007:
+    case 0x2024:
+    case 0x2027:
+    case 0x2028:
+    case 0x2029:
+    case 0x202F:
+    case 0x205F:
+    case 0x2060:
+    case 0x2061:
+    case 0x2062:
+    case 0x2063:
+    case 0x2064:
+    case 0x2215:
+    case 0x2044:
+    case 0x29F8:
+    case 0x3000:
+    case 0xFEFF:
+    case 0xFF0E:
+    case 0xFF0F:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool DecodeNextUtf8CodePoint(std::string_view raw, size_t& index,
+                             char32_t& cp) noexcept { // TSK149_Path_Traversal_And_Injection
+  if (index >= raw.size()) {
+    return false;
+  }
+  const unsigned char lead = static_cast<unsigned char>(raw[index]);
+  ++index;
+  if (lead < 0x80) {
+    cp = static_cast<char32_t>(lead);
+    return true;
+  }
+  if ((lead >> 5) == 0x6) {
+    if (index >= raw.size()) {
+      return false;
+    }
+    const unsigned char b1 = static_cast<unsigned char>(raw[index]);
+    if ((b1 & 0xC0) != 0x80) {
+      return false;
+    }
+    ++index;
+    cp = static_cast<char32_t>(((lead & 0x1F) << 6) | (b1 & 0x3F));
+    if (cp < 0x80) {
+      return false;
+    }
+    return true;
+  }
+  if ((lead >> 4) == 0xE) {
+    if (index + 1 >= raw.size()) {
+      return false;
+    }
+    const unsigned char b1 = static_cast<unsigned char>(raw[index]);
+    const unsigned char b2 = static_cast<unsigned char>(raw[index + 1]);
+    if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) {
+      return false;
+    }
+    index += 2;
+    cp = static_cast<char32_t>(((lead & 0x0F) << 12) | ((b1 & 0x3F) << 6) |
+                               (b2 & 0x3F));
+    if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) {
+      return false;
+    }
+    return true;
+  }
+  if ((lead >> 3) == 0x1E) {
+    if (index + 2 >= raw.size()) {
+      return false;
+    }
+    const unsigned char b1 = static_cast<unsigned char>(raw[index]);
+    const unsigned char b2 = static_cast<unsigned char>(raw[index + 1]);
+    const unsigned char b3 = static_cast<unsigned char>(raw[index + 2]);
+    if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) {
+      return false;
+    }
+    index += 3;
+    cp = static_cast<char32_t>(((lead & 0x07) << 18) | ((b1 & 0x3F) << 12) |
+                               ((b2 & 0x3F) << 6) | (b3 & 0x3F));
+    if (cp < 0x10000 || cp > 0x10FFFF) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+Utf8ValidationResult CheckUtf8Safety(std::string_view raw) noexcept { // TSK149_Path_Traversal_And_Injection
+  size_t index = 0;
+  while (index < raw.size()) {
+    char32_t cp = 0;
+    if (!DecodeNextUtf8CodePoint(raw, index, cp)) {
+      return Utf8ValidationResult::kInvalidEncoding;
+    }
+    if (cp <= 0x1F || ContainsForbiddenAsciiChar(cp) ||
+        IsDisallowedUnicodeCodePoint(cp)) {
+      return Utf8ValidationResult::kDisallowed;
+    }
+  }
+  return Utf8ValidationResult::kOk;
+}
+
+void RequireUtf8Safety(std::string_view raw,
+                       std::string_view what) { // TSK149_Path_Traversal_And_Injection
+  switch (CheckUtf8Safety(raw)) {
+    case Utf8ValidationResult::kOk:
+      return;
+    case Utf8ValidationResult::kInvalidEncoding:
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(what) + " contains invalid UTF-8 encoding"};
+    case Utf8ValidationResult::kDisallowed:
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      std::string(what) + " contains unsupported characters"};
+  }
+}
+
+void RequireSafePathComponent(const std::filesystem::path& component,
+                              std::string_view description) { // TSK149_Path_Traversal_And_Injection
+  const std::string text = qv::PathToUtf8String(component);
+  RequireUtf8Safety(text, description);
+  if (text.empty() || text == "." || text == ".." ||
+      text.find_first_of("/\\") != std::string::npos) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(description) + " contains reserved path segments"};
+  }
+}
+
 std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sanitization
   const char* env_root = std::getenv("QV_CONTAINER_ROOT");
   std::filesystem::path base;
@@ -368,12 +544,19 @@ const std::filesystem::path& AllowedContainerRoot() { // TSK099_Input_Validation
   return root;
 }
 
-std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) { // TSK099_Input_Validation_and_Sanitization
+std::filesystem::path SanitizeContainerPath(
+    const std::filesystem::path& path) { // TSK099_Input_Validation_and_Sanitization
+  RequireUtf8Safety(qv::PathToUtf8String(path),
+                    "Container path"); // TSK149_Path_Traversal_And_Injection
   std::error_code ec;
   auto canonical = std::filesystem::weakly_canonical(path, ec);
   if (ec) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
                     std::string(qv::errors::msg::kFailedToCanonicalizeContainerPath)};
+  }
+  if (canonical.empty()) { // TSK149_Path_Traversal_And_Injection
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPathEscapeAttemptDetected)};
   }
   const auto& base = AllowedContainerRoot();
   auto relative = std::filesystem::relative(canonical, base, ec);
@@ -386,7 +569,11 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
       throw qv::Error{qv::ErrorDomain::Validation, 0,
                       std::string(qv::errors::msg::kPathEscapeAttemptDetected)};
     }
+    RequireSafePathComponent(component,
+                             "Container path component"); // TSK149_Path_Traversal_And_Injection
   }
+  RequireUtf8Safety(qv::PathToUtf8String(canonical),
+                    "Container path"); // TSK149_Path_Traversal_And_Injection
   return canonical;
 }
 
@@ -879,12 +1066,21 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
 
   std::filesystem::path MetadataDirFor(
       const std::filesystem::path& container) { // TSK024_Key_Rotation_and_Lifecycle_Management
-    auto parent = container.parent_path();      // TSK024_Key_Rotation_and_Lifecycle_Management
-    auto name = container.filename().string();  // TSK024_Key_Rotation_and_Lifecycle_Management
-    if (name.empty()) {                         // TSK024_Key_Rotation_and_Lifecycle_Management
-      name = "volume";                          // TSK024_Key_Rotation_and_Lifecycle_Management
+    auto sanitized = SanitizeContainerPath(container); // TSK149_Path_Traversal_And_Injection
+    auto parent = sanitized.parent_path();              // TSK024_Key_Rotation_and_Lifecycle_Management
+    auto name_component = sanitized.filename();         // TSK149_Path_Traversal_And_Injection
+    if (name_component.empty() || name_component == "." ||
+        name_component == "..") { // TSK149_Path_Traversal_And_Injection
+      name_component = std::filesystem::path{"volume"};
     }
-    return parent / (name + ".meta"); // TSK024_Key_Rotation_and_Lifecycle_Management
+    std::string base = qv::PathToUtf8String(name_component); // TSK149_Path_Traversal_And_Injection
+    if (base.empty() || base == "." || base == ".." ||
+        base.find_first_of("/\\") != std::string::npos ||
+        CheckUtf8Safety(base) != Utf8ValidationResult::kOk) { // TSK149_Path_Traversal_And_Injection
+      base = "volume";
+    }
+    std::filesystem::path metadata = parent / std::filesystem::path(base + ".meta");
+    return metadata.lexically_normal(); // TSK149_Path_Traversal_And_Injection
   }
 
 #pragma pack(push, 1)
