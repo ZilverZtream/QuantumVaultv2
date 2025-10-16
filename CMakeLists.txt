@@ -170,6 +170,7 @@ add_library(qv_orchestrator
     src/orchestrator/io_util.cpp # TSK068_Atomic_Header_Writes durability helper
     src/orchestrator/event_bus.cpp
     src/orchestrator/credentials.cpp # TSK711_Keyfiles_and_PKCS11_FIDO2 credential combiner
+    src/orchestrator/sealed_key.cpp # TSK713_TPM_SecureEnclave_Key_Sealing provider registry
     src/tlv/parser.cpp # TSK111_Code_Duplication_and_Maintainability reusable TLV parser
 )
 target_include_directories(qv_orchestrator
@@ -187,7 +188,11 @@ elseif(APPLE)
   target_link_libraries(qv_orchestrator PRIVATE "-framework Security" "-framework CoreFoundation")
 endif()
 
-add_executable(qv src/cli/main.cpp)
+add_executable(qv
+    src/cli/main.cpp
+    src/platform/win/tpm.cpp # TSK713_TPM_SecureEnclave_Key_Sealing DPAPI provider
+    src/platform/macos/se.cpp # TSK713_TPM_SecureEnclave_Key_Sealing Secure Enclave provider
+)
 target_include_directories(qv
     PUBLIC
       $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
