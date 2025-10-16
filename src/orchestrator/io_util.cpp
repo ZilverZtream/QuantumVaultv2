@@ -289,11 +289,29 @@ int NativeOpen(const std::filesystem::path& path) { // TSK068_Atomic_Header_Writ
 int NativeClose(int fd) { return _close(fd); }
 
 int NativeFsync(int fd) {
-  // TSK107_Platform_Specific_Issues: _commit() provides best-effort fsync-equivalent semantics on Windows.
-  // It forces dirty buffers to disk but may still depend on storage write-back policies.
-  // TSK112_Documentation_and_Code_Clarity: Windows lacks a direct fsync; _commit flushes file
-  // contents but metadata durability still relies on the subsequent directory FlushFileBuffers call.
-  return _commit(fd);
+  // TSK143_Missing_Fsync_And_Durability_Issues: ensure both file data and metadata reach stable storage.
+  if (_commit(fd) != 0) {
+    return -1;
+  }
+  const intptr_t os_handle = _get_osfhandle(fd);
+  if (os_handle == -1) {
+#if defined(_WIN32)
+    _set_errno(EBADF);
+#else
+    errno = EBADF;
+#endif
+    return -1;
+  }
+  if (::FlushFileBuffers(reinterpret_cast<HANDLE>(os_handle)) == 0) {
+    const DWORD err = ::GetLastError();
+#if defined(_WIN32)
+    _set_errno(err == ERROR_ACCESS_DENIED ? EACCES : EIO);
+#else
+    errno = (err == ERROR_ACCESS_DENIED) ? EACCES : EIO;
+#endif
+    return -1;
+  }
+  return 0;
 }
 
 int NativeWrite(int fd, const uint8_t* data, size_t size) {
