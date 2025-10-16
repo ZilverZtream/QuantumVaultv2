@@ -843,6 +843,30 @@ std::array<uint8_t, 32> NonceLog::Append(uint64_t counter) {
   return mac; // TSK014
 }
 
+std::array<uint8_t, 32> NonceLog::Preview(uint64_t counter) {
+  std::lock_guard<std::mutex> lock(mu_);
+  EnsureLoadedUnlocked();
+  if (!entries_.empty() && counter <= entries_.back().counter) {
+    throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
+  }
+  return ComputeMac(last_mac_, counter, key_); // TSK118_Nonce_Reuse_Vulnerabilities
+}
+
+void NonceLog::Commit(uint64_t counter, std::span<const uint8_t, 32> mac) {
+  std::lock_guard<std::mutex> lock(mu_);
+  EnsureLoadedUnlocked();
+  if (!entries_.empty() && counter <= entries_.back().counter) {
+    throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
+  }
+  auto expected = ComputeMac(last_mac_, counter, key_);
+  if (!std::equal(expected.begin(), expected.end(), mac.begin(), mac.end())) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce MAC mismatch"}; // TSK118_Nonce_Reuse_Vulnerabilities
+  }
+  entries_.push_back(LogEntry{counter, expected});
+  last_mac_ = expected;
+  PersistUnlocked();
+}
+
 bool NonceLog::VerifyChain() {
   std::lock_guard<std::mutex> lock(mu_);
   try {

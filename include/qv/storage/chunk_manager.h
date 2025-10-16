@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <shared_mutex> // TSK118_Nonce_Reuse_Vulnerabilities
 #include <span>
 #include <vector>
 
@@ -43,6 +44,7 @@ private:
   std::unique_ptr<ReadAheadManager> read_ahead_;
   std::mutex sequential_mutex_;
   std::mutex persist_mutex_; // TSK067_Nonce_Safety
+  mutable std::shared_mutex nonce_mutex_; // TSK118_Nonce_Reuse_Vulnerabilities generator guard
   int64_t last_read_chunk_{-1};
   uint64_t sequential_read_count_{0};
   int64_t read_ahead_window_end_{-1};

@@ -11,6 +11,7 @@
 #include <new>      // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional> // TSK015
 #include <limits>   // TSK071_Epoch_Overflow_Safety exported thresholds
+#include <unordered_map> // TSK118_Nonce_Reuse_Vulnerabilities reservation tracking
 #include <span>
 #include <string_view> // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <vector>
@@ -38,6 +39,8 @@ namespace qv::core {
     explicit NonceLog(const std::filesystem::path& path);
     NonceLog(const std::filesystem::path& path, std::nothrow_t) noexcept; // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::array<uint8_t, 32> Append(uint64_t counter); // TSK014
+    std::array<uint8_t, 32> Preview(uint64_t counter); // TSK118_Nonce_Reuse_Vulnerabilities deferred logging
+    void Commit(uint64_t counter, std::span<const uint8_t, 32> mac); // TSK118_Nonce_Reuse_Vulnerabilities
     std::array<uint8_t, 32> LastMac() const;          // TSK014
     bool VerifyChain();
     size_t Repair(); // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -60,10 +63,13 @@ namespace qv::core {
       kEpochExpired,
       kCounterLimit,
     };
+    static constexpr int64_t kUnboundChunkIndex = std::numeric_limits<int64_t>::min(); // TSK118_Nonce_Reuse_Vulnerabilities sentinel binding
+
     struct NonceRecord { // TSK014
       std::array<uint8_t, 12> nonce;
       uint64_t counter;
       std::array<uint8_t, 32> mac;
+      int64_t chunk_index{kUnboundChunkIndex}; // TSK118_Nonce_Reuse_Vulnerabilities bind reservation to chunk
     };
     struct Status { // TSK015
       uint64_t counter{0};
@@ -74,7 +80,9 @@ namespace qv::core {
       RekeyReason reason{RekeyReason::kNone};
     };
     explicit NonceGenerator(uint32_t epoch, uint64_t start_counter = 0);
-    NonceRecord NextAuthenticated(); // TSK014
+    NonceRecord NextAuthenticated(int64_t chunk_index = kUnboundChunkIndex); // TSK014, TSK118_Nonce_Reuse_Vulnerabilities
+    void ReleaseNonce(const NonceRecord& record); // TSK118_Nonce_Reuse_Vulnerabilities
+    void CommitNonce(const NonceRecord& record);  // TSK118_Nonce_Reuse_Vulnerabilities
     std::array<uint8_t, 12> Next();
     uint64_t CurrentCounter() const {
       std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
@@ -95,11 +103,14 @@ namespace qv::core {
       std::chrono::hours max_age = std::chrono::hours{24 * 30};
     };
     RekeyPolicy policy_{};                                  // TSK015
-    std::chrono::system_clock::time_point epoch_started_{}; // TSK015
+    std::chrono::system_clock::time_point epoch_started_{};         // TSK015
+    std::chrono::steady_clock::time_point epoch_started_monotonic_; // TSK118_Nonce_Reuse_Vulnerabilities monotonic ageing
     uint64_t base_counter_{0};                              // TSK015
     mutable std::mutex state_mutex_;                        // TSK067_Nonce_Safety
+    std::unordered_map<uint64_t, NonceRecord> inflight_;     // TSK118_Nonce_Reuse_Vulnerabilities
+    std::unordered_map<int64_t, NonceRecord> recycled_;      // TSK118_Nonce_Reuse_Vulnerabilities
     RekeyReason DetermineRekeyReason(uint64_t candidate,
-                                     std::chrono::system_clock::time_point now) const; // TSK015
+                                     std::chrono::steady_clock::time_point now) const; // TSK015, TSK118_Nonce_Reuse_Vulnerabilities
     static std::array<uint8_t, 12> MakeNonceBytes(uint32_t epoch, uint64_t counter);   // TSK015
   };
 
