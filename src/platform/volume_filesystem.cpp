@@ -1953,7 +1953,14 @@ bool VolumeFilesystem::LoadMetadata(bool best_effort) {
         }
         metadata_dirty_ = true;
       } else {
-        if (original_size > std::numeric_limits<size_t>::max()) {
+        const uint64_t metadata_capacity = metadata_chunk_count_ * kChunkPayloadSize;  // TSK127
+        if (original_size > metadata_capacity || metadata_capacity > std::numeric_limits<size_t>::max()) {
+          if (!best_effort) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0, "Compressed metadata length overflow"};
+          }
+          metadata_dirty_ = true;
+          original_size = 0;
+        } else if (original_size > std::numeric_limits<size_t>::max()) {
           if (!best_effort) {
             throw qv::Error{qv::ErrorDomain::Validation, 0, "Compressed metadata length overflow"};
           }
@@ -1968,9 +1975,10 @@ bool VolumeFilesystem::LoadMetadata(bool best_effort) {
           }
           metadata_dirty_ = true;
         } else {
-          std::string decompressed(static_cast<size_t>(original_size), '\0');
+          const size_t bounded_original_size = static_cast<size_t>(original_size);
+          std::string decompressed(bounded_original_size, '\0');
           size_t result = ZSTD_decompress(decompressed.data(), decompressed.size(), decoded->data(), decoded->size());
-          if (ZSTD_isError(result) || result != static_cast<size_t>(original_size)) {
+          if (ZSTD_isError(result) || result != bounded_original_size) {
             if (!best_effort) {
               throw qv::Error{qv::ErrorDomain::Validation, 0, "Metadata decompression failed"};
             }
