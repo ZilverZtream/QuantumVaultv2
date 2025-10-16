@@ -99,7 +99,7 @@ constexpr auto kSyslogBackoffMax = std::chrono::seconds(30);        // TSK069_Do
 constexpr uint32_t kStateVersion = 1;                               // TSK079_Audit_Log_Integrity_Chain
 constexpr uint32_t kDerivedKeyVersion = 1;                           // TSK079_Audit_Log_Integrity_Chain
 constexpr size_t kDerivedSaltSize = 32;                              // TSK079_Audit_Log_Integrity_Chain
-constexpr size_t kMaxSyslogDatagramBytes = 8 * 1024;                 // TSK081_EventBus_Throughput_and_Batching payload safety margin
+[[maybe_unused]] constexpr size_t kMaxSyslogDatagramBytes = 8 * 1024; // TSK081_EventBus_Throughput_and_Batching payload safety margin
 constexpr size_t kSyslogThrottleBurst = 256;                         // TSK138_Rate_Limiting_And_DoS_Vulnerabilities burst allowance
 constexpr size_t kSyslogThrottleRatePerSecond = 64;                  // TSK138_Rate_Limiting_And_DoS_Vulnerabilities steady refill rate
 constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000ull;         // TSK138_Rate_Limiting_And_DoS_Vulnerabilities integral refill math
@@ -1942,66 +1942,40 @@ SyslogPublisher::PublishStats SyslogPublisher::PublishBatch(std::span<const Even
     return stats;
   }
 
-  struct Datagram { // TSK081_EventBus_Throughput_and_Batching buffered packet
+  struct Frame { // TSK144_Network_Protocol_Security_Issues ensure per-message TLS framing
     std::string payload;
-    std::vector<size_t> indices;
+    size_t index;
   };
 
-  std::vector<Datagram> datagrams;
-  datagrams.reserve(events.size());
-  Datagram current;
+  std::vector<Frame> frames;
+  frames.reserve(events.size());
 
   for (size_t idx = 0; idx < events.size(); ++idx) {
     auto message = BuildMessage(events[idx]);
     if (!message || message->empty()) {
       continue;
     }
-    if (message->size() >= kMaxSyslogDatagramBytes) {
-      if (!current.payload.empty()) {
-        datagrams.push_back(std::move(current));
-        current = Datagram{};
-      }
-      Datagram single;
-      single.payload = std::move(*message);
-      single.indices.push_back(idx);
-      datagrams.push_back(std::move(single));
-      continue;
-    }
-    if (!current.payload.empty() && current.payload.size() + 1 + message->size() > kMaxSyslogDatagramBytes) {
-      datagrams.push_back(std::move(current));
-      current = Datagram{};
-    }
-    if (current.payload.empty()) {
-      current.payload = std::move(*message);
-    } else {
-      current.payload.push_back('\n');
-      current.payload.append(*message);
-    }
-    current.indices.push_back(idx);
+    frames.push_back(Frame{std::move(*message), idx});
   }
 
-  if (!current.payload.empty()) {
-    datagrams.push_back(std::move(current));
-  }
-
-  if (datagrams.empty()) {
+  if (frames.empty()) {
     return stats;
   }
 
   size_t i = 0;
-  for (; i < datagrams.size(); ++i) {
+  for (; i < frames.size(); ++i) {
     auto now = std::chrono::steady_clock::now();
     if (now < next_allowed_send_) { // TSK069_DoS_Resource_Exhaustion_Guards reuse backoff
       break;
     }
-    if (!SendDatagram(datagrams[i].payload, now)) {
+    if (!SendDatagram(frames[i].payload, now)) {
       break;
     }
-    stats.sent += datagrams[i].indices.size();
+    ++stats.sent; // TSK144_Network_Protocol_Security_Issues per-message accounting
   }
 
-  for (; i < datagrams.size(); ++i) {
-    stats.unsent_indices.insert(stats.unsent_indices.end(), datagrams[i].indices.begin(), datagrams[i].indices.end());
+  for (; i < frames.size(); ++i) {
+    stats.unsent_indices.push_back(frames[i].index);
   }
 
   return stats;
