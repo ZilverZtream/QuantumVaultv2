@@ -99,12 +99,28 @@ bool Rdseed64(uint64_t& value) { // TSK134_Insufficient_Entropy_for_Keys read RD
   return false;
 #endif
 #elif defined(__GNUC__) || defined(__clang__)
-#if defined(__x86_64__)
-  return __builtin_ia32_rdseed64_step(reinterpret_cast<unsigned long long*>(&value)) == 1;
+#if defined(__RDSEED__)
+  return _rdseed64_step(reinterpret_cast<unsigned long long*>(&value)) == 1;
+#elif defined(__x86_64__)
+  unsigned long long temp = 0;
+  unsigned char ok = 0;
+  __asm__ __volatile__("rdseed %0; setc %1"
+                       : "=r"(temp), "=qm"(ok)
+                       :
+                       : "cc");
+  if (ok != 0) {
+    value = static_cast<uint64_t>(temp);
+    return true;
+  }
+  return false;
 #else
   unsigned int temp = 0;
-  int ok = __builtin_ia32_rdseed32_step(&temp);
-  if (ok == 1) {
+  unsigned char ok = 0;
+  __asm__ __volatile__("rdseed %0; setc %1"
+                       : "=r"(temp), "=qm"(ok)
+                       :
+                       : "cc");
+  if (ok != 0) {
     value = temp;
     return true;
   }
@@ -130,12 +146,28 @@ bool Rdrand64(uint64_t& value) { // TSK134_Insufficient_Entropy_for_Keys read RD
   return false;
 #endif
 #elif defined(__GNUC__) || defined(__clang__)
-#if defined(__x86_64__)
-  return __builtin_ia32_rdrand64_step(reinterpret_cast<unsigned long long*>(&value)) == 1;
+#if defined(__RDRND__)
+  return _rdrand64_step(reinterpret_cast<unsigned long long*>(&value)) == 1;
+#elif defined(__x86_64__)
+  unsigned long long temp = 0;
+  unsigned char ok = 0;
+  __asm__ __volatile__("rdrand %0; setc %1"
+                       : "=r"(temp), "=qm"(ok)
+                       :
+                       : "cc");
+  if (ok != 0) {
+    value = static_cast<uint64_t>(temp);
+    return true;
+  }
+  return false;
 #else
   unsigned int temp = 0;
-  int ok = __builtin_ia32_rdrand32_step(&temp);
-  if (ok == 1) {
+  unsigned char ok = 0;
+  __asm__ __volatile__("rdrand %0; setc %1"
+                       : "=r"(temp), "=qm"(ok)
+                       :
+                       : "cc");
+  if (ok != 0) {
     value = temp;
     return true;
   }
@@ -191,13 +223,14 @@ void MixAdditionalEntropy(std::span<uint8_t> dest) { // TSK134_Insufficient_Entr
 void ReadFromUrandom(std::span<uint8_t> out) { // TSK134_Insufficient_Entropy_for_Keys POSIX fallback
   std::ifstream urandom("/dev/urandom", std::ios::in | std::ios::binary);
   if (!urandom) {
-    throw Error(ErrorDomain::Crypto, errno, "Failed to open /dev/urandom");
+    throw qv::Error(qv::ErrorDomain::Crypto, errno,
+                    "Failed to open /dev/urandom"); // TSK134_Insufficient_Entropy_for_Keys qualify error type
   }
   urandom.read(reinterpret_cast<char*>(out.data()),
                static_cast<std::streamsize>(out.size()));
   if (urandom.gcount() != static_cast<std::streamsize>(out.size())) {
-    throw Error(ErrorDomain::Crypto, errno,
-                "Failed to read sufficient entropy from /dev/urandom");
+    throw qv::Error(qv::ErrorDomain::Crypto, errno,
+                    "Failed to read sufficient entropy from /dev/urandom"); // TSK134_Insufficient_Entropy_for_Keys qualify error type
   }
 }
 
