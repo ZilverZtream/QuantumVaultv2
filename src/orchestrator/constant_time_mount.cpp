@@ -1421,12 +1421,14 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   auto attempt_start = std::chrono::steady_clock::now(); // TSK038_Resource_Limits_and_DoS_Prevention
   constexpr auto kMaxAttemptDuration = std::chrono::seconds(5); // TSK038_Resource_Limits_and_DoS_Prevention
   constexpr uintmax_t kMaxContainerSize = 100ull * 1024ull * 1024ull; // TSK038_Resource_Limits_and_DoS_Prevention
+  constexpr uintmax_t kHeaderBytesRequired =                           // TSK141_Integer_Overflow_And_Wraparound_Issues
+      static_cast<uintmax_t>(kTotalHeaderBytes);                        // TSK141_Integer_Overflow_And_Wraparound_Issues
 
   std::error_code size_ec; // TSK038_Resource_Limits_and_DoS_Prevention
   auto container_size = std::filesystem::file_size(container, size_ec); // TSK038_Resource_Limits_and_DoS_Prevention
   bool size_known = !size_ec;                                           // TSK070
   bool within_limit = size_known && container_size <= kMaxContainerSize; // TSK070
-  bool header_sized = within_limit && container_size >= kTotalHeaderBytes; // TSK070
+  bool header_sized = within_limit && container_size >= kHeaderBytesRequired; // TSK070, TSK141_Integer_Overflow_And_Wraparound_Issues
 
   std::array<uint8_t, kTotalHeaderBytes> buf{}; // TSK013
   bool io_ok = false;                           // TSK070

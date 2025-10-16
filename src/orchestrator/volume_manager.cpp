@@ -4,6 +4,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>    // TSK036_PBKDF2_Argon2_Migration_Path adaptive calibration
+#include <cmath>     // TSK141_Integer_Overflow_And_Wraparound_Issues safe PBKDF scaling
 #include <cstring>
 #include <fstream>
 #include <functional> // TSK036_PBKDF2_Argon2_Migration_Path progress callbacks
@@ -594,9 +595,18 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
     if (per_iter_ns <= 0.0L) {
       return kDefaultPbkdfIterations;
     }
-    auto computed = static_cast<uint64_t>(static_cast<long double>(target_ns) / per_iter_ns);
+    const long double raw_iterations = static_cast<long double>(target_ns) / per_iter_ns;
+    uint64_t computed = 0;                                                   // TSK141_Integer_Overflow_And_Wraparound_Issues
+    if (!std::isfinite(raw_iterations) || raw_iterations <= 0.0L) {          // TSK141_Integer_Overflow_And_Wraparound_Issues
+      computed = kMinPbkdfIterations;                                        // TSK141_Integer_Overflow_And_Wraparound_Issues
+    } else {
+      const long double max_uint64 =                                         // TSK141_Integer_Overflow_And_Wraparound_Issues
+          static_cast<long double>(std::numeric_limits<uint64_t>::max());    // TSK141_Integer_Overflow_And_Wraparound_Issues
+      const long double bounded = std::min(raw_iterations, max_uint64);      // TSK141_Integer_Overflow_And_Wraparound_Issues
+      computed = static_cast<uint64_t>(bounded);                             // TSK141_Integer_Overflow_And_Wraparound_Issues
+    }
     if (computed == 0) {
-      computed = kMinPbkdfIterations;
+      computed = kMinPbkdfIterations;                                        // TSK141_Integer_Overflow_And_Wraparound_Issues
     }
     computed = std::clamp<uint64_t>(computed, kMinPbkdfIterations, kMaxPbkdfIterations);
     return CheckedCast<uint32_t>(computed);
@@ -957,10 +967,16 @@ VolumeManager::ChunkEncryptionResult VolumeManager::EncryptChunk(
     std::span<const uint8_t> plaintext, uint32_t epoch, int64_t chunk_index,
     uint64_t logical_offset, uint32_t chunk_size, qv::core::NonceGenerator& nonce_gen,
     std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> data_key) { // TSK040_AAD_Binding_and_Chunk_Authentication
+  if (chunk_index < 0) {                                                   // TSK141_Integer_Overflow_And_Wraparound_Issues
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Negative chunk index"}; // TSK141_Integer_Overflow_And_Wraparound_Issues
+  }
   auto chunk_hash = qv::crypto::SHA256_Hash(plaintext);                    // TSK128_Missing_AAD_Validation_in_Chunks
   qv::security::Zeroizer::ScopeWiper chunk_hash_guard(chunk_hash.data(), chunk_hash.size());
   auto nonce_record = nonce_gen.NextAuthenticated(
       chunk_index, std::span<const uint8_t>(chunk_hash.data(), chunk_hash.size())); // TSK040, TSK128_Missing_AAD_Validation_in_Chunks
+  if (nonce_record.counter == std::numeric_limits<uint64_t>::max()) {       // TSK141_Integer_Overflow_And_Wraparound_Issues
+    throw qv::Error{qv::ErrorDomain::State, 0, "Nonce counter overflow"};   // TSK141_Integer_Overflow_And_Wraparound_Issues
+  }
   auto envelope = MakeChunkEnvelope(epoch, chunk_index, logical_offset,
                                     chunk_size, nonce_record.mac, nonce_record.counter);          // TSK083_AAD_Recompute_and_Binding, TSK128_Missing_AAD_Validation_in_Chunks
   auto enc_result = qv::crypto::AES256_GCM_Encrypt(                         // TSK040
@@ -977,6 +993,9 @@ std::vector<uint8_t> VolumeManager::DecryptChunk(
     const ChunkEncryptionResult& sealed_chunk, uint32_t epoch, int64_t chunk_index,
     uint64_t logical_offset, uint32_t chunk_size,
     std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> data_key) { // TSK040_AAD_Binding_and_Chunk_Authentication
+  if (chunk_index < 0 || sealed_chunk.chunk_index < 0) {                    // TSK141_Integer_Overflow_And_Wraparound_Issues
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Negative chunk index"}; // TSK141_Integer_Overflow_And_Wraparound_Issues
+  }
   if (sealed_chunk.epoch != epoch || sealed_chunk.chunk_index != chunk_index ||         // TSK083
       sealed_chunk.logical_offset != logical_offset || sealed_chunk.chunk_size != chunk_size) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
@@ -1273,7 +1292,10 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
     qv::orchestrator::EventBus::Instance().Publish(warning);
   }
 
-  const uint32_t new_epoch = old_epoch + 1; // TSK024_Key_Rotation_and_Lifecycle_Management
+  if (old_epoch == std::numeric_limits<uint32_t>::max()) {                   // TSK141_Integer_Overflow_And_Wraparound_Issues
+    throw qv::Error{qv::ErrorDomain::State, 0, "Epoch counter overflow"};   // TSK141_Integer_Overflow_And_Wraparound_Issues
+  }
+  const uint32_t new_epoch = old_epoch + 1; // TSK024_Key_Rotation_and_Lifecycle_Management, TSK141_Integer_Overflow_And_Wraparound_Issues
 
   std::array<uint8_t, kPbkdfSaltSize>
       new_password_salt{}; // TSK036_PBKDF2_Argon2_Migration_Path
