@@ -83,6 +83,8 @@ class ChunkCache {
 
   EraseResult EraseLocked(int64_t chunk_idx);  // TSK076_Cache_Coherency
 
+  void PruneExpiredLocked();  // TSK126_Inefficient_Chunk_Cache_Eviction batched stale-node cleanup
+
   void CheckInvariantsLocked() const;  // TSK108_Data_Structure_Invariants debug validation
 
   size_t max_size_;
@@ -97,6 +99,8 @@ class ChunkCache {
   std::function<void(int64_t, const std::vector<uint8_t>&)> write_back_;
 
   std::unordered_map<int64_t, uint64_t> cache_generations_;  // TSK096_Race_Conditions_and_Thread_Safety
+
+  size_t eviction_prune_stride_{0};  // TSK126_Inefficient_Chunk_Cache_Eviction amortize sweeps
 
   mutable std::shared_mutex mutex_;
 };

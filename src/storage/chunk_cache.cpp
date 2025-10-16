@@ -14,6 +14,8 @@ namespace {
 constexpr uint64_t kGenerationResetThreshold =
     static_cast<uint64_t>(std::numeric_limits<uint32_t>::max() / 2);  // TSK115_Memory_Leaks_and_Resource_Management cap generation drift
 
+constexpr size_t kExpiredPruneInterval = 32;  // TSK126_Inefficient_Chunk_Cache_Eviction amortize global sweeps
+
 class FlushBufferPool { // TSK113_Performance_and_Scalability reuse staging buffers
  public:
   std::vector<uint8_t> Acquire(size_t size) {
@@ -108,16 +110,16 @@ ChunkCache::ChunkCache(size_t max_size) : max_size_(max_size) {}
 
 std::shared_ptr<CachedChunk> ChunkCache::Get(int64_t chunk_idx) {
   std::unique_lock write_lock(mutex_);  // TSK104_Concurrency_Deadlock_and_Lock_Ordering avoid upgrades
-  CheckInvariantsLocked();             // TSK108_Data_Structure_Invariants
+  CheckInvariantsLocked();             // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
+  std::shared_ptr<CachedChunk> result;
   auto it = cache_.find(chunk_idx);
-  if (it == cache_.end()) {
-    CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants ensure structural parity on miss
-    return nullptr;
+  if (it != cache_.end()) {
+    auto chunk = it->second.chunk;
+    TouchLocked(chunk_idx, chunk);
+    result = std::move(chunk);
   }
-  auto chunk = it->second.chunk;
-  TouchLocked(chunk_idx, chunk);
-  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants post-touch validation
-  return chunk;
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
+  return result;
 }
 
 std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
@@ -130,16 +132,34 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
   std::shared_ptr<CachedChunk> replaced_chunk;
   {
     std::unique_lock lock(mutex_);
-
-    CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants pre-insert validation
+    CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
 
     erased = EraseLocked(chunk_idx);  // TSK076_Cache_Coherency
     replaced_chunk = erased.chunk;
 
-    while (current_size_ + data.size() > max_size_ && !cache_.empty()) {
+    size_t reclaim_needed = 0;  // TSK126_Inefficient_Chunk_Cache_Eviction batch eviction sizing
+    if (current_size_ + data.size() > max_size_) {
+      reclaim_needed = current_size_ + data.size() - max_size_;
+    }
+
+    while (reclaim_needed > 0 && (!lru_list_.empty() || !cache_.empty())) {
       auto evicted = EvictLRULocked();
-      if (evicted.chunk && evicted.chunk->dirty && write_back_) {
-        to_flush.push_back(evicted.chunk);
+      if (!evicted.chunk) {
+        if (lru_list_.empty()) {
+          break;  // only expired placeholders remained
+        }
+        continue;
+      }
+
+      if (evicted.chunk->dirty && write_back_) {
+        to_flush.push_back(evicted.chunk);  // TSK126_Inefficient_Chunk_Cache_Eviction defer write-back until unlocked
+      }
+
+      const size_t evicted_size = evicted.chunk->data.size();
+      if (evicted_size >= reclaim_needed) {
+        reclaim_needed = 0;
+      } else {
+        reclaim_needed -= evicted_size;
       }
     }
 
@@ -156,7 +176,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
     inserted = chunk;
     callback = write_back_;
 
-    CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants confirm accounting updated
+    CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   }
 
   if (callback) {
@@ -201,7 +221,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
 
 std::vector<int64_t> ChunkCache::GetDirtyChunks() const {
   std::shared_lock lock(mutex_);
-  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants monitor read paths
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   std::vector<int64_t> dirty;
   dirty.reserve(cache_.size());
   for (const auto& [idx, entry] : cache_) {
@@ -209,23 +229,24 @@ std::vector<int64_t> ChunkCache::GetDirtyChunks() const {
       dirty.push_back(idx);
     }
   }
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   return dirty;
 }
 
 void ChunkCache::MarkClean(int64_t chunk_idx) {
   std::unique_lock lock(mutex_);
-  CheckInvariantsLocked();
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   if (auto it = cache_.find(chunk_idx); it != cache_.end()) {
     it->second.chunk->dirty = false;
   }
-  CheckInvariantsLocked();
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
 }
 
 void ChunkCache::Invalidate(int64_t chunk_idx) {  // TSK076_Cache_Coherency
   std::unique_lock lock(mutex_);
-  CheckInvariantsLocked();
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   EraseLocked(chunk_idx);
-  CheckInvariantsLocked();
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
 }
 
 void ChunkCache::Flush(std::function<void(int64_t, const std::vector<uint8_t>&)> write_fn) {
@@ -236,14 +257,14 @@ void ChunkCache::Flush(std::function<void(int64_t, const std::vector<uint8_t>&)>
   std::vector<DirtyEntry> dirty_chunks;  // TSK076_Cache_Coherency
   {
     std::unique_lock lock(mutex_);
-    CheckInvariantsLocked();
+    CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
     for (auto& [idx, entry] : cache_) {
       if (entry.chunk && entry.chunk->dirty) {
         entry.chunk->dirty = false;
         dirty_chunks.push_back(DirtyEntry{idx, entry.chunk});
       }
     }
-    CheckInvariantsLocked();
+    CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   }
 
   std::vector<std::shared_ptr<CachedChunk>> flush_chunks;
@@ -258,43 +279,68 @@ void ChunkCache::Flush(std::function<void(int64_t, const std::vector<uint8_t>&)>
 void ChunkCache::SetWriteBackCallback(
     std::function<void(int64_t, const std::vector<uint8_t>&)> callback) {
   std::unique_lock lock(mutex_);
-  CheckInvariantsLocked();
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   write_back_ = std::move(callback);
-  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants callback updates do not affect structure
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
+}
+
+void ChunkCache::PruneExpiredLocked() {
+  if (lru_list_.empty()) {
+    return;
+  }
+
+  for (auto it = lru_list_.begin(); it != lru_list_.end();) {
+    if (!it->chunk.expired()) {
+      ++it;
+      continue;
+    }
+
+    if (auto generation_it = cache_generations_.find(it->index);
+        generation_it != cache_generations_.end() &&
+        generation_it->second >= kGenerationResetThreshold) {
+      generation_it->second = 0;  // TSK115_Memory_Leaks_and_Resource_Management clamp runaway counters // TSK126_Inefficient_Chunk_Cache_Eviction batch prune generation reset
+    }
+    lru_map_.erase(it->index);  // TSK126_Inefficient_Chunk_Cache_Eviction remove expired node bookkeeping
+    it = lru_list_.erase(it);
+  }
 }
 
 void ChunkCache::TouchLocked(int64_t chunk_idx, const std::shared_ptr<CachedChunk>& chunk) {
   // TSK112_Documentation_and_Code_Clarity: Maintain the parallel LRU structures in lock-step
   // so invariants described in the header remain valid for debugging assertions.
-  auto map_it = lru_map_.find(chunk_idx);
-  if (map_it != lru_map_.end()) {
-    lru_list_.erase(map_it->second);
+  const bool already_front = !lru_list_.empty() && lru_list_.front().index == chunk_idx;  // TSK126_Inefficient_Chunk_Cache_Eviction avoid redundant moves
+  if (already_front) {
+    lru_list_.front().chunk = chunk;
+  } else {
+    if (auto map_it = lru_map_.find(chunk_idx); map_it != lru_map_.end()) {
+      lru_list_.erase(map_it->second);
+    }
+    lru_list_.push_front(LruNode{chunk_idx, chunk});
   }
-  lru_list_.push_front(LruNode{chunk_idx, chunk});
   lru_map_[chunk_idx] = lru_list_.begin();
   chunk->last_access = std::chrono::steady_clock::now();
-  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants validate LRU bookkeeping
 }
 
 ChunkCache::EvictedChunk ChunkCache::EvictLRULocked() {
-  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants pre-eviction audit
+  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants // TSK126_Inefficient_Chunk_Cache_Eviction boundary-only invariant check
   EvictedChunk evicted{};
   if (lru_list_.empty()) {
     CheckInvariantsLocked();
     return evicted;
   }
 
+  if (++eviction_prune_stride_ >= kExpiredPruneInterval) {
+    PruneExpiredLocked();  // TSK126_Inefficient_Chunk_Cache_Eviction amortize stale sweeps
+    eviction_prune_stride_ = 0;
+  }
+
   while (!lru_list_.empty()) {
     auto node_it = std::prev(lru_list_.end());
-    if (node_it->chunk.expired()) {  // TSK105_Resource_Leaks_and_Lifecycle prune stale nodes
-      if (auto generation_it = cache_generations_.find(node_it->index);
-          generation_it != cache_generations_.end() &&
-          generation_it->second >= kGenerationResetThreshold) {
-        generation_it->second = 0;  // TSK115_Memory_Leaks_and_Resource_Management clamp runaway counters
+    if (node_it->chunk.expired()) {
+      PruneExpiredLocked();
+      if (lru_list_.empty()) {
+        break;
       }
-      lru_map_.erase(node_it->index);
-      lru_list_.pop_back();
-      CheckInvariantsLocked();
       continue;
     }
 
@@ -302,12 +348,9 @@ ChunkCache::EvictedChunk ChunkCache::EvictLRULocked() {
     auto erased = EraseLocked(victim_idx);
     evicted.index = victim_idx;
     evicted.chunk = erased.chunk;
-    if (!evicted.chunk) {
-      CheckInvariantsLocked();
-      continue;
+    if (evicted.chunk) {
+      break;
     }
-    CheckInvariantsLocked();
-    return evicted;
   }
 
   CheckInvariantsLocked();
@@ -315,7 +358,6 @@ ChunkCache::EvictedChunk ChunkCache::EvictLRULocked() {
 }
 
 ChunkCache::EraseResult ChunkCache::EraseLocked(int64_t chunk_idx) {  // TSK076_Cache_Coherency
-  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants pre-erase snapshot
   EraseResult result{};
   auto& generation = cache_generations_[chunk_idx];
   uint64_t previous_generation = generation;
@@ -339,7 +381,6 @@ ChunkCache::EraseResult ChunkCache::EraseLocked(int64_t chunk_idx) {  // TSK076_
     cache_.erase(existing);
   }
 
-  CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants ensure size accounting updated
   return result;
 }
 
