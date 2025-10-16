@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <cassert>  // TSK108_Data_Structure_Invariants
 #include <iterator> // TSK105_Resource_Leaks_and_Lifecycle
+#include <limits>   // TSK115_Memory_Leaks_and_Resource_Management generation bounds
 #include <mutex> // TSK067_Nonce_Safety
 #include <utility> // TSK113_Performance_and_Scalability batching helpers
 
 namespace qv::storage {
 
 namespace {
+
+constexpr uint64_t kGenerationResetThreshold =
+    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max() / 2);  // TSK115_Memory_Leaks_and_Resource_Management cap generation drift
 
 class FlushBufferPool { // TSK113_Performance_and_Scalability reuse staging buffers
  public:
@@ -63,20 +67,32 @@ void FlushDirtyOutsideLock(std::vector<std::shared_ptr<CachedChunk>>& chunks,
     }
 
     for (size_t i = index; i < run_end; ++i) {
-      auto chunk = std::move(chunks[i]);
+      auto& chunk = chunks[i];
       if (!chunk) {
         continue;
       }
       const auto chunk_index = chunk->chunk_idx;
       std::vector<uint8_t> buffer;
-      if (!preserve_chunk_storage && chunk.use_count() == 1) { // TSK113_Performance_and_Scalability reuse eviction storage
+      const bool reuse_storage =
+          !preserve_chunk_storage && chunk.use_count() == 1;  // TSK113_Performance_and_Scalability reuse eviction storage
+      if (reuse_storage) {
         buffer = std::move(chunk->data);
       } else {
         buffer = pool.Acquire(chunk->data.size());
         std::copy(chunk->data.begin(), chunk->data.end(), buffer.begin());
       }
-      callback(chunk_index, buffer);
+      try {
+        callback(chunk_index, buffer);
+      } catch (...) {
+        if (reuse_storage) {
+          chunk->data = std::move(buffer);  // TSK115_Memory_Leaks_and_Resource_Management restore on failure
+        } else {
+          pool.Release(std::move(buffer));
+        }
+        throw;
+      }
       pool.Release(std::move(buffer));
+      chunk.reset();
     }
 
     index = run_end;
@@ -110,12 +126,15 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
   std::vector<std::shared_ptr<CachedChunk>> to_flush;
   std::function<void(int64_t, const std::vector<uint8_t>&)> callback;
   std::shared_ptr<CachedChunk> inserted;  // TSK104_Concurrency_Deadlock_and_Lock_Ordering retain result outside lock
+  ChunkCache::EraseResult erased{};
+  std::shared_ptr<CachedChunk> replaced_chunk;
   {
     std::unique_lock lock(mutex_);
 
     CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants pre-insert validation
 
-    auto erased = EraseLocked(chunk_idx);  // TSK076_Cache_Coherency
+    erased = EraseLocked(chunk_idx);  // TSK076_Cache_Coherency
+    replaced_chunk = erased.chunk;
 
     while (current_size_ + data.size() > max_size_ && !cache_.empty()) {
       auto evicted = EvictLRULocked();
@@ -141,7 +160,40 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
   }
 
   if (callback) {
-    FlushDirtyOutsideLock(to_flush, callback, false); // TSK113_Performance_and_Scalability staged eviction writes
+    try {
+      FlushDirtyOutsideLock(to_flush, callback, false);  // TSK113_Performance_and_Scalability staged eviction writes
+    } catch (...) {
+      std::unique_lock lock(mutex_);
+      if (inserted) {
+        if (auto cache_it = cache_.find(chunk_idx); cache_it != cache_.end() &&
+                                                  cache_it->second.chunk == inserted) {
+          current_size_ -= inserted->data.size();
+          if (auto lru_it = lru_map_.find(chunk_idx); lru_it != lru_map_.end()) {
+            lru_list_.erase(lru_it->second);
+            lru_map_.erase(lru_it);
+          }
+          cache_.erase(cache_it);
+        }
+      }
+      cache_generations_[chunk_idx] = erased.previous_generation;  // TSK115_Memory_Leaks_and_Resource_Management rollback state
+      if (replaced_chunk) {
+        replaced_chunk->version = erased.previous_generation;
+        current_size_ += replaced_chunk->data.size();
+        cache_[chunk_idx] = CacheEntry{replaced_chunk, replaced_chunk->version};
+        TouchLocked(chunk_idx, replaced_chunk);
+      }
+      for (auto& chunk : to_flush) {
+        if (!chunk) {
+          continue;
+        }
+        cache_generations_[chunk->chunk_idx] = chunk->version;
+        current_size_ += chunk->data.size();
+        cache_[chunk->chunk_idx] = CacheEntry{chunk, chunk->version};
+        TouchLocked(chunk->chunk_idx, chunk);
+      }
+      CheckInvariantsLocked();
+      throw;
+    }
   }
 
   return inserted;
@@ -233,6 +285,11 @@ ChunkCache::EvictedChunk ChunkCache::EvictLRULocked() {
   while (!lru_list_.empty()) {
     auto node_it = std::prev(lru_list_.end());
     if (node_it->chunk.expired()) {  // TSK105_Resource_Leaks_and_Lifecycle prune stale nodes
+      if (auto generation_it = cache_generations_.find(node_it->index);
+          generation_it != cache_generations_.end() &&
+          generation_it->second >= kGenerationResetThreshold) {
+        generation_it->second = 0;  // TSK115_Memory_Leaks_and_Resource_Management clamp runaway counters
+      }
       lru_map_.erase(node_it->index);
       lru_list_.pop_back();
       CheckInvariantsLocked();
@@ -259,7 +316,13 @@ ChunkCache::EraseResult ChunkCache::EraseLocked(int64_t chunk_idx) {  // TSK076_
   CheckInvariantsLocked();  // TSK108_Data_Structure_Invariants pre-erase snapshot
   EraseResult result{};
   auto& generation = cache_generations_[chunk_idx];
+  uint64_t previous_generation = generation;
+  if (generation >= kGenerationResetThreshold) {
+    generation = 0;  // TSK115_Memory_Leaks_and_Resource_Management prevent overflow runaway
+    previous_generation = 0;
+  }
   generation += 1;
+  result.previous_generation = previous_generation;
   result.generation = generation;
 
   if (auto existing = cache_.find(chunk_idx); existing != cache_.end()) {

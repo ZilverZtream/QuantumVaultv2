@@ -168,6 +168,15 @@ VolumeFilesystem::VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device)
   }
 }
 
+VolumeFilesystem::~VolumeFilesystem() {
+  // TSK115_Memory_Leaks_and_Resource_Management persist pending directory updates on teardown
+  try {
+    SaveMetadata();
+  } catch (...) {
+    // Destructors must not throw; metadata persistence errors are logged by callers.
+  }
+}
+
 FileEntry* VolumeFilesystem::FindFile(const std::string& path) {
   auto normalized = NormalizePath(path);
   if (normalized == "/") {
@@ -328,11 +337,25 @@ std::vector<uint8_t> VolumeFilesystem::ReadFileContent(const FileEntry& file) {
   uint64_t start_chunk = file.start_offset / kChunkPayloadSize;
   uint64_t chunk_count = (file.size + kChunkPayloadSize - 1) / kChunkPayloadSize;
   std::vector<uint8_t> data(chunk_count * kChunkPayloadSize);
+  struct PartialReadGuard {  // TSK115_Memory_Leaks_and_Resource_Management clear buffers on failure
+    explicit PartialReadGuard(std::vector<uint8_t>* target) : target_(target) {}
+    ~PartialReadGuard() {
+      if (!committed_ && target_) {
+        target_->clear();
+      }
+    }
+    void Commit() { committed_ = true; }
+
+   private:
+    std::vector<uint8_t>* target_;
+    bool committed_ = false;
+  } guard(&data);
   for (uint64_t i = 0; i < chunk_count; ++i) {
     auto chunk = device_->ReadChunk(static_cast<int64_t>(start_chunk + i));
     std::copy(chunk.ciphertext.begin(), chunk.ciphertext.end(),
               data.begin() + static_cast<std::ptrdiff_t>(i * kChunkPayloadSize));
   }
+  guard.Commit();
   data.resize(file.size);
   return data;
 }
@@ -357,9 +380,38 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
     file.start_offset = 0;
     return;
   }
+  uint64_t previous_next_chunk = next_chunk_index_;
+  bool allocated_new_range = false;
   if (old_chunks == 0 || start_chunk < data_start_chunk_ || required_chunks > old_chunks) {
+    allocated_new_range = true;
+    previous_next_chunk = next_chunk_index_;
     start_chunk = AllocateChunks(required_chunks);
   }
+
+  struct ChunkAllocationGuard {  // TSK115_Memory_Leaks_and_Resource_Management rollback leaked chunks
+    ChunkAllocationGuard(VolumeFilesystem& owner, FileEntry& file_ref, uint64_t original_offset,
+                         bool allocated_new, uint64_t previous_next)
+        : owner_(owner), file_(file_ref), original_offset_(original_offset),
+          allocated_new_(allocated_new), previous_next_(previous_next) {}
+    ~ChunkAllocationGuard() {
+      if (!committed_) {
+        file_.start_offset = original_offset_;
+        if (allocated_new_) {
+          owner_.next_chunk_index_ = previous_next_;
+          owner_.next_file_offset_ = owner_.next_chunk_index_ * kChunkPayloadSize;
+        }
+      }
+    }
+    void Commit() { committed_ = true; }
+
+   private:
+    VolumeFilesystem& owner_;
+    FileEntry& file_;
+    uint64_t original_offset_;
+    bool allocated_new_;
+    uint64_t previous_next_;
+    bool committed_ = false;
+  } allocation_guard(*this, file, file.start_offset, allocated_new_range, previous_next_chunk);
 
   for (uint64_t i = 0; i < required_chunks; ++i) {
     std::vector<uint8_t> chunk_buffer(kChunkPayloadSize, 0);
@@ -378,6 +430,7 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
   }
 
   file.start_offset = start_chunk * kChunkPayloadSize;
+  allocation_guard.Commit();
 }
 
 #if defined(__linux__)

@@ -84,6 +84,7 @@ class VolumeFilesystem {
 
 public:
   explicit VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device);
+  ~VolumeFilesystem();  // TSK115_Memory_Leaks_and_Resource_Management ensure metadata persisted
 
 #if defined(__linux__)
   // Filesystem operations
