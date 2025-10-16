@@ -106,8 +106,18 @@ To CheckedCast(From value) { // TSK099_Input_Validation_and_Sanitization
   return static_cast<To>(value);
 }
 
-void ValidatePassword(const std::string& password) { // TSK135_Password_Complexity_Enforcement centralized enforcement
-  EnforcePasswordPolicy(password);
+void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_and_Sanitization basic guards
+  constexpr size_t kMinPasswordLen = 8;
+  constexpr size_t kMaxPasswordLen = 1024;
+  const auto size = password.size();
+  if (size < kMinPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooShort)};
+  }
+  if (size > kMaxPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooLong)};
+  }
 }
 
 std::filesystem::path ComputeContainerRoot() { // TSK099_Input_Validation_and_Sanitization

@@ -76,7 +76,7 @@ bool HasRequiredComplexity(const std::string& password) { // TSK135_Password_Com
 struct CommonPasswordCache { // TSK135_Password_Complexity_Enforcement dictionary memoization
   std::once_flag init;
   std::unordered_set<std::string> entries;
-  std::optional<std::string> error;
+  bool available{false};
 };
 
 CommonPasswordCache& Cache() { // TSK135_Password_Complexity_Enforcement lazy singleton
@@ -86,19 +86,36 @@ CommonPasswordCache& Cache() { // TSK135_Password_Complexity_Enforcement lazy si
 
 std::optional<std::filesystem::path> ResolveCommonPasswordListPath() { // TSK135_Password_Complexity_Enforcement
   std::vector<std::filesystem::path> candidates;
+  const auto dictionary_filename = std::filesystem::path(kDefaultCommonPasswordList).filename();
+
   if (const char* env = std::getenv("QV_COMMON_PASSWORD_LIST"); env && *env) {
     candidates.emplace_back(env);
+  }
+
+  if (const char* dir = std::getenv("QV_COMMON_PASSWORD_LIST_DIR"); dir && *dir) {
+    std::filesystem::path base(dir);
+    candidates.emplace_back(base / dictionary_filename);
+  }
+
+  if (const char* data_root = std::getenv("QV_DATA_ROOT"); data_root && *data_root) {
+    std::filesystem::path root(data_root);
+    candidates.emplace_back(root / kDefaultCommonPasswordList);
+    candidates.emplace_back(root / dictionary_filename);
   }
 
   std::error_code cwd_ec;
   const auto cwd = std::filesystem::current_path(cwd_ec);
   if (!cwd_ec) {
     candidates.emplace_back(cwd / kDefaultCommonPasswordList);
-    candidates.emplace_back(cwd / std::filesystem::path(kDefaultCommonPasswordList).filename());
+    candidates.emplace_back(cwd / dictionary_filename);
   }
 
   const auto source_root = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
   candidates.emplace_back(source_root / kDefaultCommonPasswordList);
+
+#ifdef QV_COMMON_PASSWORD_LIST_INSTALL_PATH
+  candidates.emplace_back(std::filesystem::path(QV_COMMON_PASSWORD_LIST_INSTALL_PATH));
+#endif
 
   for (const auto& candidate : candidates) {
     std::error_code exists_ec;
@@ -110,15 +127,16 @@ std::optional<std::filesystem::path> ResolveCommonPasswordListPath() { // TSK135
 }
 
 void LoadCommonPasswords(CommonPasswordCache& cache) { // TSK135_Password_Complexity_Enforcement dictionary loader
+  cache.entries.clear();
+  cache.available = false;
+
   auto path = ResolveCommonPasswordListPath();
   if (!path) {
-    cache.error = "list not found";
     return;
   }
 
   std::ifstream in(*path, std::ios::binary);
   if (!in) {
-    cache.error = "open failed";
     return;
   }
 
@@ -145,16 +163,17 @@ void LoadCommonPasswords(CommonPasswordCache& cache) { // TSK135_Password_Comple
 
   if (in.bad()) {
     cache.entries.clear();
-    cache.error = "read failed";
+    return;
   }
+
+  cache.available = true;
 }
 
 bool IsCommonPassword(const std::string& password) { // TSK135_Password_Complexity_Enforcement blacklist check
   auto& cache = Cache();
   std::call_once(cache.init, [&cache]() { LoadCommonPasswords(cache); });
-  if (cache.error) {
-    throw qv::Error{qv::ErrorDomain::Config, 0,
-                    std::string(qv::errors::msg::kPasswordCommonListUnavailable) + ": " + *cache.error};
+  if (!cache.available) {
+    return false;
   }
   return cache.entries.find(password) != cache.entries.end();
 }

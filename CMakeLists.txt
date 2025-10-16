@@ -175,7 +175,13 @@ target_include_directories(qv_orchestrator
 ) # TSK008
 target_link_libraries(qv_orchestrator PUBLIC qv_core ${ARGON2_LIBRARY})
 target_include_directories(qv_orchestrator PRIVATE ${ARGON2_INCLUDE_DIR}) # TSK036_PBKDF2_Argon2_Migration_Path headers
-target_compile_definitions(qv_orchestrator PUBLIC QV_HAVE_ARGON2=1)       # TSK036_PBKDF2_Argon2_Migration_Path flag
+set(_qv_common_password_install_path "${CMAKE_INSTALL_FULL_DATADIR}/quantumvault/passwords/pwdb_top100000.txt")
+file(TO_CMAKE_PATH "${_qv_common_password_install_path}" _qv_common_password_install_path)
+target_compile_definitions(qv_orchestrator
+    PUBLIC
+      QV_HAVE_ARGON2=1                                                             # TSK036_PBKDF2_Argon2_Migration_Path flag
+      QV_COMMON_PASSWORD_LIST_INSTALL_PATH="${_qv_common_password_install_path}"  # TSK135_Password_Complexity_Enforcement runtime data
+)
 # TSK005 platform signature verification dependencies
 if (WIN32)
   target_link_libraries(qv_orchestrator PRIVATE Wintrust Crypt32)
@@ -418,6 +424,9 @@ install(TARGETS
 )
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}) # TSK008
+
+install(FILES contrib/passwords/pwdb_top100000.txt
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/quantumvault/passwords) # TSK135_Password_Complexity_Enforcement install dictionary
 
 install(EXPORT QuantumVaultTargets
     NAMESPACE qv::
