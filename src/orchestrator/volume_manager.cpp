@@ -128,6 +128,16 @@ std::string BytesToHexLower(std::span<const uint8_t> bytes) { // TSK135_Password
   return encoded;
 }
 
+std::filesystem::path MakeMigrationTempPath(const std::filesystem::path& container) { // TSK140_Temporary_File_Security_Vulnerabilities unpredictable staging names
+  std::array<uint8_t, 16> random_token{};
+  qv::crypto::SystemRandomBytes(std::span<uint8_t>(random_token.data(), random_token.size()));
+  auto temp = container;
+  temp += ".migrate.";
+  temp += BytesToHexLower(std::span<const uint8_t>(random_token.data(), random_token.size()));
+  temp += ".tmp";
+  return temp;
+}
+
 std::string HashPasswordForHistory(const std::filesystem::path& container,
                                    const std::string& password) { // TSK135_Password_Complexity_Enforcement
   const auto container_utf8 = qv::PathToUtf8String(container);
@@ -1503,8 +1513,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   auto payload_span =
       std::span<const uint8_t>(payload.data(), payload.size()); // TSK074_Migration_Rollback_and_Backup reuse views
 
-  auto migration_temp = sanitized_container;
-  migration_temp += ".migrate.tmp"; // TSK074_Migration_Rollback_and_Backup staged header checkpoint
+  auto migration_temp = MakeMigrationTempPath(sanitized_container); // TSK140_Temporary_File_Security_Vulnerabilities staged header checkpoint
   std::error_code temp_ec;
   std::filesystem::remove(migration_temp, temp_ec); // TSK074_Migration_Rollback_and_Backup clear stale stage
   ScopedPathRemoval staged_guard(migration_temp);    // TSK074_Migration_Rollback_and_Backup ensure cleanup
