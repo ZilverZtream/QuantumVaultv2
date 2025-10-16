@@ -21,6 +21,8 @@ struct CachedChunk {
   uint64_t version{0};  // TSK096_Race_Conditions_and_Thread_Safety
 };
 
+// TSK112_Documentation_and_Code_Clarity: Thread-safety — all public methods synchronize
+// on mutex_, while helpers suffixed with *Locked expect the caller to hold the lock.
 class ChunkCache {
  public:
   explicit ChunkCache(size_t max_size = 128 * 1024 * 1024);
@@ -63,6 +65,18 @@ class ChunkCache {
     uint64_t previous_generation{0};  // TSK115_Memory_Leaks_and_Resource_Management rollback support
   };
 
+  /// TSK112_Documentation_and_Code_Clarity: Updates LRU access bookkeeping.
+  ///
+  /// Preconditions:
+  ///   - mutex_ must be held by the caller (write lock)
+  ///   - chunk_idx exists in both cache_ and lru_map_
+  ///
+  /// Invariants maintained:
+  ///   - lru_list_.size() == lru_map_.size() == cache_.size()
+  ///   - lru_list_.front()->index == chunk_idx after return
+  ///   - chunk->last_access is refreshed to now
+  ///
+  /// Thread-safety: NOT thread-safe; relies on external synchronization.
   void TouchLocked(int64_t chunk_idx, const std::shared_ptr<CachedChunk>& chunk);
 
   EvictedChunk EvictLRULocked();
@@ -76,6 +90,8 @@ class ChunkCache {
 
   std::unordered_map<int64_t, CacheEntry> cache_;
   std::list<LruNode> lru_list_;                                    // TSK105_Resource_Leaks_and_Lifecycle
+  // TSK112_Documentation_and_Code_Clarity: Invariant — lru_list_, lru_map_, and cache_ contain
+  // the same set of keys; size counters track the aggregate payload of cache_.
   std::unordered_map<int64_t, std::list<LruNode>::iterator> lru_map_; // TSK105_Resource_Leaks_and_Lifecycle
 
   std::function<void(int64_t, const std::vector<uint8_t>&)> write_back_;

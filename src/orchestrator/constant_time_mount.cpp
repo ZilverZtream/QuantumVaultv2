@@ -506,12 +506,15 @@ constexpr uint64_t kPaddingSlackNs = std::chrono::milliseconds(2).count();
 constexpr uint64_t kHistogramBucketNs = 1'000'000; // 1ms buckets
 constexpr size_t kHistogramBuckets = 512;
 constexpr uint64_t kLogIntervalNs = std::chrono::seconds(2).count();
-constexpr uint16_t kTlvTypePbkdf2 = 0x1001;                                     // TSK013
-constexpr uint16_t kTlvTypeHybridSalt = 0x1002;                                 // TSK013
-constexpr uint16_t kTlvTypeArgon2 = 0x1003;                                     // TSK036_PBKDF2_Argon2_Migration_Path
-constexpr uint16_t kTlvTypeEpoch = 0x4E4F;                                      // matches EpochTLV
-constexpr uint16_t kTlvTypePqc = 0x7051;
-constexpr uint16_t kTlvTypeReservedV2 = 0x7F02;                                 // TSK013
+// TSK112_Documentation_and_Code_Clarity: TLV type identifiers (little-endian) mirror the
+// serialized header layout. The inline notes record the semantic payload each tag carries to
+// avoid treating these values as unexplained magic numbers.
+constexpr uint16_t kTlvTypePbkdf2 = 0x1001;                                     // Password-based KDF parameters // TSK112
+constexpr uint16_t kTlvTypeHybridSalt = 0x1002;                                 // PQC hybrid KDF salt // TSK112
+constexpr uint16_t kTlvTypeArgon2 = 0x1003;                                     // Argon2id KDF parameters // TSK112
+constexpr uint16_t kTlvTypeEpoch = 0x4E4F;                                      // 'NO' nonce/epoch counter // TSK112
+constexpr uint16_t kTlvTypePqc = 0x7051;                                        // 'pQ' post-quantum KEM blob // TSK112
+constexpr uint16_t kTlvTypeReservedV2 = 0x7F02;                                 // Reserved V2 payload slot // TSK112
 constexpr size_t kPbkdfSaltSize = 16;
 constexpr size_t kHybridSaltSize = 32;
 constexpr size_t kHeaderMacSize = qv::crypto::HMAC_SHA256::TAG_SIZE;
@@ -920,6 +923,10 @@ TimingSnapshot SnapshotTiming() {
   return snap;
 }
 
+// TSK112_Documentation_and_Code_Clarity: ComputePadding measures how much additional delay
+// is needed so every attempt meets the calibrated target duration. By clamping to the target
+// when the actual runtime exceeds it we avoid underflow, and callers feed the result into the
+// constant-time delay so observable timings converge.
 std::chrono::nanoseconds ComputePadding(std::chrono::nanoseconds actual) {
   auto& state = GetTimingState();
   auto mode = state.mode.load(std::memory_order_acquire); // TSK022

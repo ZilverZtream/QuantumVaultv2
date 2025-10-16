@@ -264,6 +264,8 @@ void ChunkCache::SetWriteBackCallback(
 }
 
 void ChunkCache::TouchLocked(int64_t chunk_idx, const std::shared_ptr<CachedChunk>& chunk) {
+  // TSK112_Documentation_and_Code_Clarity: Maintain the parallel LRU structures in lock-step
+  // so invariants described in the header remain valid for debugging assertions.
   auto map_it = lru_map_.find(chunk_idx);
   if (map_it != lru_map_.end()) {
     lru_list_.erase(map_it->second);
