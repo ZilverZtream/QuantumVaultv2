@@ -186,9 +186,10 @@ const struct fuse_operations kOperations = {
 
 }  // namespace
 
-FUSEAdapter::FUSEAdapter(std::shared_ptr<storage::BlockDevice> device)
+FUSEAdapter::FUSEAdapter(std::shared_ptr<storage::BlockDevice> device,
+                         std::optional<qv::storage::Extent> accessible_region)
     : filesystem_(nullptr) {
-  auto filesystem = std::make_unique<VolumeFilesystem>(std::move(device));
+  auto filesystem = std::make_unique<VolumeFilesystem>(std::move(device), accessible_region);
   g_inflight_calls.store(0, std::memory_order_release);
   g_draining.store(false, std::memory_order_release);
   filesystem_ = std::move(filesystem);
@@ -196,6 +197,12 @@ FUSEAdapter::FUSEAdapter(std::shared_ptr<storage::BlockDevice> device)
 
 FUSEAdapter::~FUSEAdapter() {
   Unmount();
+}
+
+void FUSEAdapter::ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents) {
+  if (filesystem_) {
+    filesystem_->SetProtectedExtents(extents); // TSK710_Implement_Hidden_Volumes propagate guard
+  }
 }
 
 void FUSEAdapter::Mount(const std::filesystem::path& mountpoint) {

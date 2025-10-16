@@ -29,13 +29,15 @@ namespace qv::platform {
 
 class WinFspAdapter::Impl {
  public:
-  explicit Impl(std::shared_ptr<storage::BlockDevice> device)
-      : volume_fs_(std::make_shared<VolumeFilesystem>(std::move(device))) {}
+  explicit Impl(std::shared_ptr<storage::BlockDevice> device,
+                std::optional<qv::storage::Extent> accessible_region)
+      : volume_fs_(std::make_shared<VolumeFilesystem>(std::move(device), accessible_region)) {}
 
   ~Impl() { Unmount(); }
 
   void Mount(const std::wstring& mountpoint);
   void Unmount();
+  void ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents);
 
  private:
   struct NodeContext {
@@ -93,6 +95,12 @@ class WinFspAdapter::Impl {
   std::wstring mountpoint_;
   FSP_FILE_SYSTEM* fs_{nullptr};
 };
+
+void WinFspAdapter::Impl::ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents) {
+  if (volume_fs_) {
+    volume_fs_->SetProtectedExtents(extents); // TSK710_Implement_Hidden_Volumes propagate guard
+  }
+}
 
 void WinFspAdapter::Impl::Mount(const std::wstring& mountpoint) {
   if (!volume_fs_) {
@@ -864,14 +872,20 @@ NTSTATUS WinFspAdapter::Impl::Rename(FSP_FILE_SYSTEM* fs, PVOID context, PWSTR f
   }
 }
 
-WinFspAdapter::WinFspAdapter(std::shared_ptr<storage::BlockDevice> device)
-    : impl_(std::make_unique<Impl>(std::move(device))) {}
+WinFspAdapter::WinFspAdapter(std::shared_ptr<storage::BlockDevice> device,
+                             std::optional<qv::storage::Extent> accessible_region)
+    : impl_(std::make_unique<Impl>(std::move(device), accessible_region)) {}
 
 WinFspAdapter::~WinFspAdapter() = default;
 
 void WinFspAdapter::Mount(const std::wstring& mountpoint) { impl_->Mount(mountpoint); }
 
 void WinFspAdapter::Unmount() { impl_->Unmount(); }
+void WinFspAdapter::ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents) {
+  if (impl_) {
+    impl_->ConfigureProtectedExtents(extents); // TSK710_Implement_Hidden_Volumes guard wiring
+  }
+}
 
 }  // namespace qv::platform
 
@@ -881,23 +895,29 @@ namespace qv::platform {
 
 class WinFspAdapter::Impl {
  public:
-  explicit Impl(std::shared_ptr<storage::BlockDevice>) {}
+  explicit Impl(std::shared_ptr<storage::BlockDevice>, std::optional<qv::storage::Extent>) {}
   void Mount(const std::wstring&) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
                     "WinFsp is only available on Windows platforms"};
   }
   void Unmount() {}
+  void ConfigureProtectedExtents(const std::vector<qv::storage::Extent>&) {}
 };
 
-WinFspAdapter::WinFspAdapter(std::shared_ptr<storage::BlockDevice> device)
-    : impl_(std::make_unique<Impl>(std::move(device))) {}
+WinFspAdapter::WinFspAdapter(std::shared_ptr<storage::BlockDevice> device,
+                             std::optional<qv::storage::Extent> accessible_region)
+    : impl_(std::make_unique<Impl>(std::move(device), accessible_region)) {}
 
 WinFspAdapter::~WinFspAdapter() = default;
 
 void WinFspAdapter::Mount(const std::wstring& mountpoint) { impl_->Mount(mountpoint); }
 
 void WinFspAdapter::Unmount() { impl_->Unmount(); }
-
+void WinFspAdapter::ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents) {
+  if (impl_) {
+    impl_->ConfigureProtectedExtents(extents);
+  }
+}
 }  // namespace qv::platform
 
 #endif  // defined(_WIN32) && defined(QV_HAVE_WINFSP)

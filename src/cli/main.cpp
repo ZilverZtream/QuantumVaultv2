@@ -802,7 +802,7 @@ namespace {
     std::cerr << "QuantumVault (skeleton)\n";
     std::cerr << "Usage:\n";
     std::cerr << "  qv create <container>\n";
-    std::cerr << "  qv mount  <container> <mountpoint>\n";
+    std::cerr << "  qv mount  [--hidden|--decoy] <container> <mountpoint>\n"; // TSK710_Implement_Hidden_Volumes mount modes
     std::cerr
         << "  qv rekey  [--backup-key=<path>] <container>\n"; // TSK024_Key_Rotation_and_Lifecycle_Management
     std::cerr << "  qv migrate [--migrate-to=<version>] <container>\n"; // TSK033
@@ -816,6 +816,9 @@ namespace {
     std::cerr << "  --keychain           Persist credentials in OS key store\n"; // TSK035_Platform_Specific_Security_Integration
     std::cerr << "  --tpm-seal           Seal credentials with TPM PCR policy\n"; // TSK035_Platform_Specific_Security_Integration
     std::cerr << "  --kdf-iterations=N   Override PBKDF2 iteration count for new headers\n"; // TSK036_PBKDF2_Argon2_Migration_Path
+    std::cerr << "\nMount flags:\n"; // TSK710_Implement_Hidden_Volumes document hidden options
+    std::cerr << "  --hidden            Mount the hidden volume region when available\n";
+    std::cerr << "  --decoy             Protect hidden volume while mounting outer data\n";
   }
 
   std::filesystem::path MetadataDirFor(
@@ -2331,7 +2334,8 @@ namespace {
   QV_SENSITIVE_FUNCTION int HandleMount(const std::filesystem::path& container,
                                         const std::filesystem::path& mountpoint,
                                         qv::orchestrator::VolumeManager& vm,
-                                        const SecurityIntegrationFlags& security_flags) {
+                                        const SecurityIntegrationFlags& security_flags,
+                                        const qv::orchestrator::MountParams& mount_params) {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing, // TSK020
@@ -2376,7 +2380,7 @@ namespace {
       password = ReadPassword("Password: ");
     }
     try {
-      auto handle = vm.Mount(container, password);
+      auto handle = vm.Mount(container, password, mount_params);
       if (!handle) {
         SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
         std::cerr << kGenericAuthFailureMessage << std::endl; // TSK080_Error_Info_Redaction_in_Release
@@ -2387,7 +2391,20 @@ namespace {
         throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
       }
 
-      qv::platform::FUSEAdapter adapter(handle->device);
+      std::optional<qv::storage::Extent> accessible_region; // TSK710_Implement_Hidden_Volumes hidden layout propagation
+      if (mount_params.hidden) {
+        if (!handle->hidden_region) {
+          throw qv::Error{qv::ErrorDomain::Validation, 0,
+                          "Hidden volume region unavailable"};
+        }
+        accessible_region = handle->hidden_region;
+      }
+      qv::platform::FUSEAdapter adapter(handle->device, accessible_region);
+      if (mount_params.decoy) {
+        adapter.ConfigureProtectedExtents(handle->protected_extents);
+      } else {
+        adapter.ConfigureProtectedExtents(std::vector<qv::storage::Extent>{});
+      }
       adapter.Mount(mountpoint);
       g_active_fuse_adapter = &adapter;
       g_fuse_running.store(true);
@@ -2415,7 +2432,8 @@ namespace {
   QV_SENSITIVE_FUNCTION int HandleMount(const std::filesystem::path& container,
                                         const std::filesystem::path& mountpoint,
                                         qv::orchestrator::VolumeManager& vm,
-                                        const SecurityIntegrationFlags& security_flags) {
+                                        const SecurityIntegrationFlags& security_flags,
+                                        const qv::orchestrator::MountParams& mount_params) {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing,  // TSK020
@@ -2441,7 +2459,7 @@ namespace {
     }
 
     try {
-      auto handle = vm.Mount(container, password);
+      auto handle = vm.Mount(container, password, mount_params);
       if (!handle) {
         SecureZero(password);  // TSK028A_Memory_Wiping_Gaps
         std::cerr << kGenericAuthFailureMessage << std::endl; // TSK080_Error_Info_Redaction_in_Release
@@ -2452,7 +2470,20 @@ namespace {
         throw qv::Error{qv::ErrorDomain::State, 0, "Block device unavailable for mounted volume"};
       }
 
-      qv::platform::WinFspAdapter adapter(handle->device);
+      std::optional<qv::storage::Extent> accessible_region; // TSK710_Implement_Hidden_Volumes hidden layout propagation
+      if (mount_params.hidden) {
+        if (!handle->hidden_region) {
+          throw qv::Error{qv::ErrorDomain::Validation, 0,
+                          "Hidden volume region unavailable"};
+        }
+        accessible_region = handle->hidden_region;
+      }
+      qv::platform::WinFspAdapter adapter(handle->device, accessible_region);
+      if (mount_params.decoy) {
+        adapter.ConfigureProtectedExtents(handle->protected_extents);
+      } else {
+        adapter.ConfigureProtectedExtents(std::vector<qv::storage::Extent>{});
+      }
       adapter.Mount(mount_target);
       g_winfsp_running.store(true);
       SetConsoleCtrlHandler(WinFspSignalHandler, TRUE);
@@ -2476,22 +2507,26 @@ namespace {
 #elif defined(_WIN32)
   int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
                   qv::orchestrator::VolumeManager& vm,
-                  const SecurityIntegrationFlags& security_flags) {
+                  const SecurityIntegrationFlags& security_flags,
+                  const qv::orchestrator::MountParams& mount_params) {
     (void)container;
     (void)mountpoint;
     (void)vm;
     (void)security_flags;
+    (void)mount_params;
     std::cerr << "WinFsp integration not available in this build." << std::endl;
     return kExitUsage;
   }
 #else
   int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
                   qv::orchestrator::VolumeManager& vm,
-                  const SecurityIntegrationFlags& security_flags) {
+                  const SecurityIntegrationFlags& security_flags,
+                  const qv::orchestrator::MountParams& mount_params) {
     (void)container;
     (void)mountpoint;
     (void)vm;
     (void)security_flags;
+    (void)mount_params;
     std::cerr << "Mount is only supported on Linux builds." << std::endl;
     return kExitUsage;
   }
@@ -3168,18 +3203,49 @@ int main(int argc, char** argv) {
       return HandleCreate(container_path, vm, security_flags);
     }
     if (cmd == "mount") {
-      if (argc - index != 2) {
+      if (argc - index < 2) {
         PrintUsage();
         return kExitUsage;
       }
-      std::filesystem::path container_path; // TSK129_Unvalidated_User_Input_in_CLI
-      std::filesystem::path mount_path;     // TSK129_Unvalidated_User_Input_in_CLI
-      if (!TryParsePathArgument(std::string_view(argv[index]), container_path, "container path") ||
-          !TryParsePathArgument(std::string_view(argv[index + 1]), mount_path, "mount point")) {
+      qv::orchestrator::MountParams mount_params;
+      std::optional<std::filesystem::path> container_path; // TSK129_Unvalidated_User_Input_in_CLI
+      std::optional<std::filesystem::path> mount_path;     // TSK129_Unvalidated_User_Input_in_CLI
+      for (int i = index; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg == "--hidden") {
+          mount_params.hidden = true;
+          continue;
+        }
+        if (arg == "--decoy") {
+          mount_params.decoy = true;
+          continue;
+        }
+        if (!container_path) {
+          std::filesystem::path parsed_container;
+          if (!TryParsePathArgument(arg, parsed_container, "container path")) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          container_path = parsed_container;
+          continue;
+        }
+        if (!mount_path) {
+          std::filesystem::path parsed_mount;
+          if (!TryParsePathArgument(arg, parsed_mount, "mount point")) {
+            PrintUsage();
+            return kExitUsage;
+          }
+          mount_path = parsed_mount;
+          continue;
+        }
         PrintUsage();
         return kExitUsage;
       }
-      return HandleMount(container_path, mount_path, vm, security_flags);
+      if (!container_path || !mount_path || (mount_params.hidden && mount_params.decoy)) {
+        PrintUsage();
+        return kExitUsage;
+      }
+      return HandleMount(*container_path, *mount_path, vm, security_flags, mount_params);
     }
     if (cmd == "rekey") {
       if (argc - index < 1 || argc - index > 2) {

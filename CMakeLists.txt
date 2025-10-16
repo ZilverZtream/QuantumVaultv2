@@ -114,6 +114,7 @@ add_library(qv_core
     src/core/nonce.cpp
     src/core/nonce_log.cpp
     src/core/pqc_hybrid_kdf.cpp
+    src/core/header.cpp # TSK710_Implement_Hidden_Volumes hidden descriptor verification
     src/crypto/aegis.cpp
     src/crypto/aes_gcm.cpp
     src/crypto/hkdf.cpp
@@ -347,6 +348,24 @@ endfunction()
   target_link_libraries(qv_concurrent_test PRIVATE qv_core Threads::Threads) # TSK034
   qv_apply_test_opts(qv_concurrent_test) # TSK034
   add_test(NAME qv_concurrent COMMAND qv_concurrent_test --threads=8) # TSK034
+
+  if (UNIX)
+    add_executable(qv_hidden_volume_test
+      tests/test_hidden_volume.cpp
+      src/platform/volume_filesystem.cpp) # TSK710_Implement_Hidden_Volumes guard regression
+    target_include_directories(qv_hidden_volume_test PRIVATE
+      include
+      ${FUSE3_INCLUDE_DIRS})
+    target_compile_options(qv_hidden_volume_test PRIVATE ${FUSE3_CFLAGS_OTHER})
+    target_link_directories(qv_hidden_volume_test PRIVATE ${FUSE3_LIBRARY_DIRS})
+    target_link_libraries(qv_hidden_volume_test PRIVATE
+      qv_storage
+      qv_core
+      ZSTD::ZSTD
+      ${FUSE3_LIBRARIES})
+    qv_apply_test_opts(qv_hidden_volume_test)
+    add_test(NAME qv_hidden_volume COMMAND qv_hidden_volume_test)
+  endif()
 
 # Constant-time mount test (only if the source exists)
 if (EXISTS "${CMAKE_SOURCE_DIR}/tests/test_constant_time_mount.cpp")

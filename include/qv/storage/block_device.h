@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <shared_mutex> // TSK710_Implement_Hidden_Volumes guard protected regions
 #include <span>
 #include <vector>
 
@@ -45,6 +46,9 @@ public:
     return metadata_mac_key_;  // TSK121_Missing_Authentication_in_Metadata expose derived metadata MAC key
   }
 
+  void SetProtectedExtents(std::vector<Extent> exts);              // TSK710_Implement_Hidden_Volumes guard configuration
+  [[nodiscard]] bool IsProtected(uint64_t offset, uint64_t length) const; // TSK710_Implement_Hidden_Volumes query helper
+
 private:
   std::filesystem::path path_;
   std::array<uint8_t, 32> master_key_{};
@@ -53,6 +57,8 @@ private:
   std::fstream file_;
   uint64_t record_size_{sizeof(ChunkHeader) + kChunkSize};
   std::mutex io_mutex_;
+  mutable std::shared_mutex protected_mutex_; // TSK710_Implement_Hidden_Volumes shared guard
+  std::vector<Extent> protected_extents_;      // TSK710_Implement_Hidden_Volumes protected map
 
   std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> metadata_mac_key_{};  // TSK121_Missing_Authentication_in_Metadata cached metadata authenticator
 

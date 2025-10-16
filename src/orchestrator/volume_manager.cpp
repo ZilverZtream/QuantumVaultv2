@@ -13,6 +13,7 @@
 #include <limits>     // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <optional>     // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV control
 #include <span>
+#include <shared_mutex>  // TSK710_Implement_Hidden_Volumes protected map access
 #include <sstream>      // TSK033 version formatting
 #include <string>       // TSK149_Path_Traversal_And_Injection string assembly for validation
 #include <string_view>
@@ -325,7 +326,7 @@ void PersistPasswordHistory(const std::filesystem::path& container,
   try {
     AtomicReplace(history_path, std::span<const uint8_t>(payload.data(), payload.size()));
     HardenPrivateFile(history_path); // TSK146_Permission_And_Ownership_Issues enforce 0600 history
-  } catch (const qv::Error& err) {
+  } catch (const qv::Error&) {
     throw qv::Error{err.domain(), err.code(),
                     std::string(qv::errors::msg::kPasswordHistoryPersistFailed) + ": " + err.what()};
   }
@@ -605,6 +606,7 @@ std::filesystem::path SanitizeContainerPath(
   constexpr uint16_t kTlvTypePbkdf2 = 0x1001;                                              // Password-based KDF parameters // TSK112
   constexpr uint16_t kTlvTypeHybridSalt = 0x1002;                                          // PQC hybrid KDF salt // TSK112
   constexpr uint16_t kTlvTypeArgon2 = 0x1003;                                              // Argon2id KDF parameters // TSK112
+  constexpr uint16_t kTlvTypeHiddenDescriptor = 0x4844;                                    // 'HD' hidden descriptor // TSK710_Implement_Hidden_Volumes
   constexpr uint16_t kTlvTypeEpoch = 0x4E4F;                                               // 'NO' nonce/epoch counter // TSK112
   constexpr uint16_t kTlvTypePqcKem = 0x7051;                                              // 'pQ' post-quantum KEM blob // TSK112
   constexpr uint16_t kTlvTypeReservedV2 = 0x7F02;                                          // Reserved V2 payload // TSK112
@@ -785,6 +787,9 @@ std::filesystem::path SanitizeContainerPath(
     qv::core::PQC_KEM_TLV kem_blob{};       // TSK024_Key_Rotation_and_Lifecycle_Management
     ReservedV2Tlv reserved_v2{};            // TSK024_Key_Rotation_and_Lifecycle_Management
     bool reserved_v2_present{false};        // TSK033 optional TLV tracking
+    std::optional<qv::core::HiddenVolumeDescriptor>
+        hidden_descriptor;                  // TSK710_Implement_Hidden_Volumes optional hidden metadata
+    bool have_hidden_descriptor{false};     // TSK710_Implement_Hidden_Volumes track presence
     std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE>
         mac{};                        // TSK024_Key_Rotation_and_Lifecycle_Management
     std::vector<uint8_t> payload;     // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -1049,6 +1054,20 @@ std::filesystem::path SanitizeContainerPath(
             std::copy(record.value.begin(), record.value.end(),
                       parsed.reserved_v2.payload.begin());
           }
+          break;
+        }
+        case kTlvTypeHiddenDescriptor: { // TSK710_Implement_Hidden_Volumes parse hidden metadata
+          if (record.value.size() != sizeof(qv::core::HiddenVolumeDescriptor)) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0,
+                            "Hidden descriptor malformed"};
+          }
+          qv::core::HiddenVolumeDescriptor descriptor{};
+          std::memcpy(&descriptor, record.value.data(), sizeof(descriptor));
+          descriptor.start_offset = qv::FromLittleEndian64(descriptor.start_offset);
+          descriptor.length = qv::FromLittleEndian64(descriptor.length);
+          descriptor.epoch = qv::FromLittleEndian(descriptor.epoch);
+          parsed.hidden_descriptor = descriptor;
+          parsed.have_hidden_descriptor = true;
           break;
         }
         default:
@@ -1486,20 +1505,78 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
 QV_SENSITIVE_END
 
 std::optional<ConstantTimeMount::VolumeHandle>
-VolumeManager::Mount(const std::filesystem::path& container, const std::string& password) {
+VolumeManager::Mount(const std::filesystem::path& container, const std::string& password,
+                     const MountParams& params) { // TSK710_Implement_Hidden_Volumes mount guard wiring
+  if (params.hidden && params.decoy) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Hidden and decoy modes cannot be combined"};
+  }
   ValidatePassword(password);                                                 // TSK099_Input_Validation_and_Sanitization
   auto sanitized_container = SanitizeContainerPath(container);               // TSK099_Input_Validation_and_Sanitization
   auto handle = ctm_.Mount(sanitized_container, password); // TSK029
-  if (handle) {
-    qv::orchestrator::Event mounted{}; // TSK029
-    mounted.category = EventCategory::kLifecycle;
-    mounted.severity = EventSeverity::kInfo;
-    mounted.event_id = "volume_mounted";
-    mounted.message = "Encrypted volume mounted";
-    mounted.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container),
-                                FieldPrivacy::kRedact);
-    qv::orchestrator::EventBus::Instance().Publish(mounted);
+  if (!handle) {
+    return handle;
   }
+
+  std::vector<qv::storage::Extent> hidden_extents; // TSK710_Implement_Hidden_Volumes optional guard map
+  try {
+    hidden_extents = LoadHiddenDescriptor(sanitized_container, password);
+  } catch (const qv::AuthenticationFailureError&) {
+    if (params.hidden || params.decoy) {
+      throw;
+    }
+  } catch (const qv::Error& err) {
+    if (params.hidden || params.decoy) {
+      throw;
+    }
+  }
+
+  if ((params.hidden || params.decoy) && hidden_extents.empty()) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Hidden volume descriptor unavailable"};
+  }
+
+  if (params.decoy && !hidden_extents.empty()) {
+    SetProtectedExtents(hidden_extents);
+    if (handle->device) {
+      handle->device->SetProtectedExtents(hidden_extents);
+    }
+  } else {
+    SetProtectedExtents({});
+    if (handle->device) {
+      handle->device->SetProtectedExtents({});
+    }
+  }
+  if (params.hidden) {
+    if (hidden_extents.size() != 1) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Hidden volume descriptor must define a single contiguous region"};
+    }
+    handle->hidden_region = hidden_extents.front(); // TSK710_Implement_Hidden_Volumes expose layout to adapters
+  } else {
+    if (!hidden_extents.empty()) {
+      handle->hidden_region = hidden_extents.front();
+    } else {
+      handle->hidden_region.reset();
+    }
+  }
+  handle->protected_extents = hidden_extents;
+  handle->hidden_mode = params.hidden;
+  handle->decoy_guard = params.decoy;
+
+  qv::orchestrator::Event mounted{}; // TSK029
+  mounted.category = EventCategory::kLifecycle;
+  mounted.severity = EventSeverity::kInfo;
+  mounted.event_id = "volume_mounted";
+  mounted.message = params.hidden ? "Hidden volume mounted"
+                                  : "Encrypted volume mounted";
+  mounted.fields.emplace_back("container", qv::PathToUtf8String(sanitized_container),
+                              FieldPrivacy::kRedact);
+  if (!hidden_extents.empty()) {
+    mounted.fields.emplace_back("protected_regions", std::to_string(hidden_extents.size()),
+                                FieldPrivacy::kPublic, true);
+  }
+  qv::orchestrator::EventBus::Instance().Publish(mounted);
   return handle;
 }
 
@@ -1522,6 +1599,81 @@ void VolumeManager::ValidateHeaderForBackup(
   }
 
   (void)ParseHeader(blob); // TSK082_Backup_Verification_and_Schema reuse existing parser
+}
+
+void VolumeManager::SetProtectedExtents(std::vector<qv::storage::Extent> exts) { // TSK710_Implement_Hidden_Volumes update map
+  qv::storage::NormalizeExtents(exts);
+  std::unique_lock<std::shared_mutex> guard(protected_mutex_);
+  protected_extents_ = std::move(exts);
+}
+
+bool VolumeManager::IsProtected(uint64_t offset, uint64_t length) const { // TSK710_Implement_Hidden_Volumes query map
+  std::shared_lock<std::shared_mutex> guard(protected_mutex_);
+  for (const auto& extent : protected_extents_) {
+    if (extent.Intersects(offset, length)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<qv::storage::Extent> VolumeManager::LoadHiddenDescriptor(
+    const std::filesystem::path& container, const std::string& password) { // TSK710_Implement_Hidden_Volumes parse TLV
+  auto sanitized_container = SanitizeContainerPath(container);               // TSK099_Input_Validation_and_Sanitization
+  std::ifstream in(sanitized_container, std::ios::binary);
+  if (!in) {
+    const int err = errno;
+    throw qv::Error{qv::ErrorDomain::IO, err,
+                    "Failed to open container for hidden descriptor: " + sanitized_container.string()};
+  }
+  std::vector<uint8_t> blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  auto parsed = ParseHeader(blob);
+  if (!parsed.have_hidden_descriptor || !parsed.hidden_descriptor) {
+    return {};
+  }
+
+  qv::core::HiddenVolumeDescriptor descriptor = *parsed.hidden_descriptor;
+  if (descriptor.length == 0) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Hidden descriptor length invalid"};
+  }
+  if (descriptor.start_offset > std::numeric_limits<uint64_t>::max() - descriptor.length) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Hidden descriptor exceeds container size"};
+  }
+  if (qv::storage::kChunkSize == 0) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Chunk size is zero"};
+  }
+  if (descriptor.start_offset % qv::storage::kChunkSize != 0 ||
+      descriptor.length % qv::storage::kChunkSize != 0) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Hidden descriptor must align to chunk payload size"}; // TSK710_Implement_Hidden_Volumes alignment guard
+  }
+  constexpr uint64_t kMetadataReservationBytes = 1024ull * 1024ull;
+  const uint64_t metadata_chunks =
+      (kMetadataReservationBytes + qv::storage::kChunkSize - 1) / qv::storage::kChunkSize;
+  const uint64_t span_chunks = descriptor.length / qv::storage::kChunkSize;
+  if (span_chunks <= metadata_chunks + 1) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Hidden descriptor reserves insufficient payload"}; // TSK710_Implement_Hidden_Volumes capacity guard
+  }
+
+  qv::security::SecureBuffer<uint8_t> password_copy(password.size());
+  if (password_copy.size() > 0) {
+    std::memcpy(password_copy.data(), reinterpret_cast<const uint8_t*>(password.data()), password.size());
+  }
+  qv::security::Zeroizer::ScopeWiper<uint8_t> pass_guard(password_copy.AsSpan());
+  std::span<const uint8_t> pass_span(password_copy.AsSpan());
+  auto key = qv::core::DeriveHiddenVolumeKey(pass_span, std::span<const uint8_t, 16>(parsed.header.uuid));
+  bool verified = qv::core::VerifyHiddenVolumeDescriptor(
+      descriptor, std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE>(key), parsed.epoch_value,
+      std::span<const uint8_t, 16>(parsed.header.uuid));
+  qv::security::Zeroizer::Wipe(std::span<uint8_t>(key.data(), key.size()));
+  if (!verified) {
+    throw qv::AuthenticationFailureError("Hidden volume descriptor authentication failed");
+  }
+  std::vector<qv::storage::Extent> extents;
+  extents.push_back(qv::storage::Extent{descriptor.start_offset, descriptor.length});
+  qv::storage::NormalizeExtents(extents);
+  return extents;
 }
 
 QV_SENSITIVE_BEGIN

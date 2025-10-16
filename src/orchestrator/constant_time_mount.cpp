@@ -1406,6 +1406,7 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
     VolumeHandle handle{};
     handle.dummy = static_cast<int>(selected);
     handle.device = MakeBlockDevice(sanitized_container);
+    handle.hidden_region = std::nullopt; // TSK710_Implement_Hidden_Volumes default outer layout
     return handle;
   }
   return std::nullopt;
@@ -1552,6 +1553,7 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     VolumeHandle handle{};
     handle.dummy = 1;
     handle.device = MakeBlockDevice(container);
+    handle.hidden_region = std::nullopt; // TSK710_Implement_Hidden_Volumes default outer layout
     return handle;
   }
   return std::nullopt;
