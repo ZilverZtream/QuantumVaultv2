@@ -58,6 +58,7 @@
 #include "qv/error.h"
 #include "qv/orchestrator/constant_time_mount.h" // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include "qv/orchestrator/event_bus.h"           // TSK027
+#include "qv/orchestrator/io_util.h"             // TSK143_Missing_Fsync_And_Durability_Issues durable manifest writes
 #include "qv/orchestrator/volume_manager.h"
 #include "qv/security/zeroizer.h" // TSK125_Missing_Secure_Deletion_for_Keys scoped wiping
 #if defined(__linux__)
@@ -202,6 +203,136 @@ namespace {
       return std::string{"[path]"};
     }
     return fallback;
+  }
+
+  int OpenFileForWrite(const std::filesystem::path& path) { // TSK143_Missing_Fsync_And_Durability_Issues platform-safe open
+#if defined(_WIN32)
+    const std::wstring native = path.wstring();
+    return _wopen(native.c_str(),
+                  _O_CREAT | _O_WRONLY | _O_TRUNC | _O_BINARY | _O_SEQUENTIAL,
+                  _S_IREAD | _S_IWRITE);
+#else
+    return ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+#endif
+  }
+
+  std::ptrdiff_t WriteRaw(int fd, const char* data, size_t size) { // TSK143_Missing_Fsync_And_Durability_Issues raw descriptor write
+#if defined(_WIN32)
+    return _write(fd, data, static_cast<unsigned int>(size));
+#else
+    return ::write(fd, data, size);
+#endif
+  }
+
+  void WriteAllToFd(int fd, const char* data, size_t size,
+                    const std::filesystem::path& destination) { // TSK143_Missing_Fsync_And_Durability_Issues complete writes
+    size_t written = 0;
+    while (written < size) {
+      const auto chunk = WriteRaw(fd, data + written, size - written);
+      if (chunk < 0) {
+        const int err = errno;
+        if (err == EINTR) {
+          continue;
+        }
+        throw qv::Error{qv::ErrorDomain::IO, err,
+                        "Failed to write staged backup file: " + SanitizePath(destination)};
+      }
+      if (chunk == 0) {
+        throw qv::Error{qv::ErrorDomain::IO, 0,
+                        "Short write while staging backup: " + SanitizePath(destination)};
+      }
+      written += static_cast<size_t>(chunk);
+    }
+  }
+
+  void SyncFileDescriptor(int fd, const std::filesystem::path& path) { // TSK143_Missing_Fsync_And_Durability_Issues ensure durability
+#if defined(_WIN32)
+    if (_commit(fd) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to sync staged backup file: " + SanitizePath(path)};
+    }
+    const intptr_t os_handle = _get_osfhandle(fd);
+    if (os_handle == -1) {
+      throw qv::Error{qv::ErrorDomain::IO, EBADF,
+                      "Invalid handle while syncing: " + SanitizePath(path)};
+    }
+    if (!::FlushFileBuffers(reinterpret_cast<HANDLE>(os_handle))) {
+      const DWORD err = ::GetLastError();
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err),
+                      "Failed to flush buffers: " + SanitizePath(path)};
+    }
+#else
+    if (::fsync(fd) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to sync staged backup file: " + SanitizePath(path)};
+    }
+#endif
+  }
+
+  void CloseFileDescriptor(int fd, const std::filesystem::path& path) { // TSK143_Missing_Fsync_And_Durability_Issues close with error surfacing
+#if defined(_WIN32)
+    if (_close(fd) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to close staged backup file: " + SanitizePath(path)};
+    }
+#else
+    if (::close(fd) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to close staged backup file: " + SanitizePath(path)};
+    }
+#endif
+  }
+
+  void SyncDirectoryPath(const std::filesystem::path& dir) { // TSK143_Missing_Fsync_And_Durability_Issues persist directory metadata
+    auto target = dir;
+    if (target.empty()) {
+      target = std::filesystem::current_path();
+    }
+#if defined(_WIN32)
+    const std::wstring native = target.wstring();
+    HANDLE handle = ::CreateFileW(native.c_str(), GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING,
+                                  FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+      const DWORD err = ::GetLastError();
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err),
+                      "Failed to open directory for sync: " + SanitizePath(target)};
+    }
+    if (!::FlushFileBuffers(handle)) {
+      const DWORD err = ::GetLastError();
+      ::CloseHandle(handle);
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err),
+                      "Failed to flush directory metadata: " + SanitizePath(target)};
+    }
+    ::CloseHandle(handle);
+#else
+#if defined(O_DIRECTORY)
+    int dir_fd = ::open(target.c_str(), O_RDONLY | O_DIRECTORY);
+#else
+    int dir_fd = ::open(target.c_str(), O_RDONLY);
+#endif
+    if (dir_fd < 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to open directory for sync: " + SanitizePath(target)};
+    }
+    if (::fsync(dir_fd) != 0) {
+      const int err = errno;
+      ::close(dir_fd);
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to flush directory metadata: " + SanitizePath(target)};
+    }
+    if (::close(dir_fd) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to close directory after sync: " + SanitizePath(target)};
+    }
+#endif
   }
 
   void DisableCoreDumps() { // TSK139_Memory_Disclosure_And_Information_Leaks
@@ -896,13 +1027,6 @@ namespace {
                       "Failed to open file for backup: " + SanitizePath(source)};
     }
 
-    std::ofstream out(destination, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-      const int err = errno;
-      throw qv::Error{qv::ErrorDomain::IO, err,
-                      "Failed to create staged backup file: " + SanitizePath(destination)};
-    }
-
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
         EVP_MD_CTX_new(), &EVP_MD_CTX_free); // TSK082_Backup_Verification_and_Schema
     if (!ctx) {
@@ -914,36 +1038,55 @@ namespace {
                       "Failed to initialize SHA-256 context"};
     }
 
+    int out_fd = OpenFileForWrite(destination); // TSK143_Missing_Fsync_And_Durability_Issues use descriptor for fsync
+    if (out_fd < 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to create staged backup file: " + SanitizePath(destination)};
+    }
+    auto close_silently = [&]() noexcept {
+      if (out_fd >= 0) {
+#if defined(_WIN32)
+        _close(out_fd);
+#else
+        ::close(out_fd);
+#endif
+        out_fd = -1;
+      }
+    };
+
     std::array<char, 1 << 15> buffer{}; // 32 KiB chunks // TSK082_Backup_Verification_and_Schema
     while (in) {
       in.read(buffer.data(), buffer.size());
       std::streamsize read = in.gcount();
       if (read > 0) {
         if (EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<size_t>(read)) != 1) {
+          close_silently();
           throw qv::Error{qv::ErrorDomain::Crypto, 0,
                           "Failed while computing SHA-256"};
         }
-        out.write(buffer.data(), read);
-        if (!out) {
-          const int err = errno;
-          throw qv::Error{qv::ErrorDomain::IO, err,
-                          "Failed to write staged backup file: " +
-                              SanitizePath(destination)};
+        try {
+          WriteAllToFd(out_fd, buffer.data(), static_cast<size_t>(read), destination);
+        } catch (...) {
+          close_silently();
+          throw;
         }
       }
     }
 
     if (!in.eof()) {
       const int err = errno;
+      close_silently();
       throw qv::Error{qv::ErrorDomain::IO, err,
                       "Failed while reading source for backup: " + SanitizePath(source)};
     }
-
-    out.flush();
-    if (!out) {
-      const int err = errno;
-      throw qv::Error{qv::ErrorDomain::IO, err,
-                      "Failed to flush staged backup file: " + SanitizePath(destination)};
+    try {
+      SyncFileDescriptor(out_fd, destination);
+      CloseFileDescriptor(out_fd, destination);
+      out_fd = -1;
+    } catch (...) {
+      close_silently();
+      throw;
     }
 
     std::array<uint8_t, 32> digest{};
@@ -2178,6 +2321,7 @@ namespace {
     }
     std::filesystem::rename(staged_container, container_backup);
     container_guard.Release();
+    SyncDirectoryPath(output_dir); // TSK143_Missing_Fsync_And_Durability_Issues ensure backup rename durability
 #if !defined(_WIN32)
     try {
       std::filesystem::permissions(
@@ -2204,6 +2348,7 @@ namespace {
       }
       std::filesystem::rename(staged_nonce, *nonce_backup);
       nonce_guard->Release();
+      SyncDirectoryPath(output_dir); // TSK143_Missing_Fsync_And_Durability_Issues ensure nonce backup durability
 #if !defined(_WIN32)
       try {
         std::filesystem::permissions(
@@ -2223,18 +2368,6 @@ namespace {
     }
 
     auto manifest_path = output_dir / "manifest.json";
-    auto manifest_tmp = manifest_path;
-    manifest_tmp += ".tmp";
-    {
-      std::error_code ec;
-      std::filesystem::remove(manifest_tmp, ec);
-    }
-    ScopedPathCleanup manifest_guard(manifest_tmp);
-    std::ofstream manifest(manifest_tmp, std::ios::binary | std::ios::trunc);
-    if (!manifest.is_open()) {
-      throw qv::Error{qv::ErrorDomain::IO, errno,
-                      "Failed to write manifest: " + SanitizePath(manifest_tmp)};
-    }
     constexpr int kManifestVersion = 2; // TSK137_Backup_Security_And_Integrity_Gaps schema upgrade
     const auto container_hash_hex =
         BytesToHexLower(std::span<const uint8_t>(container_digest.data(), container_digest.size()));
@@ -2283,31 +2416,24 @@ namespace {
     const auto ciphertext_hex = BytesToHexLower(std::span<const uint8_t>(
         manifest_enc.ciphertext.data(), manifest_enc.ciphertext.size()));
 
-    manifest << "{\n";
-    manifest << "  \"manifest_version\": " << kManifestVersion << ",\n";
-    manifest << "  \"app_version\": \"" << AppVersionString() << "\",\n";
-    manifest << "  \"encryption\": {\n";
-    manifest << "    \"algorithm\": \"AES-256-GCM\",\n";
-    manifest << "    \"salt_hex\": \"" << salt_hex << "\",\n";
-    manifest << "    \"nonce_hex\": \"" << nonce_hex << "\",\n";
-    manifest << "    \"tag_hex\": \"" << tag_hex << "\",\n";
-    manifest << "    \"ciphertext_hex\": \"" << ciphertext_hex << "\"\n";
-    manifest << "  }\n";
-    manifest << "}\n";
-    manifest.flush();
-    if (!manifest) {
-      const int err = errno;
-      throw qv::Error{qv::ErrorDomain::IO, err,
-                      "Failed to finalize manifest: " + SanitizePath(manifest_tmp)};
-    }
-    manifest.close();
+    std::ostringstream manifest_json;
+    manifest_json << "{\n";
+    manifest_json << "  \"manifest_version\": " << kManifestVersion << ",\n";
+    manifest_json << "  \"app_version\": \"" << AppVersionString() << "\",\n";
+    manifest_json << "  \"encryption\": {\n";
+    manifest_json << "    \"algorithm\": \"AES-256-GCM\",\n";
+    manifest_json << "    \"salt_hex\": \"" << salt_hex << "\",\n";
+    manifest_json << "    \"nonce_hex\": \"" << nonce_hex << "\",\n";
+    manifest_json << "    \"tag_hex\": \"" << tag_hex << "\",\n";
+    manifest_json << "    \"ciphertext_hex\": \"" << ciphertext_hex << "\"\n";
+    manifest_json << "  }\n";
+    manifest_json << "}\n";
 
-    {
-      std::error_code ec;
-      std::filesystem::remove(manifest_path, ec);
-    }
-    std::filesystem::rename(manifest_tmp, manifest_path);
-    manifest_guard.Release();
+    const auto manifest_body = manifest_json.str();
+    const std::vector<uint8_t> manifest_bytes(manifest_body.begin(), manifest_body.end());
+    qv::orchestrator::AtomicReplace(
+        manifest_path,
+        std::span<const uint8_t>(manifest_bytes.data(), manifest_bytes.size())); // TSK143_Missing_Fsync_And_Durability_Issues durable manifest swap
 #if !defined(_WIN32)
     try {
       std::filesystem::permissions(
