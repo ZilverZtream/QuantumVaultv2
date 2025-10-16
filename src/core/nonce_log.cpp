@@ -46,6 +46,7 @@
 #if defined(_MSC_VER)
 #pragma comment(lib, "bcrypt.lib") // TSK016_Windows_Compatibility_Fixes ensure RNG linkage
 #endif
+extern "C" BOOLEAN NTAPI RtlGenRandom(PVOID RandomBuffer, ULONG RandomBufferLength); // TSK134_Insufficient_Entropy_for_Keys Windows fallback RNG
 #endif
 
 #if QV_HAVE_SODIUM
@@ -607,48 +608,65 @@ namespace {
   }
 
   void GenerateKey(std::array<uint8_t, kMacSize>& key) { // TSK124_Insecure_Randomness_Usage resilient RNG selection
+    key.fill(0); // TSK134_Insufficient_Entropy_for_Keys clear previous key material
+    std::array<uint8_t, kMacSize> candidate{}; // TSK134_Insufficient_Entropy_for_Keys stage key until success
     std::vector<std::string> failures;
 #if QV_HAVE_SODIUM
     if (TryRngProvider(
             [&]() {
               qv::crypto::EnsureCryptoProviderInitialized(); // TSK072_CryptoProvider_Init_and_KAT single runtime init
-              randombytes_buf(key.data(), key.size());       // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
+              candidate.fill(0);
+              randombytes_buf(candidate.data(), candidate.size());       // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
             },
             failures)) {
+      key = candidate;
       return;
     }
 #endif
     if (TryRngProvider(
             [&]() {
-              qv::crypto::SystemRandomBytes(std::span<uint8_t>(key.data(), key.size()));
+              candidate.fill(0);
+              qv::crypto::SystemRandomBytes(std::span<uint8_t>(candidate.data(), candidate.size()));
             },
             failures)) {
+      key = candidate;
       return;
     }
 #if defined(_WIN32)
     if (TryRngProvider(
             [&]() {
-              const NTSTATUS status = BCryptGenRandom(nullptr, key.data(),
-                                                      static_cast<ULONG>(key.size()),
+              candidate.fill(0);
+              const NTSTATUS status = BCryptGenRandom(nullptr, candidate.data(),
+                                                      static_cast<ULONG>(candidate.size()),
                                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-              if (!BCRYPT_SUCCESS(status)) {
+              if (!BCRYPT_SUCCESS(status) &&
+                  !RtlGenRandom(candidate.data(), static_cast<ULONG>(candidate.size()))) {
                 throw Error{ErrorDomain::Security, static_cast<int>(status),
-                            "BCryptGenRandom failed"}; // TSK016_Windows_Compatibility_Fixes explicit fallback
+                            "Windows RNG failed"}; // TSK134_Insufficient_Entropy_for_Keys fallback to legacy API
               }
             },
             failures)) {
+      key = candidate;
       return;
     }
 #else
     if (TryRngProvider(
             [&]() {
-              if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
+              candidate.fill(0);
+              if (RAND_status() == 0) { // TSK134_Insufficient_Entropy_for_Keys ensure entropy available
+                RAND_poll();
+                if (RAND_status() == 0) {
+                  throw Error{ErrorDomain::Security, 0, "Insufficient entropy"};
+                }
+              }
+              if (RAND_bytes(candidate.data(), static_cast<int>(candidate.size())) != 1) {
                 const auto err = static_cast<int>(ERR_get_error());
                 throw Error{ErrorDomain::Security, err,
                             "RAND_bytes failed"}; // TSK023_Production_Crypto_Provider_Complete_Integration OpenSSL RNG fallback
               }
             },
             failures)) {
+      key = candidate;
       return;
     }
 #endif
