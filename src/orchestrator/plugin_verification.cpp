@@ -358,18 +358,56 @@ PluginTrustPolicy LoadPluginTrustPolicy(const std::filesystem::path& policy_path
   return policy;
 }
 
-bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& expected) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) return false;
-  f.seekg(0, std::ios::end);
-  size_t sz = static_cast<size_t>(f.tellg());
-  f.seekg(0, std::ios::beg);
-  std::vector<uint8_t> data(sz);
-  f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(sz));
-  if (f.gcount() != static_cast<std::streamsize>(sz)) {
-    return false;
+namespace {
+constexpr uintmax_t kMaxPluginImageBytes = 64ull * 1024ull * 1024ull; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+}
+
+std::optional<VerifiedPluginMetadata> VerifyPlugin(const std::filesystem::path& path,
+                                                   const PluginVerification& expected) {
+  std::error_code ec;
+  auto resolved = std::filesystem::canonical(path, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (ec) {
+    return std::nullopt;
+  }
+
+  auto status = std::filesystem::symlink_status(path, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (ec) {
+    return std::nullopt;
+  }
+  if (std::filesystem::is_symlink(status)) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    return std::nullopt;
+  }
+
+  auto file_size = std::filesystem::file_size(resolved, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (ec) {
+    return std::nullopt;
+  }
+  if (file_size > kMaxPluginImageBytes) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    return std::nullopt;
+  }
+
+  std::ifstream f(resolved, std::ios::binary);
+  if (!f)
+    return std::nullopt;
+  std::vector<uint8_t> data(static_cast<size_t>(file_size));
+  if (!data.empty()) {
+    f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(file_size));
+    if (f.gcount() != static_cast<std::streamsize>(file_size)) {
+      return std::nullopt;
+    }
   }
   auto hash = qv::crypto::SHA256_Hash(data);
+
+  auto last_write_time = std::filesystem::last_write_time(resolved, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (ec) {
+    return std::nullopt;
+  }
+
+  VerifiedPluginMetadata metadata{}; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  metadata.resolved_path = resolved;
+  metadata.content_hash = hash;
+  metadata.last_write_time = last_write_time;
+  metadata.file_size = file_size;
 
   const PluginTrustPolicy* policy_ptr = expected.trust_policy;
   if (policy_ptr == nullptr) {
@@ -391,11 +429,24 @@ bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& e
   bool hash_present = !IsAllZero(std::span<const uint8_t>(expected.expected_hash));
   bool key_nonzero = !IsAllZero(std::span<const uint8_t>(signing_key));                 // TSK070
   bool key_trusted = IsKeyTrusted(policy, plugin_id, signing_key);                      // TSK070
-  bool signature_check = Ed25519_Verify(signing_key, hash, expected.signature);         // TSK070
+  const bool should_attempt_signature = signature_present && key_nonzero && key_trusted; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  std::array<uint8_t, 32> masked_key{};                                                 // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  std::array<uint8_t, 64> masked_signature{};                                           // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  auto key_for_verification = signing_key;                                              // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  auto signature_for_verification = expected.signature;                                // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  for (size_t i = 0; i < key_for_verification.size(); ++i) {                            // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    key_for_verification[i] =
+        qv::crypto::ct::Select<uint8_t>(masked_key[i], key_for_verification[i], should_attempt_signature); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  }
+  for (size_t i = 0; i < signature_for_verification.size(); ++i) {                      // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    signature_for_verification[i] = qv::crypto::ct::Select<uint8_t>(
+        masked_signature[i], signature_for_verification[i], should_attempt_signature);   // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  }
+
+  bool signature_check =
+      Ed25519_Verify(key_for_verification, hash, signature_for_verification);            // TSK142_Plugin_Security_Bypass_Vulnerabilities
   uint32_t signature_mask = signature_check ? 1u : 0u;                                  // TSK070
-  signature_mask &= signature_present ? 1u : 0u;                                        // TSK070
-  signature_mask &= key_nonzero ? 1u : 0u;                                              // TSK070
-  signature_mask &= key_trusted ? 1u : 0u;                                              // TSK070
+  signature_mask &= should_attempt_signature ? 1u : 0u;                                  // TSK142_Plugin_Security_Bypass_Vulnerabilities
 
   const bool require_signature = expected.enforce_signature || policy.require_signature;
   const bool allow_hash = expected.allow_hash_fallback || policy.allow_hash_fallback;
@@ -408,12 +459,12 @@ bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& e
   uint32_t integrity_mask = signature_mask | (fallback_mask & (require_mask ^ 1u));    // TSK070
   bool integrity_ok = integrity_mask != 0u;                                            // TSK070
   if (!integrity_ok) {                                                                 // TSK070
-    return false;                                                                       // TSK070
+    return std::nullopt;                                                               // TSK142_Plugin_Security_Bypass_Vulnerabilities
   }
 
-  auto abi = QueryPluginABI(path);
+  auto abi = QueryPluginABI(resolved);                                                 // TSK142_Plugin_Security_Bypass_Vulnerabilities
   if (!abi) {
-    return false;
+    return std::nullopt;
   }
 
   PluginCompatibilityRange allowed{expected.min_abi_version, expected.max_abi_version};
@@ -425,18 +476,18 @@ bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& e
   }
 
   if (allowed.min_version > allowed.max_version) {
-    return false;
+    return std::nullopt;
   }
 
   if (abi->plugin_min > allowed.max_version || abi->plugin_max < allowed.min_version) {
-    return false;
+    return std::nullopt;
   }
 
   if (abi->has_selftest && !abi->selftest_passed) {
-    return false;
+    return std::nullopt;
   }
-  if (!HasSecurityFlags(path)) return false;
-  return true;
+  if (!HasSecurityFlags(resolved)) return std::nullopt; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  return metadata;
 }
 
 bool HasSecurityFlags(const std::filesystem::path& path) {

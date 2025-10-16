@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream> // TSK142_Plugin_Security_Bypass_Vulnerabilities
 #include <iostream> // TSK098_Exception_Safety_and_Resource_Leaks
 #include <memory>
 #include <optional>
@@ -43,6 +44,8 @@
 #include <sys/syscall.h>
 #endif
 
+#include "qv/crypto/ct.h" // TSK142_Plugin_Security_Bypass_Vulnerabilities
+#include "qv/crypto/sha256.h" // TSK142_Plugin_Security_Bypass_Vulnerabilities
 #include "qv/orchestrator/event_bus.h" // TSK019
 #include "qv/orchestrator/plugin_abi.h"
 
@@ -273,6 +276,53 @@ namespace {
     return true;
   }
 
+  bool ValidatePluginSnapshot(const std::filesystem::path& path,
+                              const qv::orchestrator::VerifiedPluginMetadata& metadata) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    std::error_code ec;
+    auto resolved = std::filesystem::weakly_canonical(path, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (ec) {
+      return false;
+    }
+
+    if (resolved.empty()) {
+      resolved = metadata.resolved_path;
+    }
+
+    if (!std::filesystem::exists(resolved, ec) || ec) {
+      return false;
+    }
+
+    if (!std::filesystem::equivalent(resolved, metadata.resolved_path, ec) || ec) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+      return false;
+    }
+
+    auto current_size = std::filesystem::file_size(resolved, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (ec || current_size != metadata.file_size) {
+      return false;
+    }
+
+    auto current_time = std::filesystem::last_write_time(resolved, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (ec || current_time != metadata.last_write_time) {
+      return false;
+    }
+
+    std::ifstream f(resolved, std::ios::binary); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (!f) {
+      return false;
+    }
+
+    std::vector<uint8_t> buffer(static_cast<size_t>(metadata.file_size)); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (!buffer.empty()) {
+      f.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(metadata.file_size));
+      if (f.gcount() != static_cast<std::streamsize>(metadata.file_size)) {
+        return false;
+      }
+    }
+
+    auto digest = qv::crypto::SHA256_Hash(buffer); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    return qv::crypto::ct::CompareEqual(digest, metadata.content_hash); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  }
+
   void SetPluginResourceLimits() {
     struct rlimit mem_limit {
       kPluginMemoryLimitBytes, kPluginMemoryLimitBytes
@@ -292,9 +342,24 @@ namespace {
     }
 
     std::vector<sock_filter> filter;
-    filter.reserve(32);
+    filter.reserve(48); // TSK142_Plugin_Security_Bypass_Vulnerabilities
     filter.push_back({static_cast<uint16_t>(BPF_LD | BPF_W | BPF_ABS), 0, 0,
-                     static_cast<uint32_t>(offsetof(struct seccomp_data, nr))});
+                     static_cast<uint32_t>(offsetof(struct seccomp_data, arch))}); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+#if defined(__x86_64__)
+    constexpr uint32_t kAuditArch = AUDIT_ARCH_X86_64; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+#elif defined(__aarch64__)
+    constexpr uint32_t kAuditArch = AUDIT_ARCH_AARCH64; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+#elif defined(__arm__)
+    constexpr uint32_t kAuditArch = AUDIT_ARCH_ARM; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+#else
+    constexpr uint32_t kAuditArch = 0; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+#endif
+    if constexpr (kAuditArch != 0) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+      filter.push_back({static_cast<uint16_t>(BPF_JMP | BPF_JEQ | BPF_K), 0, 1, kAuditArch});
+      filter.push_back({static_cast<uint16_t>(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_KILL_PROCESS});
+    }
+    filter.push_back({static_cast<uint16_t>(BPF_LD | BPF_W | BPF_ABS), 0, 0,
+                     static_cast<uint32_t>(offsetof(struct seccomp_data, nr))}); // TSK142_Plugin_Security_Bypass_Vulnerabilities
 
     auto allow_syscall = [&filter](int syscall_number) {
       filter.push_back({static_cast<uint16_t>(BPF_JMP | BPF_JEQ | BPF_K), 0, 1,
@@ -939,10 +1004,26 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
     return false;
   }
 
+  std::optional<qv::orchestrator::VerifiedPluginMetadata> verification_metadata; // TSK142_Plugin_Security_Bypass_Vulnerabilities
   if (ShouldVerify(policy)) {
-    if (!VerifyPlugin(canonical_path, policy)) {
+    verification_metadata = VerifyPlugin(so_path, policy); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (!verification_metadata) {
       PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_verification_failed",
                               "Plugin verification failed", canonical_path);
+      return false;
+    }
+    std::error_code verify_ec;                                                          // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (!std::filesystem::equivalent(canonical_path, verification_metadata->resolved_path, verify_ec) || verify_ec) {
+      PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                              "plugin_verification_path_mismatch",                                      // TSK142_Plugin_Security_Bypass_Vulnerabilities
+                              "Verified path differs from canonical plugin path", canonical_path);      // TSK142_Plugin_Security_Bypass_Vulnerabilities
+      return false;
+    }
+    canonical_path = verification_metadata->resolved_path; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    if (verification_metadata && !ValidatePluginSnapshot(canonical_path, *verification_metadata)) {
+      PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                              "plugin_changed_after_verification",                                       // TSK142_Plugin_Security_Bypass_Vulnerabilities
+                              "Plugin modified between verification and load", canonical_path);         // TSK142_Plugin_Security_Bypass_Vulnerabilities
       return false;
     }
   }
@@ -994,6 +1075,13 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kWarning, "plugin_identity_mismatch",
                             "Plugin identifier does not match verification policy", canonical_path,
                             std::move(identity_fields));
+    return false;
+  }
+
+  if (verification_metadata && !ValidatePluginSnapshot(canonical_path, *verification_metadata)) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                            "plugin_changed_after_load", // TSK142_Plugin_Security_Bypass_Vulnerabilities
+                            "Plugin image changed while loading", canonical_path); // TSK142_Plugin_Security_Bypass_Vulnerabilities
     return false;
   }
 
@@ -1084,6 +1172,14 @@ bool PluginManager::LoadPlugin(const std::filesystem::path& so_path,
                         kPluginHandshakeTimeout)) {
     PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError, "plugin_handshake_failure",
                             "Failed to negotiate plugin handshake", canonical_path);
+    cleanup_child(SIGKILL);
+    return false;
+  }
+
+  if (verification_metadata && !ValidatePluginSnapshot(canonical_path, *verification_metadata)) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    PublishPluginDiagnostic(qv::orchestrator::EventSeverity::kError,
+                            "plugin_changed_during_handshake", // TSK142_Plugin_Security_Bypass_Vulnerabilities
+                            "Plugin image changed during sandbox startup", canonical_path); // TSK142_Plugin_Security_Bypass_Vulnerabilities
     cleanup_child(SIGKILL);
     return false;
   }

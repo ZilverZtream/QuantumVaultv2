@@ -55,7 +55,15 @@ struct PluginAbiQueryResult {
   bool selftest_passed{false};
 };
 
-bool VerifyPlugin(const std::filesystem::path& path, const PluginVerification& expected);
+struct VerifiedPluginMetadata { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  std::filesystem::path resolved_path; // canonicalized location actually verified
+  std::array<uint8_t, 32> content_hash{}; // verified digest
+  std::filesystem::file_time_type last_write_time{};
+  uintmax_t file_size{0};
+};
+
+std::optional<VerifiedPluginMetadata> VerifyPlugin(const std::filesystem::path& path,
+                                                   const PluginVerification& expected);
 bool HasSecurityFlags(const std::filesystem::path& path);
 std::optional<PluginAbiQueryResult> QueryPluginABI(const std::filesystem::path& path);
 bool Ed25519_Verify(std::span<const uint8_t,32> pubkey,
