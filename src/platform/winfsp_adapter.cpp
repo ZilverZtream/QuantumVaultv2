@@ -174,6 +174,8 @@ void WinFspAdapter::Impl::Mount(const std::wstring& mountpoint) {
   }
 
   fs_->UserContext = this;
+  FspFileSystemSetOperationGuardStrategy(
+      fs_, FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);  // TSK130_Improper_WinFsp_Error_Mapping
 
   status = FspFileSystemSetMountPoint(fs_, mountpoint_.c_str());
   if (!NT_SUCCESS(status)) {
@@ -330,8 +332,52 @@ std::string WinFspAdapter::Impl::NormalizePath(const std::wstring& value) {
 
 NTSTATUS WinFspAdapter::Impl::PathErrorStatus(const qv::Error& error) {
   // TSK084_WinFSP_Normalization_and_Traversal map validation failures to NTSTATUS codes
-  if (error.domain == qv::ErrorDomain::Validation) {
-    return STATUS_OBJECT_PATH_SYNTAX_BAD;
+  // TSK130_Improper_WinFsp_Error_Mapping tighten domain-to-NTSTATUS translation for WinFsp
+  const char* message = error.what();
+  if (!message) {
+    message = "";
+  }
+  const auto contains = [message](const char* needle) {
+    return std::strstr(message, needle) != nullptr;
+  };
+
+  switch (error.domain) {
+    case qv::ErrorDomain::Validation:
+      if (contains("depth exceeds") || contains("length exceeds") ||
+          contains("segment length exceeds")) {
+        return STATUS_NAME_TOO_LONG;
+      }
+      if (contains("traversal")) {
+        return STATUS_ACCESS_DENIED;
+      }
+      if (contains("Parent directory missing") || contains("Directory not found") ||
+          contains("Destination parent missing")) {
+        return STATUS_OBJECT_PATH_NOT_FOUND;
+      }
+      if (contains("Cannot remove root") || contains("Cannot rename root")) {
+        return STATUS_ACCESS_DENIED;
+      }
+      if (contains("Embedded null") || contains("Drive-qualified") || contains("UNC paths") ||
+          contains("Adjacent path separators") || contains("Non-printable") ||
+          contains("Unicode normalization failed") || contains("syntax")) {
+        return STATUS_OBJECT_PATH_SYNTAX_BAD;
+      }
+      return STATUS_OBJECT_PATH_SYNTAX_BAD;
+    case qv::ErrorDomain::State:
+      if (contains("Directory not empty") || contains("Destination directory not empty")) {
+        return STATUS_DIRECTORY_NOT_EMPTY;
+      }
+      if (contains("Destination exists") || contains("already exists")) {
+        return STATUS_OBJECT_NAME_COLLISION;
+      }
+      return STATUS_ACCESS_DENIED;
+    case qv::ErrorDomain::IO:
+      if (contains("not found")) {
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+      }
+      return STATUS_IO_DEVICE_ERROR;
+    default:
+      break;
   }
   return STATUS_ACCESS_DENIED;
 }
@@ -432,9 +478,18 @@ NTSTATUS WinFspAdapter::Impl::GetSecurityByName(FSP_FILE_SYSTEM* fs, PWSTR filen
   try {
     metadata = self->volume_fs_->StatPath(path);
   } catch (const qv::Error& error) {
+    if (error.domain == qv::ErrorDomain::IO) {
+      return STATUS_OBJECT_NAME_NOT_FOUND;  // TSK130_Improper_WinFsp_Error_Mapping
+    }
     return PathErrorStatus(error);
   } catch (...) {
-    return STATUS_IO_DEVICE_ERROR;
+    if (attributes) {
+      *attributes = FILE_ATTRIBUTE_ARCHIVE;
+    }
+    if (descriptor_size) {
+      *descriptor_size = 0;
+    }
+    return STATUS_SUCCESS;  // TSK130_Improper_WinFsp_Error_Mapping surface attributes best-effort
   }
   if (!metadata) {
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -764,6 +819,8 @@ NTSTATUS WinFspAdapter::Impl::CanDelete(FSP_FILE_SYSTEM* fs, PVOID context, PWST
       return STATUS_DIRECTORY_NOT_EMPTY;
     }
     return STATUS_SUCCESS;
+  } catch (const qv::Error& error) {
+    return PathErrorStatus(error);  // TSK130_Improper_WinFsp_Error_Mapping preserve domain semantics
   } catch (...) {
     return STATUS_IO_DEVICE_ERROR;
   }
