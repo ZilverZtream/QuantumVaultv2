@@ -111,6 +111,7 @@ elseif(TARGET Sodium::Sodium)
 endif()
 
 add_library(qv_core
+    src/core/header_io.cpp # TSK712_Header_Backup_and_Restore_Tooling header backup plumbing
     src/core/nonce.cpp
     src/core/nonce_log.cpp
     src/core/pqc_hybrid_kdf.cpp
@@ -241,6 +242,15 @@ target_compile_definitions(qv PRIVATE
     QV_ENABLE_TPM_SEALING=$<BOOL:${qv_have_tpm}>   # TSK035_Platform_Specific_Security_Integration
 )
 
+add_executable(qv-header tools/qv-header.cpp) # TSK712_Header_Backup_and_Restore_Tooling standalone helper
+target_include_directories(qv-header
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(qv-header PRIVATE qv_core ${ARGON2_LIBRARY})
+target_include_directories(qv-header PRIVATE ${ARGON2_INCLUDE_DIR})
+
 # TSK062_FUSE_Filesystem_Integration_Linux build the Linux FUSE bridge when dependencies are present
 if (UNIX)
   find_package(PkgConfig REQUIRED)
@@ -345,6 +355,13 @@ endfunction()
   qv_apply_test_opts(qv_error_handling_test) # TSK034
   add_test(NAME qv_error_handling COMMAND qv_error_handling_test) # TSK034
 
+  add_executable(qv_header_io_test tests/test_header_io.cpp) # TSK712_Header_Backup_and_Restore_Tooling
+  target_include_directories(qv_header_io_test PUBLIC include)
+  target_link_libraries(qv_header_io_test PRIVATE qv_core ${ARGON2_LIBRARY})
+  target_include_directories(qv_header_io_test PRIVATE ${ARGON2_INCLUDE_DIR})
+  qv_apply_test_opts(qv_header_io_test)
+  add_test(NAME qv_header_io COMMAND qv_header_io_test)
+
   add_executable(qv_concurrent_test tests/test_concurrent_mount.cpp) # TSK034
   target_include_directories(qv_concurrent_test PUBLIC include) # TSK034
   target_link_libraries(qv_concurrent_test PRIVATE qv_core Threads::Threads) # TSK034
@@ -410,6 +427,12 @@ endif()
     target_compile_options(qv_fuzz_header PRIVATE -fsanitize=fuzzer,address) # TSK030
     target_link_options(qv_fuzz_header PRIVATE -fsanitize=fuzzer,address) # TSK030
     add_dependencies(fuzz_tests qv_fuzz_header) # TSK030
+
+    add_executable(qv_fuzz_header_backup tests/fuzz/fuzz_header_backup.cpp) # TSK712_Header_Backup_and_Restore_Tooling backup bundle fuzz target
+    target_link_libraries(qv_fuzz_header_backup PRIVATE qv_core) # TSK712_Header_Backup_and_Restore_Tooling core-only dependency
+    target_compile_options(qv_fuzz_header_backup PRIVATE -fsanitize=fuzzer,address) # TSK712_Header_Backup_and_Restore_Tooling sanitizer coverage
+    target_link_options(qv_fuzz_header_backup PRIVATE -fsanitize=fuzzer,address) # TSK712_Header_Backup_and_Restore_Tooling sanitizer coverage
+    add_dependencies(fuzz_tests qv_fuzz_header_backup) # TSK712_Header_Backup_and_Restore_Tooling aggregate build hook
   endif()
 
 endif()
@@ -430,6 +453,7 @@ install(TARGETS
     qv_storage
     qv_orchestrator
     qv
+    qv-header
     qv_example_crypto
     qv_pqc_mlkem
     EXPORT QuantumVaultTargets # TSK008
