@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream> // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
 #include <limits>      // TSK095_Memory_Safety_and_Buffer_Bounds overflow guards
+#include <memory>       // TSK133_Race_in_Nonce_Log_Recovery WAL guard lifetime
 #include <mutex>        // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
 #include <stdexcept>  // TSK104_Concurrency_Deadlock_and_Lock_Ordering misuse detection
 #include <system_error>
@@ -26,6 +27,7 @@
 // platform-specific primitives.
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/file.h>   // TSK133_Race_in_Nonce_Log_Recovery advisory locking
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -241,6 +243,84 @@ namespace {
     wal += ".wal";
     return wal;
   }
+
+  std::filesystem::path WalLockPathFor(const std::filesystem::path& path) { // TSK133_Race_in_Nonce_Log_Recovery lock file suffix
+    auto lock = path;
+    lock += ".lock";
+    return lock;
+  }
+
+  class NonceLogFileLock {                                             // TSK133_Race_in_Nonce_Log_Recovery cross-process guard
+  public:
+    explicit NonceLogFileLock(const std::filesystem::path& path) {
+      std::error_code ec;
+      auto parent = path.parent_path();
+      if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+          throw Error{ErrorDomain::IO, ec.value(),
+                      "Failed to create nonce lock directory " +
+                          qv::PathToUtf8String(parent)};
+        }
+      }
+#ifdef _WIN32
+      handle_ = ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (handle_ == INVALID_HANDLE_VALUE) {
+        auto err = static_cast<int>(::GetLastError());
+        throw Error{ErrorDomain::IO, err,
+                    "Failed to lock nonce WAL " + qv::PathToUtf8String(path)};
+      }
+#else
+      fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
+      if (fd_ < 0) {
+        throw Error{ErrorDomain::IO, errno,
+                    "Failed to open nonce WAL lock " + qv::PathToUtf8String(path)};
+      }
+      if (::flock(fd_, LOCK_EX) != 0) {
+        int err = errno;
+        ::close(fd_);
+        fd_ = -1;
+        throw Error{ErrorDomain::IO, err,
+                    "Failed to acquire nonce WAL lock " + qv::PathToUtf8String(path)};
+      }
+#endif
+    }
+
+    NonceLogFileLock(const NonceLogFileLock&) = delete;
+    NonceLogFileLock& operator=(const NonceLogFileLock&) = delete;
+
+    ~NonceLogFileLock() {
+#ifdef _WIN32
+      if (handle_ != INVALID_HANDLE_VALUE) {
+        ::CloseHandle(handle_);
+        handle_ = INVALID_HANDLE_VALUE;
+      }
+#else
+      if (fd_ >= 0) {
+        ::flock(fd_, LOCK_UN);
+        ::close(fd_);
+        fd_ = -1;
+      }
+#endif
+    }
+
+  private:
+#ifdef _WIN32
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    int fd_{-1};
+#endif
+  };
+
+} // namespace
+
+struct NonceLog::FileLock {                                             // TSK133_Race_in_Nonce_Log_Recovery member indirection
+  explicit FileLock(const std::filesystem::path& path) : guard(path) {}
+  NonceLogFileLock guard;
+};
+
+namespace {
 
   class TempFileGuard { // TSK028_Secure_Deletion_and_Data_Remanence
   public:
@@ -623,7 +703,22 @@ namespace {
 
 } // namespace
 
+void NonceLog::EnsureWalLock() {                                        // TSK133_Race_in_Nonce_Log_Recovery lazy guard setup
+  if (wal_lock_) {
+    return;
+  }
+  if (path_.empty()) {
+    throw std::logic_error("NonceLog path must be set before locking");
+  }
+  auto lock_path = WalLockPathFor(path_);
+  wal_lock_ = std::make_unique<FileLock>(lock_path);
+}
+
 NonceLog::NonceLog(const std::filesystem::path& path) : path_(path) {
+  if (!path_.parent_path().empty()) {
+    std::filesystem::create_directories(path_.parent_path());
+  }
+  EnsureWalLock();
   std::lock_guard<std::mutex> lock(mu_);
   RecoverWalUnlocked(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   if (std::filesystem::exists(path_)) {
@@ -645,6 +740,7 @@ void NonceLog::InitializeNewLog() {
   if (!path_.parent_path().empty()) {
     std::filesystem::create_directories(path_.parent_path());
   }
+  EnsureWalLock();
   GenerateKey(key_);
   last_mac_.fill(0);
   entries_.clear();
@@ -652,6 +748,7 @@ void NonceLog::InitializeNewLog() {
 }
 
 void NonceLog::EnsureLoadedUnlocked() {
+  EnsureWalLock();
   if (loaded_) {
     return;
   }
@@ -664,6 +761,7 @@ void NonceLog::EnsureLoadedUnlocked() {
 }
 
 void NonceLog::RecoverWalUnlocked() { // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  EnsureWalLock();
   auto wal_path = WalPathFor(path_);
   if (!std::filesystem::exists(wal_path)) {
     return;
@@ -698,6 +796,7 @@ void NonceLog::RecoverWalUnlocked() { // TSK021_Nonce_Log_Durability_and_Crash_S
 }
 
 void NonceLog::ReloadUnlocked() {
+  EnsureWalLock();
   std::ifstream in(path_, std::ios::binary);
   if (!in.is_open()) {
     throw Error{ErrorDomain::IO, 0,
@@ -871,6 +970,7 @@ void NonceLog::PersistUnlocked() {
     mu_.unlock();
     throw std::logic_error("PersistUnlocked requires caller to hold mu_");
   }
+  EnsureWalLock();
   std::vector<uint8_t> buffer = SerializeHeader(kLogVersion, kHeaderMagic, key_);
   for (const auto& entry : entries_) {
     AppendEntryBytes(buffer, entry.counter, entry.mac);
