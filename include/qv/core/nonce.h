@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <memory> // TSK133_Race_in_Nonce_Log_Recovery scoped WAL locks
 #include <mutex>
 #include <new>      // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional> // TSK015
@@ -33,6 +34,8 @@ namespace qv::core {
     std::vector<LogEntry> entries_;
     bool loaded_{false};
     mutable std::mutex mu_;
+    struct FileLock;                                       // TSK133_Race_in_Nonce_Log_Recovery forward-declare lock wrapper
+    std::unique_ptr<FileLock> wal_lock_;                   // TSK133_Race_in_Nonce_Log_Recovery serialized WAL access
 
   public:
     NonceLog() = default;
@@ -56,6 +59,7 @@ namespace qv::core {
     void PersistUnlocked();
     void InitializeNewLog();
     void RecoverWalUnlocked(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
+    void EnsureWalLock();      // TSK133_Race_in_Nonce_Log_Recovery acquire/process-level guard
   };
 
   class NonceGenerator {
