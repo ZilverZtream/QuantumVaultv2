@@ -8,6 +8,7 @@
 #include "qv/common.h"
 #include "qv/core/nonce.h"
 #include "qv/crypto/aes_gcm.h"
+#include "qv/crypto/ct.h" // TSK123_Missing_Constant_Time_Comparisons constant-time size selection
 #include "qv/security/zeroizer.h"
 
 #ifndef QV_SENSITIVE_FUNCTION  // TSK028A_Memory_Wiping_Gaps
@@ -247,10 +248,16 @@ std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
       nonce_span,
       tag_span,
       std::span<const uint8_t>(data_key_.data(), data_key_.size()));
-  if (plaintext.size() < record.header.data_size) {
+  const uint64_t available_size = static_cast<uint64_t>(plaintext.size());
+  const uint64_t expected_size = static_cast<uint64_t>(record.header.data_size);
+  const uint64_t underflow_mask =
+      (available_size - expected_size) >> 63; // TSK123_Missing_Constant_Time_Comparisons constant-time underflow detection
+  const uint64_t sanitized_size = qv::crypto::ct::Select<uint64_t>(
+      expected_size, available_size, underflow_mask != 0); // TSK123_Missing_Constant_Time_Comparisons branch-free clamp
+  plaintext.resize(static_cast<size_t>(sanitized_size));
+  if (underflow_mask != 0) {
     throw Error{ErrorDomain::Crypto, 0, "Decrypted payload truncated"};
   }
-  plaintext.resize(record.header.data_size);
   return plaintext;
 }
 
