@@ -497,8 +497,24 @@ private:
     if (failures <= 0) {
       return kMinDelay;
     }
-    auto multiplier = static_cast<int>(1u << std::min(failures, 10));
-    auto delay = kMinDelay * multiplier;
+
+    const auto max_multiplier = kMaxDelay / kMinDelay;
+    int exponent = failures;
+    if (max_multiplier > 0) {
+      constexpr unsigned kMaxExponent =
+          std::numeric_limits<unsigned long long>::digits - 1; // TSK138_Rate_Limiting_And_DoS_Vulnerabilities ensure shift safety
+      unsigned limit = 0;
+      const auto target = static_cast<uint64_t>(max_multiplier);
+      while (limit < kMaxExponent && (1ull << limit) < target) {
+        ++limit;
+      }
+      exponent = std::min(failures, static_cast<int>(limit));
+    } else {
+      exponent = 0; // TSK138_Rate_Limiting_And_DoS_Vulnerabilities fall back if max delay is smaller than min delay
+    }
+
+    auto multiplier = static_cast<uint64_t>(1ull << exponent);
+    auto delay = kMinDelay * static_cast<int64_t>(multiplier);
     return delay > kMaxDelay ? kMaxDelay : delay;
   }
 
