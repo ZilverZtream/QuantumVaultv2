@@ -178,7 +178,7 @@ target_include_directories(qv_orchestrator PRIVATE ${ARGON2_INCLUDE_DIR}) # TSK0
 target_compile_definitions(qv_orchestrator PUBLIC QV_HAVE_ARGON2=1)       # TSK036_PBKDF2_Argon2_Migration_Path flag
 # TSK005 platform signature verification dependencies
 if (WIN32)
-  target_link_libraries(qv_orchestrator PRIVATE Wintrust Crypt32)
+  target_link_libraries(qv_orchestrator PRIVATE Wintrust Crypt32 Dnsapi) # TSK144_Network_Protocol_Security_Issues DNSSEC APIs
 elseif(APPLE)
   target_link_libraries(qv_orchestrator PRIVATE "-framework Security" "-framework CoreFoundation")
 endif()
