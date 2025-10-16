@@ -25,6 +25,8 @@
 
 #include <openssl/evp.h> // TSK082_Backup_Verification_and_Schema
 
+#include "qv/crypto/aes_gcm.h"  // TSK137_Backup_Security_And_Integrity_Gaps manifest sealing
+#include "qv/crypto/hkdf.h"    // TSK137_Backup_Security_And_Integrity_Gaps manifest key derivation
 #include "qv/crypto/random.h" // TSK124_Insecure_Randomness_Usage use platform RNG for secure overwrite
 #ifndef QV_SENSITIVE_FUNCTION  // TSK028A_Memory_Wiping_Gaps
 #if defined(_MSC_VER)
@@ -926,6 +928,57 @@ namespace {
                       "Unexpected SHA-256 length"};
     }
 
+    return digest;
+  }
+
+  std::array<uint8_t, 32> ComputeFileSha256(
+      const std::filesystem::path& path) { // TSK137_Backup_Security_And_Integrity_Gaps post-copy verification
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+      const int err = errno; // TSK137_Backup_Security_And_Integrity_Gaps surface verification failure
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to open file for verification: " + SanitizePath(path)};
+    }
+
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+        EVP_MD_CTX_new(), &EVP_MD_CTX_free); // TSK137_Backup_Security_And_Integrity_Gaps reuse hashing
+    if (!ctx) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Failed to initialize hashing context"};
+    }
+    if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Failed to initialize SHA-256 context"};
+    }
+
+    std::array<char, 1 << 15> buffer{}; // TSK137_Backup_Security_And_Integrity_Gaps 32 KiB chunks
+    while (in) {
+      in.read(buffer.data(), buffer.size());
+      std::streamsize read = in.gcount();
+      if (read > 0) {
+        if (EVP_DigestUpdate(ctx.get(), buffer.data(), static_cast<size_t>(read)) != 1) {
+          throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                          "Failed while computing SHA-256"};
+        }
+      }
+    }
+
+    if (!in.eof()) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed while reading file for verification: " + SanitizePath(path)};
+    }
+
+    std::array<uint8_t, 32> digest{};
+    unsigned int digest_len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), digest.data(), &digest_len) != 1) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Failed to finalize SHA-256"};
+    }
+    if (digest_len != digest.size()) {
+      throw qv::Error{qv::ErrorDomain::Crypto, 0,
+                      "Unexpected SHA-256 length"};
+    }
     return digest;
   }
 
@@ -2072,6 +2125,24 @@ namespace {
     }
     std::filesystem::rename(staged_container, container_backup);
     container_guard.Release();
+#if !defined(_WIN32)
+    try {
+      std::filesystem::permissions(
+          container_backup,
+          std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+          std::filesystem::perm_options::replace); // TSK137_Backup_Security_And_Integrity_Gaps restrict backup access
+    } catch (const std::filesystem::filesystem_error& err) {
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                      "Failed to secure container backup: " + SanitizePath(container_backup)};
+    }
+#endif
+
+    const auto verify_container_digest = ComputeFileSha256(
+        container_backup); // TSK137_Backup_Security_And_Integrity_Gaps ensure copy fidelity
+    if (verify_container_digest != container_digest) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Container backup digest mismatch detected"};
+    }
 
     if (nonce_backup && nonce_guard) {
       {
@@ -2080,6 +2151,22 @@ namespace {
       }
       std::filesystem::rename(staged_nonce, *nonce_backup);
       nonce_guard->Release();
+#if !defined(_WIN32)
+      try {
+        std::filesystem::permissions(
+            *nonce_backup,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace); // TSK137_Backup_Security_And_Integrity_Gaps protect nonce log backup
+      } catch (const std::filesystem::filesystem_error& err) {
+        throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                        "Failed to secure nonce backup: " + SanitizePath(*nonce_backup)};
+      }
+#endif
+      const auto verify_nonce_digest = ComputeFileSha256(*nonce_backup); // TSK137_Backup_Security_And_Integrity_Gaps
+      if (verify_nonce_digest != *nonce_digest) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0,
+                        "Nonce log backup digest mismatch detected"};
+      }
     }
 
     auto manifest_path = output_dir / "manifest.json";
@@ -2095,24 +2182,64 @@ namespace {
       throw qv::Error{qv::ErrorDomain::IO, errno,
                       "Failed to write manifest: " + SanitizePath(manifest_tmp)};
     }
-    constexpr int kManifestVersion = 1; // TSK082_Backup_Verification_and_Schema schema marker
+    constexpr int kManifestVersion = 2; // TSK137_Backup_Security_And_Integrity_Gaps schema upgrade
     const auto container_hash_hex =
         BytesToHexLower(std::span<const uint8_t>(container_digest.data(), container_digest.size()));
-    manifest << "{\n";
-    manifest << "  \"manifest_version\": " << kManifestVersion << ",\n";
-    manifest << "  \"app_version\": \"" << AppVersionString() << "\",\n";
-    manifest << "  \"container_path\": \"" << container_backup.filename().string() << "\",\n";
-    manifest << "  \"container_sha256\": \"" << container_hash_hex << "\",\n";
+    std::ostringstream sensitive;
+    sensitive << "{\n";
+    sensitive << "  \"container_path\": \"" << container_backup.filename().string() << "\",\n";
+    sensitive << "  \"container_sha256\": \"" << container_hash_hex << "\",\n";
     if (nonce_backup && nonce_digest) {
       const auto nonce_hash_hex = BytesToHexLower(
           std::span<const uint8_t>(nonce_digest->data(), nonce_digest->size()));
-      manifest << "  \"nonce_log_path\": \"" << nonce_backup->filename().string() << "\",\n";
-      manifest << "  \"nonce_log_sha256\": \"" << nonce_hash_hex << "\",\n";
+      sensitive << "  \"nonce_log_path\": \"" << nonce_backup->filename().string() << "\",\n";
+      sensitive << "  \"nonce_log_sha256\": \"" << nonce_hash_hex << "\",\n";
     } else {
-      manifest << "  \"nonce_log_path\": null,\n";
-      manifest << "  \"nonce_log_sha256\": null,\n";
+      sensitive << "  \"nonce_log_path\": null,\n";
+      sensitive << "  \"nonce_log_sha256\": null,\n";
     }
-    manifest << "  \"created_at\": \"" << CurrentISO8601() << "\"\n";
+    sensitive << "  \"created_at\": \"" << CurrentISO8601() << "\"\n";
+    sensitive << "}\n";
+    auto sensitive_blob = sensitive.str();
+    std::vector<uint8_t> sensitive_bytes(sensitive_blob.begin(), sensitive_blob.end());
+
+    std::array<uint8_t, 16> manifest_salt{};
+    FillRandom(manifest_salt); // TSK137_Backup_Security_And_Integrity_Gaps derive unique key
+    static constexpr std::string_view kManifestInfo{"QV-BACKUP-MANIFEST/v1"};
+    auto manifest_key = qv::crypto::HKDF_SHA256(
+        std::span<const uint8_t>(container_digest.data(), container_digest.size()),
+        std::span<const uint8_t>(manifest_salt.data(), manifest_salt.size()),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kManifestInfo.data()),
+                                 kManifestInfo.size())); // TSK137_Backup_Security_And_Integrity_Gaps
+    std::array<uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE> manifest_nonce{};
+    FillRandom(manifest_nonce); // TSK137_Backup_Security_And_Integrity_Gaps unique IV
+    auto manifest_enc = qv::crypto::AES256_GCM_Encrypt(
+        std::span<const uint8_t>(sensitive_bytes.data(), sensitive_bytes.size()), std::span<const uint8_t>(),
+        std::span<const uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE>(manifest_nonce.data(), manifest_nonce.size()),
+        std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE>(manifest_key.data(), manifest_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(manifest_key.data(), manifest_key.size()));
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(sensitive_bytes.data(), sensitive_bytes.size()));
+    std::fill(sensitive_blob.begin(), sensitive_blob.end(), '\0');
+
+    const auto salt_hex = BytesToHexLower(
+        std::span<const uint8_t>(manifest_salt.data(), manifest_salt.size()));
+    const auto nonce_hex = BytesToHexLower(
+        std::span<const uint8_t>(manifest_nonce.data(), manifest_nonce.size()));
+    const auto tag_hex = BytesToHexLower(
+        std::span<const uint8_t>(manifest_enc.tag.data(), manifest_enc.tag.size()));
+    const auto ciphertext_hex = BytesToHexLower(std::span<const uint8_t>(
+        manifest_enc.ciphertext.data(), manifest_enc.ciphertext.size()));
+
+    manifest << "{\n";
+    manifest << "  \"manifest_version\": " << kManifestVersion << ",\n";
+    manifest << "  \"app_version\": \"" << AppVersionString() << "\",\n";
+    manifest << "  \"encryption\": {\n";
+    manifest << "    \"algorithm\": \"AES-256-GCM\",\n";
+    manifest << "    \"salt_hex\": \"" << salt_hex << "\",\n";
+    manifest << "    \"nonce_hex\": \"" << nonce_hex << "\",\n";
+    manifest << "    \"tag_hex\": \"" << tag_hex << "\",\n";
+    manifest << "    \"ciphertext_hex\": \"" << ciphertext_hex << "\"\n";
+    manifest << "  }\n";
     manifest << "}\n";
     manifest.flush();
     if (!manifest) {
@@ -2128,6 +2255,17 @@ namespace {
     }
     std::filesystem::rename(manifest_tmp, manifest_path);
     manifest_guard.Release();
+#if !defined(_WIN32)
+    try {
+      std::filesystem::permissions(
+          manifest_path,
+          std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+          std::filesystem::perm_options::replace); // TSK137_Backup_Security_And_Integrity_Gaps secure manifest
+    } catch (const std::filesystem::filesystem_error& err) {
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                      "Failed to secure manifest: " + SanitizePath(manifest_path)};
+    }
+#endif
 
     std::cout << "Backup created at " << SanitizePath(output_dir) << std::endl;
     return kExitOk;
