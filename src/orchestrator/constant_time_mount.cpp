@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype> // TSK136_Missing_Rate_Limiting_Mount_Attempts client IP normalization
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -50,6 +51,73 @@
 using namespace qv::orchestrator;
 
 namespace {
+
+std::string TrimWhitespace(std::string_view input) { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  const auto begin = input.find_first_not_of(" \t\r\n");
+  if (begin == std::string_view::npos) {
+    return {};
+  }
+  const auto end = input.find_last_not_of(" \t\r\n");
+  return std::string(input.substr(begin, end - begin + 1));
+}
+
+std::optional<std::string> NormalizeClientIp(std::string_view raw) { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  auto trimmed = TrimWhitespace(raw);
+  if (trimmed.empty()) {
+    return std::nullopt;
+  }
+  if (trimmed.size() > 64) {
+    return std::nullopt;
+  }
+  for (char& ch : trimmed) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isdigit(uch) || ch == '.' || ch == ':' || ch == '%' || ch == '-' || ch == '[' ||
+        ch == ']') {
+      ch = static_cast<char>(std::tolower(uch));
+      continue;
+    }
+    if ((uch >= static_cast<unsigned char>('a') && uch <= static_cast<unsigned char>('f')) ||
+        (uch >= static_cast<unsigned char>('A') && uch <= static_cast<unsigned char>('F'))) {
+      ch = static_cast<char>(std::tolower(uch));
+      continue;
+    }
+    return std::nullopt;
+  }
+  return trimmed;
+}
+
+std::string HexEncode(std::span<const uint8_t> bytes) { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string output(bytes.size() * 2, '0');
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    const auto value = bytes[i];
+    output[i * 2] = kHex[(value >> 4) & 0xF];
+    output[i * 2 + 1] = kHex[value & 0xF];
+  }
+  return output;
+}
+
+std::string HashClientIdentifier(std::string_view normalized) { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  static constexpr std::array<uint8_t, 16> kClientIpSalt = {
+      'Q', 'V', 'M', 'O', 'U', 'N', 'T', '_', 'I', 'P', '_', 'H', 'A', 'S', 'H', '1'};
+  auto mac = qv::crypto::HMAC_SHA256::Compute(
+      std::span<const uint8_t>(kClientIpSalt.data(), kClientIpSalt.size()),
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(normalized.data()),
+                               normalized.size()));
+  return HexEncode(std::span<const uint8_t>(mac.data(), mac.size()));
+}
+
+std::optional<std::string> ResolveClientFingerprint() { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  const char* env = std::getenv("QV_CLIENT_IP");
+  if (!env || !*env) {
+    return std::nullopt;
+  }
+  auto normalized = NormalizeClientIp(env);
+  if (!normalized) {
+    return std::nullopt;
+  }
+  return HashClientIdentifier(*normalized);
+}
 
 void ConstantTimeDelay(std::chrono::nanoseconds duration) { // TSK102_Timing_Side_Channels
   if (duration <= std::chrono::nanoseconds::zero()) {
@@ -185,12 +253,30 @@ struct LockFileHeader { // TSK075_Lockout_Persistence_and_IPC
 
 static_assert(sizeof(LockFileHeader) == 20, "lock file header layout mismatch"); // TSK075_Lockout_Persistence_and_IPC
 
+#pragma pack(push, 1)
+struct GlobalLockFile { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  uint32_t version_le{0};
+  uint32_t failures_le{0};
+  uint64_t last_attempt_le{0};
+  uint32_t locked_le{0};
+  uint64_t total_failures_le{0};
+};
+#pragma pack(pop)
+
+static_assert(sizeof(GlobalLockFile) == 28, "global lock file layout mismatch"); // TSK136
+
 class FailureTracker { // TSK026
 public:
   struct FailureState {
     int failures{0};
     bool locked{false};
     std::chrono::seconds enforced_delay{std::chrono::seconds::zero()};
+    int global_failures{0};                                             // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    std::chrono::seconds global_enforced_delay{std::chrono::seconds::zero()}; // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    uint64_t global_total_failures{0};                                  // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    int client_failures{0};                                             // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    std::chrono::seconds client_enforced_delay{std::chrono::seconds::zero()};  // TSK136
+    std::string client_fingerprint;                                     // TSK136
   };
 
   static FailureTracker& Instance() {
@@ -199,31 +285,56 @@ public:
   }
 
   void EnforceDelay(const std::filesystem::path& container,
-                    const std::optional<VolumeUuid>& volume_uuid) {
+                    const std::optional<VolumeUuid>& volume_uuid,
+                    const std::optional<std::string>& client_fingerprint) {
     const VolumeUuid uuid = NormalizeUuid(volume_uuid);                           // TSK075_Lockout_Persistence_and_IPC
     auto gate = qv::orchestrator::ScopedIpcLock::ForPath(container);              // TSK075_Lockout_Persistence_and_IPC
     const bool have_gate = gate.locked();                                         // TSK075_Lockout_Persistence_and_IPC
+    auto global_gate = qv::orchestrator::ScopedIpcLock::Acquire("qv_mount_global_rate"); // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    const bool have_global_gate = global_gate.locked();                           // TSK136
     const auto now = SystemClock::now();
 
     AttemptState state;
+    GlobalState global_snapshot;
+    AttemptState client_snapshot;
+    bool have_client = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       const auto key = qv::PathToUtf8String(container);
       state = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
+      global_snapshot = LoadGlobalStateLocked(now, have_global_gate);
+      if (client_fingerprint) {
+        client_snapshot = LoadClientStateLocked(*client_fingerprint, now);
+        have_client = true;
+      }
     }
 
-    if (state.locked) {
+    if (state.locked || global_snapshot.state.locked || (have_client && client_snapshot.locked)) {
       throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
                     std::string(qv::errors::msg::kVolumeLocked)}; // TSK026
     }
 
-    if (!state.have_last_attempt || state.failures <= 0) {
+    if ((!state.have_last_attempt || state.failures <= 0) &&
+        (!global_snapshot.state.have_last_attempt || global_snapshot.state.failures <= 0) &&
+        (!have_client || !client_snapshot.have_last_attempt || client_snapshot.failures <= 0)) {
       return;
     }
 
     const auto required_delay = RequiredDelay(state.failures);
-    const auto required_duration = std::chrono::duration_cast<SystemClock::duration>(required_delay);
-    const auto elapsed = now - state.last_attempt;
+    const auto global_delay = RequiredDelay(global_snapshot.state.failures);
+    const auto client_delay = have_client ? RequiredDelay(client_snapshot.failures)
+                                          : std::chrono::seconds::zero();
+    const auto enforced_delay = std::max({required_delay, global_delay, client_delay});
+    const auto required_duration = std::chrono::duration_cast<SystemClock::duration>(enforced_delay);
+    auto last_attempt = state.have_last_attempt ? state.last_attempt : now;
+    if (global_snapshot.state.have_last_attempt &&
+        global_snapshot.state.last_attempt > last_attempt) {
+      last_attempt = global_snapshot.state.last_attempt;
+    }
+    if (have_client && client_snapshot.have_last_attempt && client_snapshot.last_attempt > last_attempt) {
+      last_attempt = client_snapshot.last_attempt;
+    }
+    const auto elapsed = now - last_attempt;
     if (elapsed >= required_duration) {
       return;
     }
@@ -234,26 +345,43 @@ public:
 
   FailureState RecordAttempt(const std::filesystem::path& container,
                              const std::optional<VolumeUuid>& volume_uuid,
-                             bool success) {
+                             bool success,
+                             const std::optional<std::string>& client_fingerprint) {
     const VolumeUuid uuid = NormalizeUuid(volume_uuid);                           // TSK075_Lockout_Persistence_and_IPC
     auto gate = qv::orchestrator::ScopedIpcLock::ForPath(container);              // TSK075_Lockout_Persistence_and_IPC
     const bool have_gate = gate.locked();                                         // TSK075_Lockout_Persistence_and_IPC
+    auto global_gate = qv::orchestrator::ScopedIpcLock::Acquire("qv_mount_global_rate"); // TSK136
+    const bool have_global_gate = global_gate.locked();                           // TSK136
     const auto now = SystemClock::now();
 
     FailureState result{};
     AttemptState snapshot{};
+    GlobalState global_snapshot{};
+    AttemptState client_snapshot{};
+    bool have_client_snapshot = false;
     bool should_persist = false;
     bool should_remove = false;
+    bool should_persist_global = false;
 
     {
       std::unique_lock<std::mutex> lock(mutex_);
       const auto key = qv::PathToUtf8String(container);
       auto& entry = attempts_[key];
       snapshot = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
+      global_snapshot = LoadGlobalStateLocked(now, have_global_gate);
+      if (client_fingerprint) {
+        client_snapshot = LoadClientStateLocked(*client_fingerprint, now);
+        have_client_snapshot = true;
+      }
 
       if (success) {
         attempts_.erase(key);
+        if (have_client_snapshot) {
+          client_attempts_.erase(*client_fingerprint);
+        }
+        global_snapshot = ResetGlobalStateLocked(now);
         should_remove = true;
+        should_persist_global = have_global_gate;
       } else {
         snapshot.have_last_attempt = true;
         snapshot.last_attempt = now;
@@ -264,8 +392,16 @@ public:
           snapshot.locked = true;
         }
         entry = snapshot;
-        result = BuildFailureState(snapshot);
+        IncrementGlobalFailureLocked(now, global_snapshot);
+        if (have_client_snapshot) {
+          UpdateClientStateLocked(*client_fingerprint, now, client_snapshot);
+        }
+        result = BuildFailureState(snapshot, global_snapshot,
+                                   have_client_snapshot ? std::optional<AttemptState>(client_snapshot)
+                                                        : std::nullopt,
+                                   client_fingerprint ? *client_fingerprint : std::string{});
         should_persist = true;
+        should_persist_global = have_global_gate;
       }
     }
 
@@ -276,11 +412,18 @@ public:
         std::error_code ec;
         std::filesystem::remove(LockFilePath(container), ec);
       }
+      if (should_persist_global && have_global_gate) {
+        PersistGlobalState(global_snapshot);
+      }
       return {};
     }
 
     if (should_persist && have_gate) {
       WritePersistentState(container, uuid, snapshot);
+    }
+
+    if (should_persist_global && have_global_gate) {
+      PersistGlobalState(global_snapshot);
     }
 
     return result;
@@ -296,33 +439,57 @@ private:
     SystemClock::time_point last_attempt{};
   };
 
+  struct GlobalState { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    AttemptState state;
+    uint64_t total_failures{0};
+  };
+
   struct PersistLoadResult {
     std::optional<AttemptState> state;
     bool tampered{false};
   };
 
   static constexpr auto kMinDelay = std::chrono::seconds(3);
-  static constexpr auto kMaxDelay = std::chrono::seconds(60);
+  static constexpr auto kMaxDelay = std::chrono::minutes(15); // TSK136_Missing_Rate_Limiting_Mount_Attempts increased backoff cap
   static constexpr int kMaxAttempts = 5;
   static constexpr uint32_t kLockFileVersion = 1;                                   // TSK075_Lockout_Persistence_and_IPC
+  static constexpr uint32_t kGlobalLockFileVersion = 1;                             // TSK136
 
   AttemptState LoadAttemptStateLocked(const std::string& key,
                                       const std::filesystem::path& container,
                                       const VolumeUuid& uuid,
                                       SystemClock::time_point now,
                                       bool have_gate);
-  FailureState BuildFailureState(const AttemptState& state) const;
+  GlobalState LoadGlobalStateLocked(SystemClock::time_point now, bool have_gate);
+  AttemptState LoadClientStateLocked(const std::string& fingerprint, SystemClock::time_point now);
+    void IncrementGlobalFailureLocked(SystemClock::time_point now, GlobalState& snapshot);
+    GlobalState ResetGlobalStateLocked(SystemClock::time_point now);
+  void UpdateClientStateLocked(const std::string& fingerprint, SystemClock::time_point now,
+                               AttemptState& snapshot);
+  FailureState BuildFailureState(const AttemptState& container_state,
+                                 const GlobalState& global_state,
+                                 std::optional<AttemptState> client_state,
+                                 std::string client_fingerprint) const;
   PersistLoadResult ReadPersistentState(const std::filesystem::path& container,
                                         const VolumeUuid& uuid) const;
   void WritePersistentState(const std::filesystem::path& container,
                             const VolumeUuid& uuid,
                             const AttemptState& state) const;
   void RemovePersistentState(const std::filesystem::path& container) const;
+  struct GlobalPersistResult { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    std::optional<GlobalState> state;
+    bool tampered{false};
+  };
+  GlobalPersistResult ReadGlobalState() const;
+  void PersistGlobalState(const GlobalState& state) const;
+  std::filesystem::path GlobalStatePath() const;
 
   static VolumeUuid NormalizeUuid(const std::optional<VolumeUuid>& uuid);
   static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> DeriveMacKey(const VolumeUuid& uuid);
   static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> ComputeLockMac(const LockFileHeader& header,
                                                                                const VolumeUuid& uuid);
+  static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> ComputeGlobalLockMac(
+      const GlobalLockFile& header);
 
   std::chrono::seconds RequiredDelay(int failures) const {
     if (failures <= 0) {
@@ -335,6 +502,9 @@ private:
 
   std::mutex mutex_;
   std::unordered_map<std::string, AttemptState> attempts_;
+  std::unordered_map<std::string, AttemptState> client_attempts_; // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  GlobalState global_state_{};                                   // TSK136
+  bool global_loaded_{false};                                    // TSK136
 };
 
 FailureTracker::AttemptState FailureTracker::LoadAttemptStateLocked(
@@ -358,13 +528,109 @@ FailureTracker::AttemptState FailureTracker::LoadAttemptStateLocked(
   return entry;
 }
 
-FailureTracker::FailureState FailureTracker::BuildFailureState(const AttemptState& state) const {
-  FailureState result{};
-  result.failures = state.failures;
-  result.locked = state.locked;
-  if (state.have_last_attempt) {
-    result.enforced_delay = RequiredDelay(state.failures);
+FailureTracker::GlobalState FailureTracker::LoadGlobalStateLocked(SystemClock::time_point now,
+                                                                 bool have_gate) {
+  if (have_gate) {                                                                  // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    auto persisted = ReadGlobalState();
+    if (persisted.tampered) {
+      global_state_.state.failures = kMaxAttempts;
+      global_state_.state.locked = true;
+      global_state_.state.have_last_attempt = true;
+      global_state_.state.last_attempt = now;
+    } else if (persisted.state) {
+      global_state_ = *persisted.state;
+    } else {
+      global_state_ = {};
+    }
+    global_loaded_ = true;
+  } else if (!global_loaded_) {
+    global_state_ = {};
+    global_loaded_ = true;
   }
+
+  if (!global_state_.state.have_last_attempt) {
+    global_state_.state.last_attempt = now;
+  }
+  return global_state_;
+}
+
+FailureTracker::AttemptState FailureTracker::LoadClientStateLocked(const std::string& fingerprint,
+                                                                  SystemClock::time_point now) {
+  auto& entry = client_attempts_[fingerprint];                                      // TSK136
+  if (!entry.have_last_attempt) {
+    entry.last_attempt = now;
+  }
+  return entry;
+}
+
+void FailureTracker::IncrementGlobalFailureLocked(SystemClock::time_point now,
+                                                  GlobalState& snapshot) {
+  global_state_.state.have_last_attempt = true;                                     // TSK136
+  global_state_.state.last_attempt = now;
+  if (global_state_.state.failures < kMaxAttempts) {
+    global_state_.state.failures += 1;
+  }
+  if (global_state_.state.failures >= kMaxAttempts) {
+    global_state_.state.locked = true;
+  }
+  global_state_.total_failures += 1;
+  global_loaded_ = true;
+  snapshot = global_state_;
+}
+
+FailureTracker::GlobalState FailureTracker::ResetGlobalStateLocked(SystemClock::time_point now) {
+  global_state_.state.failures = 0;                                                 // TSK136
+  global_state_.state.locked = false;
+  global_state_.state.have_last_attempt = true;
+  global_state_.state.last_attempt = now;
+  global_loaded_ = true;
+  return global_state_;
+}
+
+void FailureTracker::UpdateClientStateLocked(const std::string& fingerprint,
+                                             SystemClock::time_point now,
+                                             AttemptState& snapshot) {
+  snapshot.have_last_attempt = true;                                                // TSK136
+  snapshot.last_attempt = now;
+  if (snapshot.failures < kMaxAttempts) {
+    snapshot.failures += 1;
+  }
+  if (snapshot.failures >= kMaxAttempts) {
+    snapshot.locked = true;
+  }
+  client_attempts_[fingerprint] = snapshot;
+}
+
+FailureTracker::FailureState FailureTracker::BuildFailureState(const AttemptState& container_state,
+                                                              const GlobalState& global_state,
+                                                              std::optional<AttemptState> client_state,
+                                                              std::string client_fingerprint) const {
+  FailureState result{};                                                          // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  const auto container_delay =
+      (container_state.have_last_attempt && container_state.failures > 0)
+          ? RequiredDelay(container_state.failures)
+          : std::chrono::seconds::zero();
+  const auto global_delay =
+      (global_state.state.have_last_attempt && global_state.state.failures > 0)
+          ? RequiredDelay(global_state.state.failures)
+          : std::chrono::seconds::zero();
+  const auto client_delay =
+      (client_state && client_state->have_last_attempt && client_state->failures > 0)
+          ? RequiredDelay(client_state->failures)
+          : std::chrono::seconds::zero();
+
+  result.failures = container_state.failures;
+  result.locked = container_state.locked || global_state.state.locked ||
+                  (client_state && client_state->locked);
+  result.enforced_delay = std::max({container_delay, global_delay, client_delay});
+  result.global_failures = global_state.state.failures;
+  result.global_enforced_delay = global_delay;
+  result.global_total_failures = global_state.total_failures;
+  if (client_state) {
+    result.client_failures = client_state->failures;
+    result.client_enforced_delay = client_delay;
+  }
+  result.client_fingerprint = std::move(client_fingerprint);
   return result;
 }
 
@@ -459,6 +725,93 @@ void FailureTracker::RemovePersistentState(const std::filesystem::path& containe
   std::filesystem::remove(lock_path, ec);
 }
 
+FailureTracker::GlobalPersistResult FailureTracker::ReadGlobalState() const {
+  GlobalPersistResult result{};                                                    // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  auto path = GlobalStatePath();
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return result;
+  }
+
+  GlobalLockFile header{};
+  in.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (static_cast<size_t>(in.gcount()) != sizeof(header)) {
+    result.tampered = true;
+    return result;
+  }
+
+  std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> stored_mac{};
+  in.read(reinterpret_cast<char*>(stored_mac.data()), stored_mac.size());
+  if (static_cast<size_t>(in.gcount()) != stored_mac.size()) {
+    result.tampered = true;
+    return result;
+  }
+
+  if (qv::FromLittleEndian32(header.version_le) != kGlobalLockFileVersion) {
+    result.tampered = true;
+    return result;
+  }
+
+  auto expected_mac = ComputeGlobalLockMac(header);
+  if (!std::equal(stored_mac.begin(), stored_mac.end(), expected_mac.begin(), expected_mac.end())) {
+    result.tampered = true;
+    return result;
+  }
+
+  GlobalState state{};
+  uint32_t failures = qv::FromLittleEndian32(header.failures_le);
+  if (failures > static_cast<uint32_t>(kMaxAttempts)) {
+    failures = static_cast<uint32_t>(kMaxAttempts);
+  }
+  state.state.failures = static_cast<int>(failures);
+  state.state.locked = qv::FromLittleEndian32(header.locked_le) != 0;
+  if (state.state.locked && state.state.failures < kMaxAttempts) {
+    state.state.failures = kMaxAttempts;
+  }
+  uint64_t last_epoch = qv::FromLittleEndian64(header.last_attempt_le);
+  if (last_epoch != 0) {
+    state.state.have_last_attempt = true;
+    state.state.last_attempt = SystemClock::time_point(std::chrono::seconds(last_epoch));
+  }
+  state.total_failures = qv::FromLittleEndian64(header.total_failures_le);
+  result.state = state;
+  return result;
+}
+
+void FailureTracker::PersistGlobalState(const GlobalState& state) const {
+  GlobalLockFile header{};                                                         // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  header.version_le = qv::ToLittleEndian(kGlobalLockFileVersion);
+  header.failures_le = qv::ToLittleEndian(static_cast<uint32_t>(std::min(state.state.failures, kMaxAttempts)));
+  uint64_t last_epoch = 0;
+  if (state.state.have_last_attempt) {
+    last_epoch = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                         state.state.last_attempt.time_since_epoch())
+                         .count());
+  }
+  header.last_attempt_le = qv::ToLittleEndian64(last_epoch);
+  header.locked_le = qv::ToLittleEndian(state.state.locked ? 1u : 0u);
+  header.total_failures_le = qv::ToLittleEndian64(state.total_failures);
+
+  auto mac = ComputeGlobalLockMac(header);
+  auto path = GlobalStatePath();
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                    std::string(qv::errors::msg::kPersistLockFileFailed)}; // TSK026, TSK136
+  }
+  out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  out.write(reinterpret_cast<const char*>(mac.data()), mac.size());
+  if (!out) {
+    throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                    std::string(qv::errors::msg::kPersistLockFileFailed)}; // TSK026, TSK136
+  }
+}
+
+std::filesystem::path FailureTracker::GlobalStatePath() const {
+  auto root = AllowedContainerRoot();                                              // TSK136
+  return root / ".qv_global_mount.lock";
+}
+
 VolumeUuid FailureTracker::NormalizeUuid(const std::optional<VolumeUuid>& uuid) {
   VolumeUuid normalized{};
   if (uuid) {
@@ -485,6 +838,15 @@ std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> FailureTracker::ComputeLo
   message.insert(message.end(), uuid.begin(), uuid.end());
   return qv::crypto::HMAC_SHA256::Compute(std::span<const uint8_t>(key.data(), key.size()),
                                           std::span<const uint8_t>(message.data(), message.size()));
+}
+
+std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> FailureTracker::ComputeGlobalLockMac(
+    const GlobalLockFile& header) {
+  static constexpr std::array<uint8_t, 16> kGlobalMacSalt = {
+      'Q', 'V', 'G', 'L', 'O', 'B', 'A', 'L', '_', 'L', 'O', 'C', 'K', '_', 'M', '1'}; // TSK136
+  return qv::crypto::HMAC_SHA256::Compute(
+      std::span<const uint8_t>(kGlobalMacSalt.data(), kGlobalMacSalt.size()),
+      qv::AsBytesConst(header));
 }
 
 // TSK004, TSK013
@@ -947,7 +1309,8 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   auto sanitized_container = SanitizeContainerPath(container);                // TSK099_Input_Validation_and_Sanitization
   auto& tracker = FailureTracker::Instance();                                 // TSK026
   auto volume_uuid = ReadVolumeUuid(sanitized_container);                     // TSK075_Lockout_Persistence_and_IPC
-  tracker.EnforceDelay(sanitized_container, volume_uuid);                     // TSK026, TSK075_Lockout_Persistence_and_IPC
+  auto client_fingerprint = ResolveClientFingerprint();                       // TSK136_Missing_Rate_Limiting_Mount_Attempts
+  tracker.EnforceDelay(sanitized_container, volume_uuid, client_fingerprint); // TSK026, TSK075, TSK136
 
   Attempt a, b;
   auto start = std::chrono::steady_clock::now();
@@ -975,7 +1338,8 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   uint32_t h2 = r2_ok ? CheckedCast<uint32_t>(r2->dummy) : 0;           // TSK099_Input_Validation_and_Sanitization
   uint32_t selected = qv::crypto::ct::Select<uint32_t>(h1, h2, (!r1_ok && r2_ok));
 
-  auto state = tracker.RecordAttempt(sanitized_container, volume_uuid, any_success); // TSK026, TSK075_Lockout_Persistence_and_IPC
+  auto state = tracker.RecordAttempt(sanitized_container, volume_uuid, any_success,
+                                     client_fingerprint); // TSK026, TSK075, TSK136
   if (!any_success) {
     Event event{};                                                // TSK026
     event.category = EventCategory::kSecurity;                    // TSK026
@@ -990,6 +1354,26 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
                               FieldPrivacy::kPublic, true); // TSK026
     event.fields.emplace_back("cooldown_seconds", std::to_string(state.enforced_delay.count()),
                               FieldPrivacy::kPublic, true); // TSK026
+    event.fields.emplace_back("global_consecutive_failures",
+                              std::to_string(state.global_failures), FieldPrivacy::kPublic,
+                              true); // TSK136_Missing_Rate_Limiting_Mount_Attempts
+    event.fields.emplace_back("global_cooldown_seconds",
+                              std::to_string(state.global_enforced_delay.count()),
+                              FieldPrivacy::kPublic, true); // TSK136
+    event.fields.emplace_back("global_total_failures",
+                              std::to_string(state.global_total_failures), FieldPrivacy::kPublic,
+                              true); // TSK136
+    if (!state.client_fingerprint.empty()) {
+      event.fields.emplace_back("client_fingerprint", state.client_fingerprint,
+                                FieldPrivacy::kHash, true); // TSK136
+    }
+    if (state.client_failures > 0) {
+      event.fields.emplace_back("client_failures", std::to_string(state.client_failures),
+                                FieldPrivacy::kPublic, true); // TSK136
+      event.fields.emplace_back("client_cooldown_seconds",
+                                std::to_string(state.client_enforced_delay.count()),
+                                FieldPrivacy::kPublic, true); // TSK136
+    }
     event.fields.emplace_back("locked", state.locked ? "true" : "false", FieldPrivacy::kPublic);
     EventBus::Instance().Publish(event); // TSK026
   }
