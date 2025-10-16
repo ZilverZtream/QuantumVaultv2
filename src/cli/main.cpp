@@ -15,7 +15,6 @@
 #include <iostream>
 #include <memory>   // TSK082_Backup_Verification_and_Schema
 #include <optional>
-#include <random>  // TSK028_Secure_Deletion_and_Data_Remanence
 #include <span>    // TSK028_Secure_Deletion_and_Data_Remanence
 #include <sstream> // TSK028_Secure_Deletion_and_Data_Remanence
 #include <string>
@@ -25,6 +24,7 @@
 
 #include <openssl/evp.h> // TSK082_Backup_Verification_and_Schema
 
+#include "qv/crypto/random.h" // TSK124_Insecure_Randomness_Usage use platform RNG for secure overwrite
 #ifndef QV_SENSITIVE_FUNCTION  // TSK028A_Memory_Wiping_Gaps
 #if defined(_MSC_VER)
 #define QV_SENSITIVE_BEGIN __pragma(optimize("", off))
@@ -958,13 +958,36 @@ namespace {
   }
 #endif
 
-  void FillRandomBuffer(std::span<uint8_t> out,
-                        std::mt19937_64& gen) { // TSK028_Secure_Deletion_and_Data_Remanence
-    size_t idx = 0;
-    while (idx < out.size()) {
-      auto value = gen();
-      for (size_t j = 0; j < sizeof(value) && idx < out.size(); ++j, ++idx) {
-        out[idx] = static_cast<uint8_t>((value >> (j * 8)) & 0xFF);
+  void OverwriteSecure(int fd, std::uintmax_t size,
+                       const std::filesystem::path& container) { // TSK124_Insecure_Randomness_Usage
+    std::vector<uint8_t> buffer(4096);
+    constexpr int kOverwritePasses = 7;
+    for (int pass = 0; pass < kOverwritePasses; ++pass) {
+      if (!NativeSeek(fd, 0)) {
+        throw qv::Error{qv::ErrorDomain::IO, errno,
+                        "Failed to seek during destruction: " + SanitizePath(container)};
+      }
+      std::uintmax_t remaining = size;
+      while (remaining > 0) {
+        const size_t chunk =
+            static_cast<size_t>(std::min<std::uintmax_t>(remaining, buffer.size()));
+        qv::crypto::SystemRandomBytes(
+            std::span<uint8_t>(buffer.data(), chunk)); // TSK124_Insecure_Randomness_Usage fresh entropy per chunk
+        size_t written_total = 0;
+        while (written_total < chunk) {
+          const std::ptrdiff_t wrote =
+              NativeWrite(fd, buffer.data() + written_total, chunk - written_total);
+          if (wrote <= 0) {
+            throw qv::Error{qv::ErrorDomain::IO, errno,
+                            "Failed to overwrite container: " + SanitizePath(container)};
+          }
+          written_total += static_cast<size_t>(wrote);
+        }
+        remaining -= chunk;
+      }
+      if (NativeFsync(fd) != 0) {
+        throw qv::Error{qv::ErrorDomain::IO, errno,
+                        "Failed to flush overwrite pass: " + SanitizePath(container)};
       }
     }
   }
@@ -1836,38 +1859,7 @@ namespace {
       }
     } guard{fd};
 
-    std::vector<uint8_t> buffer(4096);
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    constexpr int kOverwritePasses = 7;
-
-    for (int pass = 0; pass < kOverwritePasses; ++pass) {
-      if (!NativeSeek(fd, 0)) {
-        throw qv::Error{qv::ErrorDomain::IO, errno,
-                        "Failed to seek during destruction: " + SanitizePath(container)};
-      }
-      std::uintmax_t remaining = size;
-      while (remaining > 0) {
-        const size_t chunk =
-            static_cast<size_t>(std::min<std::uintmax_t>(remaining, buffer.size()));
-        FillRandomBuffer(std::span<uint8_t>(buffer.data(), chunk), gen);
-        size_t written_total = 0;
-        while (written_total < chunk) {
-          const std::ptrdiff_t wrote =
-              NativeWrite(fd, buffer.data() + written_total, chunk - written_total);
-          if (wrote <= 0) {
-            throw qv::Error{qv::ErrorDomain::IO, errno,
-                            "Failed to overwrite container: " + SanitizePath(container)};
-          }
-          written_total += static_cast<size_t>(wrote);
-        }
-        remaining -= chunk;
-      }
-      if (NativeFsync(fd) != 0) {
-        throw qv::Error{qv::ErrorDomain::IO, errno,
-                        "Failed to flush overwrite pass: " + SanitizePath(container)};
-      }
-    }
+    OverwriteSecure(fd, size, container); // TSK124_Insecure_Randomness_Usage centralized secure wipe
 
     if (NativeClose(fd) != 0) {
       throw qv::Error{qv::ErrorDomain::IO, errno,

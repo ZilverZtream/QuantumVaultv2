@@ -1,6 +1,7 @@
 #include "qv/core/nonce.h"
 #include "qv/crypto/hmac_sha256.h"
 #include "qv/crypto/provider.h" // TSK072_CryptoProvider_Init_and_KAT reuse provider runtime init
+#include "qv/crypto/random.h"   // TSK124_Insecure_Randomness_Usage provide OS randomness fallback
 #include "qv/error.h"
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include <thread>      // TSK101_File_IO_Persistence_and_Atomicity retry backoff
 #include <type_traits> // TSK100_Integer_Overflow_and_Arithmetic checked casts
 #include <vector>
+#include <span>        // TSK124_Insecure_Randomness_Usage span adapter for RNG inputs
 
 // TSK021_Nonce_Log_Durability_and_Crash_Safety introduce explicit fsync helpers and
 // platform-specific primitives.
@@ -500,28 +502,79 @@ namespace {
     return HMAC_SHA256::Compute(key, qv::AsBytes(input));
   }
 
+  template <typename Fn>
+  bool TryRngProvider(Fn&& fn, std::vector<std::string>& failures) { // TSK124_Insecure_Randomness_Usage iterate RNG options
+    try {
+      fn();
+      return true;
+    } catch (const Error& err) {
+      failures.emplace_back(err.what());
+    } catch (const std::exception& ex) {
+      failures.emplace_back(ex.what());
+    }
+    return false;
+  }
+
+  void GenerateKey(std::array<uint8_t, kMacSize>& key) { // TSK124_Insecure_Randomness_Usage resilient RNG selection
+    std::vector<std::string> failures;
 #if QV_HAVE_SODIUM
-  void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-    qv::crypto::EnsureCryptoProviderInitialized(); // TSK072_CryptoProvider_Init_and_KAT single runtime init
-    randombytes_buf(key.data(), key.size());       // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
-  }
-#elif defined(_WIN32)
-  void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-    const NTSTATUS status = BCryptGenRandom(nullptr, key.data(), static_cast<ULONG>(key.size()),
-                                            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (!BCRYPT_SUCCESS(status)) {
-      throw Error{ErrorDomain::Security, static_cast<int>(status),
-                  "BCryptGenRandom failed"}; // TSK016_Windows_Compatibility_Fixes
+    if (TryRngProvider(
+            [&]() {
+              qv::crypto::EnsureCryptoProviderInitialized(); // TSK072_CryptoProvider_Init_and_KAT single runtime init
+              randombytes_buf(key.data(), key.size());       // TSK023_Production_Crypto_Provider_Complete_Integration libsodium RNG
+            },
+            failures)) {
+      return;
     }
-  }
-#else
-  void GenerateKey(std::array<uint8_t, kMacSize>& key) {
-    if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
-      auto err = static_cast<int>(ERR_get_error());
-      throw Error{ErrorDomain::Security, err, "RAND_bytes failed"}; // TSK023_Production_Crypto_Provider_Complete_Integration OpenSSL RNG
-    }
-  }
 #endif
+    if (TryRngProvider(
+            [&]() {
+              qv::crypto::SystemRandomBytes(std::span<uint8_t>(key.data(), key.size()));
+            },
+            failures)) {
+      return;
+    }
+#if defined(_WIN32)
+    if (TryRngProvider(
+            [&]() {
+              const NTSTATUS status = BCryptGenRandom(nullptr, key.data(),
+                                                      static_cast<ULONG>(key.size()),
+                                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+              if (!BCRYPT_SUCCESS(status)) {
+                throw Error{ErrorDomain::Security, static_cast<int>(status),
+                            "BCryptGenRandom failed"}; // TSK016_Windows_Compatibility_Fixes explicit fallback
+              }
+            },
+            failures)) {
+      return;
+    }
+#else
+    if (TryRngProvider(
+            [&]() {
+              if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
+                const auto err = static_cast<int>(ERR_get_error());
+                throw Error{ErrorDomain::Security, err,
+                            "RAND_bytes failed"}; // TSK023_Production_Crypto_Provider_Complete_Integration OpenSSL RNG fallback
+              }
+            },
+            failures)) {
+      return;
+    }
+#endif
+
+    std::string message =
+        "Failed to generate nonce log key using available RNG providers"; // TSK124_Insecure_Randomness_Usage
+    if (!failures.empty()) {
+      message.append(": ");
+      for (size_t i = 0; i < failures.size(); ++i) {
+        if (i != 0) {
+          message.append("; ");
+        }
+        message.append(failures[i]);
+      }
+    }
+    throw Error{ErrorDomain::Security, 0, message};
+  }
 
   std::vector<uint8_t> SerializeHeader(uint32_t version, std::span<const char, 8> magic,
                                        std::span<const uint8_t, kMacSize> key) {
