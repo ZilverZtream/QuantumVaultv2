@@ -4,8 +4,88 @@
 #include <cassert>  // TSK108_Data_Structure_Invariants
 #include <iterator> // TSK105_Resource_Leaks_and_Lifecycle
 #include <mutex> // TSK067_Nonce_Safety
+#include <utility> // TSK113_Performance_and_Scalability batching helpers
 
 namespace qv::storage {
+
+namespace {
+
+class FlushBufferPool { // TSK113_Performance_and_Scalability reuse staging buffers
+ public:
+  std::vector<uint8_t> Acquire(size_t size) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = buffers_.begin(); it != buffers_.end(); ++it) {
+      if (it->capacity() >= size) {
+        auto buffer = std::move(*it);
+        buffers_.erase(it);
+        buffer.resize(size);
+        return buffer;
+      }
+    }
+    return std::vector<uint8_t>(size);
+  }
+
+  void Release(std::vector<uint8_t> buffer) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    buffer.clear();
+    buffers_.push_back(std::move(buffer));
+  }
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::vector<uint8_t>> buffers_;
+};
+
+FlushBufferPool& SharedFlushPool() {
+  static FlushBufferPool pool;
+  return pool;
+}
+
+void FlushDirtyOutsideLock(std::vector<std::shared_ptr<CachedChunk>>& chunks,
+                           const std::function<void(int64_t, const std::vector<uint8_t>&)>& callback,
+                           bool preserve_chunk_storage) {
+  if (!callback || chunks.empty()) {
+    chunks.clear();
+    return;
+  }
+
+  std::sort(chunks.begin(), chunks.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs->chunk_idx < rhs->chunk_idx;
+  });
+
+  auto& pool = SharedFlushPool();
+  size_t index = 0;
+  while (index < chunks.size()) {
+    size_t run_end = index + 1;
+    while (run_end < chunks.size() &&
+           chunks[run_end]->chunk_idx == chunks[run_end - 1]->chunk_idx + 1) {
+      ++run_end;
+    }
+
+    for (size_t i = index; i < run_end; ++i) {
+      auto chunk = std::move(chunks[i]);
+      if (!chunk) {
+        continue;
+      }
+      const auto chunk_index = chunk->chunk_idx;
+      std::vector<uint8_t> buffer;
+      if (!preserve_chunk_storage && chunk.use_count() == 1) { // TSK113_Performance_and_Scalability reuse eviction storage
+        buffer = std::move(chunk->data);
+      } else {
+        buffer = pool.Acquire(chunk->data.size());
+        std::copy(chunk->data.begin(), chunk->data.end(), buffer.begin());
+      }
+      callback(chunk_index, buffer);
+      pool.Release(std::move(buffer));
+    }
+
+    index = run_end;
+  }
+
+  chunks.clear();
+}
+
+}  // namespace
 
 // TSK064_Performance_Optimization_and_Caching
 ChunkCache::ChunkCache(size_t max_size) : max_size_(max_size) {}
@@ -61,9 +141,7 @@ std::shared_ptr<CachedChunk> ChunkCache::Put(int64_t chunk_idx,
   }
 
   if (callback) {
-    for (const auto& chunk : to_flush) {
-      callback(chunk->chunk_idx, chunk->data);
-    }
+    FlushDirtyOutsideLock(to_flush, callback, false); // TSK113_Performance_and_Scalability staged eviction writes
   }
 
   return inserted;
@@ -116,12 +194,13 @@ void ChunkCache::Flush(std::function<void(int64_t, const std::vector<uint8_t>&)>
     CheckInvariantsLocked();
   }
 
-  std::sort(dirty_chunks.begin(), dirty_chunks.end(),
-            [](const DirtyEntry& lhs, const DirtyEntry& rhs) { return lhs.index < rhs.index; });
-
-  for (const auto& entry : dirty_chunks) {
-    write_fn(entry.index, entry.chunk->data);
+  std::vector<std::shared_ptr<CachedChunk>> flush_chunks;
+  flush_chunks.reserve(dirty_chunks.size());
+  for (auto& entry : dirty_chunks) {
+    flush_chunks.push_back(std::move(entry.chunk));
   }
+
+  FlushDirtyOutsideLock(flush_chunks, write_fn, true); // TSK113_Performance_and_Scalability batched flush staging
 }
 
 void ChunkCache::SetWriteBackCallback(
