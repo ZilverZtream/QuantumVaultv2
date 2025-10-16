@@ -268,6 +268,109 @@ namespace {
     return fallback;
   }
 
+#if !defined(_WIN32)
+  void RequireOwnedDirectory(const std::filesystem::path& dir) { // TSK146_Permission_And_Ownership_Issues ensure trusted parents
+    const auto native = dir.native();
+    struct stat info {
+    };
+    if (::lstat(native.c_str(), &info) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to inspect directory ownership: " + SanitizePath(dir)};
+    }
+    if (!S_ISDIR(info.st_mode)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Parent path is not a directory: " + SanitizePath(dir)};
+    }
+    if (info.st_uid != ::geteuid()) {
+      throw qv::Error{qv::ErrorDomain::Security, 0,
+                      "Parent directory ownership mismatch: " + SanitizePath(dir)};
+    }
+    if ((info.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+      throw qv::Error{qv::ErrorDomain::Security, 0,
+                      "Parent directory must not be group/world writable: " + SanitizePath(dir)};
+    }
+  }
+#endif
+
+  void EnsureDirectorySecure(const std::filesystem::path& dir) { // TSK146_Permission_And_Ownership_Issues reject unsafe parents
+    if (dir.empty()) {
+      return;
+    }
+    std::error_code status_ec;
+    auto status = std::filesystem::symlink_status(dir, status_ec);
+    if (status_ec) {
+      throw qv::Error{qv::ErrorDomain::IO, status_ec.value(),
+                      "Failed to inspect parent directory: " + SanitizePath(dir)};
+    }
+    if (!std::filesystem::exists(status)) {
+      return;
+    }
+    if (!std::filesystem::is_directory(status)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Parent path is not a directory: " + SanitizePath(dir)};
+    }
+#if defined(_WIN32)
+    if (std::filesystem::is_symlink(status)) {
+      throw qv::Error{qv::ErrorDomain::Security, 0,
+                      "Refusing to use symlink parent directory: " + SanitizePath(dir)};
+    }
+#else
+    RequireOwnedDirectory(dir);
+#endif
+  }
+
+  void EnsureSecureParentDirectory(const std::filesystem::path& path) { // TSK146_Permission_And_Ownership_Issues guard ancestry
+    if (!path.has_parent_path()) {
+      return;
+    }
+    EnsureDirectorySecure(path.parent_path());
+  }
+
+  void HardenDirectoryPermissions(const std::filesystem::path& dir) { // TSK146_Permission_And_Ownership_Issues enforce 0700
+    if (dir.empty()) {
+      return;
+    }
+#if defined(_WIN32)
+    if (_wchmod(dir.c_str(), _S_IREAD | _S_IWRITE | _S_IEXEC) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to restrict directory permissions: " + SanitizePath(dir)};
+    }
+#else
+    std::error_code perm_ec;
+    std::filesystem::permissions(dir,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write |
+                                     std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::replace, perm_ec);
+    if (perm_ec) {
+      throw qv::Error{qv::ErrorDomain::IO, perm_ec.value(),
+                      "Failed to restrict directory permissions: " + SanitizePath(dir)};
+    }
+#endif
+  }
+
+  void HardenFilePermissions(const std::filesystem::path& path) { // TSK146_Permission_And_Ownership_Issues enforce 0600
+#if defined(_WIN32)
+    if (_wchmod(path.c_str(), _S_IREAD | _S_IWRITE) != 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to restrict file permissions: " + SanitizePath(path)};
+    }
+#else
+    std::error_code perm_ec;
+    std::filesystem::permissions(path,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, perm_ec);
+    if (perm_ec) {
+      throw qv::Error{qv::ErrorDomain::IO, perm_ec.value(),
+                      "Failed to restrict file permissions: " + SanitizePath(path)};
+    }
+#endif
+  }
+
   int OpenFileForWrite(const std::filesystem::path& path) { // TSK143_Missing_Fsync_And_Durability_Issues platform-safe open
 #if defined(_WIN32)
     const std::wstring native = path.wstring();
@@ -511,6 +614,7 @@ namespace {
 
   [[maybe_unused]] void EnsureCredentialDir(const std::filesystem::path& container) { // TSK035_Platform_Specific_Security_Integration
     auto metadata = MetadataDirFor(container);
+    EnsureSecureParentDirectory(metadata); // TSK146_Permission_And_Ownership_Issues validate ancestry
     std::error_code ec;
     std::filesystem::create_directories(metadata, ec);
     if (ec) {
@@ -519,10 +623,13 @@ namespace {
                           SanitizePath(metadata),
                       static_cast<int>(ec.value())};
     }
+    HardenDirectoryPermissions(metadata); // TSK146_Permission_And_Ownership_Issues enforce 0700 metadata dir
+    EnsureDirectorySecure(metadata);      // TSK146_Permission_And_Ownership_Issues re-validate after creation
   }
 
   [[maybe_unused]] void WriteBinaryFile(const std::filesystem::path& path, // TSK035_Platform_Specific_Security_Integration
                                         std::span<const uint8_t> data) {
+    EnsureSecureParentDirectory(path); // TSK146_Permission_And_Ownership_Issues refuse unsafe parents
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
       throw qv::Error{qv::ErrorDomain::IO, kCredentialPersistFailed,
@@ -533,6 +640,8 @@ namespace {
       throw qv::Error{qv::ErrorDomain::IO, kCredentialPersistFailed,
                       "Failed to write credential blob: " + SanitizePath(path)};
     }
+    out.close();
+    HardenFilePermissions(path); // TSK146_Permission_And_Ownership_Issues enforce 0600 credential cache
   }
 
   [[maybe_unused]] std::vector<uint8_t> ReadBinaryFile(const std::filesystem::path& path) { // TSK035_Platform_Specific_Security_Integration
@@ -2160,8 +2269,30 @@ namespace {
             std::cerr << "I/O error: Cannot prepare backup key directory." << std::endl;
             return kExitIO;
           }
+          try {
+            HardenDirectoryPermissions(parent); // TSK146_Permission_And_Ownership_Issues tighten new directory
+            EnsureDirectorySecure(parent);      // TSK146_Permission_And_Ownership_Issues ensure trusted owner
+          } catch (const qv::Error& err) {
+            if (err.domain() == qv::ErrorDomain::IO) {
+              std::cerr << "I/O error: " << err.what() << std::endl;
+              return kExitIO;
+            }
+            std::cerr << "Validation error: " << err.what() << std::endl;
+            return kExitUsage;
+          }
         } else if (!std::filesystem::is_directory(parent_status)) {
           std::cerr << "Validation error: Backup key parent is not a directory." << std::endl;
+          return kExitUsage;
+        }
+        try {
+          EnsureDirectorySecure(parent);   // TSK146_Permission_And_Ownership_Issues reject weak parent perms
+          HardenDirectoryPermissions(parent); // TSK146_Permission_And_Ownership_Issues enforce owner-only access
+        } catch (const qv::Error& err) {
+          if (err.domain() == qv::ErrorDomain::IO) {
+            std::cerr << "I/O error: " << err.what() << std::endl;
+            return kExitIO;
+          }
+          std::cerr << "Validation error: " << err.what() << std::endl;
           return kExitUsage;
         }
       }
@@ -2259,7 +2390,15 @@ namespace {
     (void)legacy_log; // ensures verification during construction
 
     auto metadata_dir = MetadataDirFor(container);
-    std::filesystem::create_directories(metadata_dir);
+    EnsureSecureParentDirectory(metadata_dir); // TSK146_Permission_And_Ownership_Issues validate metadata ancestry
+    try {
+      std::filesystem::create_directories(metadata_dir);
+    } catch (const std::filesystem::filesystem_error& err) {
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                      "Failed to prepare metadata directory: " + SanitizePath(metadata_dir)};
+    }
+    HardenDirectoryPermissions(metadata_dir); // TSK146_Permission_And_Ownership_Issues ensure private metadata
+    EnsureDirectorySecure(metadata_dir);      // TSK146_Permission_And_Ownership_Issues re-check metadata security
     auto target = MetadataNonceLogPath(container);
 
     std::error_code ec;
@@ -2324,12 +2463,15 @@ namespace {
     }
 #endif
 
+    EnsureSecureParentDirectory(output_dir); // TSK146_Permission_And_Ownership_Issues refuse shared parents
     try {
       std::filesystem::create_directories(output_dir);
     } catch (const std::filesystem::filesystem_error& err) {
       throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
                       "Failed to prepare backup directory: " + SanitizePath(output_dir)};
     }
+    HardenDirectoryPermissions(output_dir); // TSK146_Permission_And_Ownership_Issues enforce 0700 backups
+    EnsureDirectorySecure(output_dir);      // TSK146_Permission_And_Ownership_Issues confirm directory integrity
 
     const auto probe_path = output_dir / ".qv_backup_write_test"; // TSK129_Unvalidated_User_Input_in_CLI
     {
@@ -2347,19 +2489,6 @@ namespace {
       std::error_code remove_ec;
       std::filesystem::remove(probe_path, remove_ec);
     }
-
-#if !defined(_WIN32)
-    try {
-      std::filesystem::permissions(
-          output_dir,
-          std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
-              std::filesystem::perms::owner_exec,
-          std::filesystem::perm_options::replace);
-    } catch (const std::filesystem::filesystem_error& err) {
-      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
-                      "Failed to secure backup directory: " + SanitizePath(output_dir)};
-    }
-#endif
 
     auto container_backup = output_dir / container.filename();
     auto staged_container = container_backup;
