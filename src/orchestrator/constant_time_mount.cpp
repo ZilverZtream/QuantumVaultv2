@@ -300,7 +300,7 @@ public:
     bool have_client = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      const auto key = qv::PathToUtf8String(container);
+      const auto key = BuildAttemptKey(container, uuid); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities canonicalize alias attempts
       state = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
       global_snapshot = LoadGlobalStateLocked(now, have_global_gate);
       if (client_fingerprint) {
@@ -365,7 +365,7 @@ public:
 
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      const auto key = qv::PathToUtf8String(container);
+      const auto key = BuildAttemptKey(container, uuid); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities canonicalize alias attempts
       auto& entry = attempts_[key];
       snapshot = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
       global_snapshot = LoadGlobalStateLocked(now, have_global_gate);
@@ -450,7 +450,7 @@ private:
   };
 
   static constexpr auto kMinDelay = std::chrono::seconds(3);
-  static constexpr auto kMaxDelay = std::chrono::minutes(15); // TSK136_Missing_Rate_Limiting_Mount_Attempts increased backoff cap
+  static constexpr auto kMaxDelay = std::chrono::hours(4); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities extended backoff horizon
   static constexpr int kMaxAttempts = 5;
   static constexpr uint32_t kLockFileVersion = 1;                                   // TSK075_Lockout_Persistence_and_IPC
   static constexpr uint32_t kGlobalLockFileVersion = 1;                             // TSK136
@@ -485,6 +485,8 @@ private:
   std::filesystem::path GlobalStatePath() const;
 
   static VolumeUuid NormalizeUuid(const std::optional<VolumeUuid>& uuid);
+  static std::string BuildAttemptKey(const std::filesystem::path& container,
+                                     const VolumeUuid& uuid); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities container alias hardening
   static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> DeriveMacKey(const VolumeUuid& uuid);
   static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> ComputeLockMac(const LockFileHeader& header,
                                                                                const VolumeUuid& uuid);
@@ -820,6 +822,22 @@ VolumeUuid FailureTracker::NormalizeUuid(const std::optional<VolumeUuid>& uuid) 
   return normalized;
 }
 
+std::string FailureTracker::BuildAttemptKey(const std::filesystem::path& container,
+                                            const VolumeUuid& uuid) {
+  auto lock_key = LockFilePath(container).lexically_normal().generic_string();
+#if defined(_WIN32)
+  std::transform(lock_key.begin(), lock_key.end(), lock_key.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+#endif
+  const bool have_uuid = std::any_of(uuid.begin(), uuid.end(), [](uint8_t byte) { return byte != 0; });
+  if (have_uuid) {
+    lock_key.push_back('#');
+    lock_key.append(HexEncode(std::span<const uint8_t>(uuid.data(), uuid.size()))); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities stabilize key material
+  }
+  return lock_key;
+}
+
 std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> FailureTracker::DeriveMacKey(
     const VolumeUuid& uuid) {
   static constexpr std::array<uint8_t, 16> kMacSalt = {'Q', 'V', 'L', 'O', 'C', 'K', '_', 'H',
@@ -873,6 +891,7 @@ constexpr size_t kHybridSaltSize = 32;
 constexpr size_t kHeaderMacSize = qv::crypto::HMAC_SHA256::TAG_SIZE;
 constexpr size_t kMaxTlvPayloadBytes = 64 * 1024 - 1;                           // TSK095_Memory_Safety_and_Buffer_Bounds
 static_assert(kMaxTlvPayloadBytes < 64 * 1024, "TLV payload limit too large"); // TSK095_Memory_Safety_and_Buffer_Bounds
+constexpr size_t kMaxHeaderTlvs = 16;                                            // TSK138_Rate_Limiting_And_DoS_Vulnerabilities bound parsing fan-out
 
 #pragma pack(push, 1)
 struct VolumeHeader { // TSK013
@@ -955,13 +974,18 @@ ParsedHeader ParseHeader(std::span<const uint8_t> bytes) { // TSK013
     return parsed;
   }
 
-  qv::tlv::Parser parser(bytes.subspan(offset), 64, kMaxTlvPayloadBytes);
+  qv::tlv::Parser parser(bytes.subspan(offset), kMaxHeaderTlvs, kMaxTlvPayloadBytes); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities tighten TLV bound
   if (!parser.valid()) {
     parsed.valid = false;
     return parsed;
   }
 
+  size_t processed_records = 0;                                                   // TSK138_Rate_Limiting_And_DoS_Vulnerabilities
   for (const auto& record : parser) {
+    if (++processed_records > kMaxHeaderTlvs) {
+      parse_ok = false;
+      break;
+    }
     switch (record.type) {
       case kTlvTypePbkdf2: {
         const size_t expected = sizeof(uint32_t) + kPbkdfSaltSize;

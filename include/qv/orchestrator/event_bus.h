@@ -126,6 +126,8 @@ namespace qv::orchestrator {
     EventBus();
     void DispatchLoop(); // TSK081_EventBus_Throughput_and_Batching async publisher
     void StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching ensure background thread
+    void RefillSyslogTokensLocked(std::chrono::steady_clock::time_point now);      // TSK138_Rate_Limiting_And_DoS_Vulnerabilities token bucket refill
+    bool ConsumeSyslogTokenLocked(std::chrono::steady_clock::time_point now);      // TSK138_Rate_Limiting_And_DoS_Vulnerabilities rate limit enforcement
 
     using SubscriberList = std::vector<Subscriber>;
 
@@ -138,6 +140,9 @@ namespace qv::orchestrator {
     std::thread dispatcher_thread_;                  // TSK081_EventBus_Throughput_and_Batching background worker
     bool stop_dispatcher_{false};                    // TSK081_EventBus_Throughput_and_Batching lifecycle guard
     uint64_t dropped_syslog_streak_{0};              // TSK081_EventBus_Throughput_and_Batching backpressure logging
+    uint64_t syslog_tokens_{0};                      // TSK138_Rate_Limiting_And_DoS_Vulnerabilities rate bucket state
+    std::chrono::steady_clock::time_point syslog_last_token_refill_{}; // TSK138_Rate_Limiting_And_DoS_Vulnerabilities refill watermark
+    uint64_t throttled_syslog_streak_{0};            // TSK138_Rate_Limiting_And_DoS_Vulnerabilities throttle logging
 
     static constexpr size_t kMaxSyslogQueueDepth = 1024; // TSK081_EventBus_Throughput_and_Batching backpressure limit
     static constexpr size_t kMaxSyslogBatchSize = 32;     // TSK081_EventBus_Throughput_and_Batching batch size

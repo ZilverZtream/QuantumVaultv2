@@ -90,6 +90,9 @@ constexpr uint32_t kStateVersion = 1;                               // TSK079_Au
 constexpr uint32_t kDerivedKeyVersion = 1;                           // TSK079_Audit_Log_Integrity_Chain
 constexpr size_t kDerivedSaltSize = 32;                              // TSK079_Audit_Log_Integrity_Chain
 constexpr size_t kMaxSyslogDatagramBytes = 8 * 1024;                 // TSK081_EventBus_Throughput_and_Batching UDP safety margin
+constexpr size_t kSyslogThrottleBurst = 256;                         // TSK138_Rate_Limiting_And_DoS_Vulnerabilities burst allowance
+constexpr size_t kSyslogThrottleRatePerSecond = 64;                  // TSK138_Rate_Limiting_And_DoS_Vulnerabilities steady refill rate
+constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000ull;         // TSK138_Rate_Limiting_And_DoS_Vulnerabilities integral refill math
 
 uint32_t ToBigEndian32(uint32_t value) { // TSK079_Audit_Log_Integrity_Chain portable state encoding
   if (qv::kIsLittleEndian) {
@@ -1523,6 +1526,8 @@ EventBus::EventBus() { // TSK029
     std::atomic_store_explicit(&subscribers_snapshot_, std::const_pointer_cast<const SubscriberList>(initial),
                                std::memory_order_release);
   }
+  syslog_tokens_ = kSyslogThrottleBurst;                                 // TSK138_Rate_Limiting_And_DoS_Vulnerabilities initialize bucket
+  syslog_last_token_refill_ = std::chrono::steady_clock::now();          // TSK138_Rate_Limiting_And_DoS_Vulnerabilities timestamp baseline
   StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching begin async handling
 }
 
@@ -1533,6 +1538,9 @@ EventBus::~EventBus() { // TSK081_EventBus_Throughput_and_Batching
     pending_syslog_.clear();                    // TSK110_Initialization_and_Cleanup_Order clear queued work
     syslog_client_.reset();                     // TSK110_Initialization_and_Cleanup_Order release transport
     dropped_syslog_streak_ = 0;                 // TSK113_Performance_and_Scalability reset backpressure state
+    throttled_syslog_streak_ = 0;               // TSK138_Rate_Limiting_And_DoS_Vulnerabilities reset throttle streaks
+    syslog_tokens_ = kSyslogThrottleBurst;      // TSK138_Rate_Limiting_And_DoS_Vulnerabilities restore bucket baseline
+    syslog_last_token_refill_ = {};             // TSK138_Rate_Limiting_And_DoS_Vulnerabilities clear refill anchor
   }
   syslog_cv_.notify_all();
   if (dispatcher_thread_.joinable()) {
@@ -1552,6 +1560,45 @@ void EventBus::StartDispatcher() { // TSK081_EventBus_Throughput_and_Batching
   }
   stop_dispatcher_ = false;
   dispatcher_thread_ = std::thread([this]() { DispatchLoop(); });
+}
+
+void EventBus::RefillSyslogTokensLocked(std::chrono::steady_clock::time_point now) { // TSK138_Rate_Limiting_And_DoS_Vulnerabilities
+  if (syslog_last_token_refill_ == std::chrono::steady_clock::time_point{}) {
+    syslog_last_token_refill_ = now;
+    syslog_tokens_ = kSyslogThrottleBurst;
+    return;
+  }
+  if (now <= syslog_last_token_refill_) {
+    return;
+  }
+  const auto elapsed = now - syslog_last_token_refill_;
+  const auto elapsed_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+  const auto tokens = (elapsed_ns * kSyslogThrottleRatePerSecond) / kNanosecondsPerSecond;
+  if (tokens == 0) {
+    return;
+  }
+  syslog_tokens_ = std::min<uint64_t>(kSyslogThrottleBurst, syslog_tokens_ + tokens);
+  syslog_last_token_refill_ = now;
+}
+
+bool EventBus::ConsumeSyslogTokenLocked(std::chrono::steady_clock::time_point now) { // TSK138_Rate_Limiting_And_DoS_Vulnerabilities
+  RefillSyslogTokensLocked(now);
+  if (syslog_tokens_ == 0) {
+    ++throttled_syslog_streak_;
+    if (throttled_syslog_streak_ == 1) {
+      std::clog << "{\"event\":\"syslog_rate_limit\",\"state\":\"throttle\",\"count\":"
+                << throttled_syslog_streak_ << "}" << std::endl;
+    }
+    return false;
+  }
+  --syslog_tokens_;
+  if (throttled_syslog_streak_ > 0) {
+    std::clog << "{\"event\":\"syslog_rate_limit\",\"state\":\"recover\",\"count\":"
+              << throttled_syslog_streak_ << "}" << std::endl;
+    throttled_syslog_streak_ = 0;
+  }
+  return true;
 }
 
 void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
@@ -1618,12 +1665,15 @@ void EventBus::Publish(const Event& event) { // TSK029
   {
     std::lock_guard<std::mutex> guard(syslog_mutex_);
     if (syslog_client_) { // TSK081_EventBus_Throughput_and_Batching enqueue for async dispatch
+      const auto now = std::chrono::steady_clock::now();
       if (pending_syslog_.size() >= kMaxSyslogQueueDepth) {
         ++dropped_syslog_streak_;
         if (dropped_syslog_streak_ == 1) {
           std::clog << "{\"event\":\"syslog_backpressure\",\"state\":\"drop\",\"count\":"
                     << dropped_syslog_streak_ << "}" << std::endl;
         }
+      } else if (!ConsumeSyslogTokenLocked(now)) {
+        // Rate limiter logged the drop; subscribers still receive the event synchronously.
       } else {
         if (dropped_syslog_streak_ > 0) {
           std::clog << "{\"event\":\"syslog_backpressure\",\"state\":\"recover\",\"count\":"
@@ -1664,6 +1714,9 @@ bool EventBus::ConfigureSyslog(const std::string& host, uint16_t port, std::stri
   {
     std::lock_guard<std::mutex> guard(syslog_mutex_);
     syslog_client_ = std::move(client);
+    syslog_tokens_ = kSyslogThrottleBurst;                          // TSK138_Rate_Limiting_And_DoS_Vulnerabilities reset bucket
+    throttled_syslog_streak_ = 0;                                   // TSK138_Rate_Limiting_And_DoS_Vulnerabilities clear throttle streak
+    syslog_last_token_refill_ = std::chrono::steady_clock::now();   // TSK138_Rate_Limiting_And_DoS_Vulnerabilities refresh timestamp
   }
   StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching ensure worker active
   syslog_cv_.notify_one();
