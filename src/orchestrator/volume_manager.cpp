@@ -105,8 +105,18 @@ To CheckedCast(From value) { // TSK099_Input_Validation_and_Sanitization
   return static_cast<To>(value);
 }
 
-void ValidatePassword(const std::string& password) { // TSK135_Password_Complexity_Enforcement centralized enforcement
-  EnforcePasswordPolicy(password);
+void ValidatePassword(const std::string& password) { // TSK099_Input_Validation_and_Sanitization basic guards
+  constexpr size_t kMinPasswordLen = 8;
+  constexpr size_t kMaxPasswordLen = 1024;
+  const auto size = password.size();
+  if (size < kMinPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooShort)};
+  }
+  if (size > kMaxPasswordLen) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    std::string(qv::errors::msg::kPasswordTooLong)};
+  }
 }
 
 constexpr std::size_t kPasswordHistoryDepth = 5; // TSK135_Password_Complexity_Enforcement rotation window
@@ -954,6 +964,7 @@ QV_SENSITIVE_BEGIN
 QV_SENSITIVE_FUNCTION std::optional<ConstantTimeMount::VolumeHandle>
 VolumeManager::Create(const std::filesystem::path& container, const std::string& password) {
   ValidatePassword(password);                                                 // TSK099_Input_Validation_and_Sanitization
+  EnforcePasswordPolicy(password);                                           // TSK135_Password_Complexity_Enforcement enforce provisioning policy
   auto sanitized_container = SanitizeContainerPath(container);               // TSK099_Input_Validation_and_Sanitization
   if (std::filesystem::exists(sanitized_container)) {
     throw qv::Error{qv::ErrorDomain::Validation,
@@ -1118,6 +1129,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
                      std::optional<std::filesystem::path> backup_public_key) {
   ValidatePassword(current_password);                                           // TSK099_Input_Validation_and_Sanitization
   ValidatePassword(new_password);                                              // TSK099_Input_Validation_and_Sanitization
+  EnforcePasswordPolicy(new_password);                                        // TSK135_Password_Complexity_Enforcement enforce provisioning policy
   auto sanitized_container = SanitizeContainerPath(container);                 // TSK099_Input_Validation_and_Sanitization
   if (!std::filesystem::exists(sanitized_container)) { // TSK024_Key_Rotation_and_Lifecycle_Management
     throw qv::Error{qv::ErrorDomain::IO, qv::errors::io::kContainerMissing,
