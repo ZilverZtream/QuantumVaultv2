@@ -491,15 +491,26 @@ namespace {
 
   std::array<uint8_t, kMacSize> ComputeMac(std::span<const uint8_t, kMacSize> prev_mac,
                                            uint64_t counter,
-                                           std::span<const uint8_t, kMacSize> key) {
-    struct MACInput {
+                                           std::span<const uint8_t, kMacSize> key,
+                                           std::span<const uint8_t> binding) { // TSK128_Missing_AAD_Validation_in_Chunks bind ciphertext
+    struct MACHeader {
       std::array<uint8_t, kMacSize> previous;
       uint64_t counter_be;
+      uint16_t binding_size_le;
     };
-    MACInput input{};
-    std::copy(prev_mac.begin(), prev_mac.end(), input.previous.begin());
-    input.counter_be = qv::ToBigEndian(counter);
-    return HMAC_SHA256::Compute(key, qv::AsBytes(input));
+    if (binding.size() > std::numeric_limits<uint16_t>::max()) {
+      throw Error{ErrorDomain::Validation, 0, "Nonce binding too large"};
+    }
+    MACHeader header{};
+    std::copy(prev_mac.begin(), prev_mac.end(), header.previous.begin());
+    header.counter_be = qv::ToBigEndian(counter);
+    header.binding_size_le = qv::ToLittleEndian(static_cast<uint16_t>(binding.size()));
+    std::vector<uint8_t> mac_input;
+    mac_input.reserve(sizeof(MACHeader) + binding.size());
+    auto header_bytes = qv::AsBytesConst(header);
+    mac_input.insert(mac_input.end(), header_bytes.begin(), header_bytes.end());
+    mac_input.insert(mac_input.end(), binding.begin(), binding.end());
+    return HMAC_SHA256::Compute(key, mac_input);
   }
 
   template <typename Fn>
@@ -883,35 +894,38 @@ void NonceLog::PersistUnlocked() {
   loaded_ = true;
 }
 
-std::array<uint8_t, 32> NonceLog::Append(uint64_t counter) {
+std::array<uint8_t, 32> NonceLog::Append(uint64_t counter,
+                                         std::span<const uint8_t> binding) {
   std::lock_guard<std::mutex> lock(mu_);
   EnsureLoadedUnlocked();
   if (!entries_.empty() && counter <= entries_.back().counter) {
     throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
   }
-  auto mac = ComputeMac(last_mac_, counter, key_);
+  auto mac = ComputeMac(last_mac_, counter, key_, binding);
   entries_.push_back(LogEntry{counter, mac});
   last_mac_ = mac;
   PersistUnlocked();
   return mac; // TSK014
 }
 
-std::array<uint8_t, 32> NonceLog::Preview(uint64_t counter) {
+std::array<uint8_t, 32> NonceLog::Preview(uint64_t counter,
+                                          std::span<const uint8_t> binding) {
   std::lock_guard<std::mutex> lock(mu_);
   EnsureLoadedUnlocked();
   if (!entries_.empty() && counter <= entries_.back().counter) {
     throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
   }
-  return ComputeMac(last_mac_, counter, key_); // TSK118_Nonce_Reuse_Vulnerabilities
+  return ComputeMac(last_mac_, counter, key_, binding); // TSK118_Nonce_Reuse_Vulnerabilities
 }
 
-void NonceLog::Commit(uint64_t counter, std::span<const uint8_t, 32> mac) {
+void NonceLog::Commit(uint64_t counter, std::span<const uint8_t, 32> mac,
+                      std::span<const uint8_t> binding) {
   std::lock_guard<std::mutex> lock(mu_);
   EnsureLoadedUnlocked();
   if (!entries_.empty() && counter <= entries_.back().counter) {
     throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
   }
-  auto expected = ComputeMac(last_mac_, counter, key_);
+  auto expected = ComputeMac(last_mac_, counter, key_, binding);
   if (!std::equal(expected.begin(), expected.end(), mac.begin(), mac.end())) {
     throw Error{ErrorDomain::Validation, 0, "Nonce MAC mismatch"}; // TSK118_Nonce_Reuse_Vulnerabilities
   }

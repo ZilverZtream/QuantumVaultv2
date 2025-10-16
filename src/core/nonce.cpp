@@ -61,7 +61,8 @@ NonceGenerator::RekeyReason NonceGenerator::DetermineRekeyReason(
   return RekeyReason::kNone;
 }
 
-NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated(int64_t chunk_index) {
+NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated(int64_t chunk_index,
+                                                             std::span<const uint8_t> binding) {
   std::lock_guard<std::mutex> lock(state_mutex_); // TSK067_Nonce_Safety
   auto monotonic_now = std::chrono::steady_clock::now(); // TSK118_Nonce_Reuse_Vulnerabilities
   if (counter_ == std::numeric_limits<uint64_t>::max()) { // TSK067_Nonce_Safety
@@ -94,6 +95,11 @@ NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated(int64_t chunk_inde
     if (recycled != recycled_.end()) {
       NonceRecord record = recycled->second;
       record.chunk_index = chunk_index; // TSK118_Nonce_Reuse_Vulnerabilities ensure binding stays explicit
+      if (binding.size() != record.binding_size ||
+          !std::equal(binding.begin(), binding.end(), record.binding.begin(),
+                      record.binding.begin() + record.binding_size)) {
+        throw Error{ErrorDomain::Validation, 0, "Nonce binding mismatch"};
+      }
       recycled_.erase(recycled);
       inflight_[record.counter] = record;
       return record;
@@ -106,13 +112,20 @@ NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated(int64_t chunk_inde
   NonceRecord record{}; // TSK014
   record.counter = next; // TSK014
   record.nonce = MakeNonceBytes(epoch_, next); // TSK015
+  if (!binding.empty()) {
+    if (binding.size() > record.binding.size()) {
+      throw Error{ErrorDomain::Validation, 0, "Nonce binding too large"};
+    }
+    std::copy(binding.begin(), binding.end(), record.binding.begin());
+    record.binding_size = static_cast<uint8_t>(binding.size());
+  }
   record.chunk_index = chunk_index; // TSK118_Nonce_Reuse_Vulnerabilities
   if (chunk_index == kUnboundChunkIndex) {
-    record.mac = log_.Append(next); // TSK014 legacy immediate commit
+    record.mac = log_.Append(next, binding); // TSK014 legacy immediate commit
     return record; // TSK014
   }
 
-  record.mac = log_.Preview(next); // TSK118_Nonce_Reuse_Vulnerabilities defer commit until success
+  record.mac = log_.Preview(next, binding); // TSK118_Nonce_Reuse_Vulnerabilities defer commit until success
   inflight_[record.counter] = record; // TSK118_Nonce_Reuse_Vulnerabilities
   return record; // TSK014
 }
@@ -177,6 +190,11 @@ void NonceGenerator::ReleaseNonce(const NonceRecord& record) { // TSK118_Nonce_R
       !std::equal(it->second.mac.begin(), it->second.mac.end(), record.mac.begin(), record.mac.end())) {
     throw Error{ErrorDomain::Validation, 0, "Nonce reservation mismatch"};
   }
+  if (it->second.binding_size != record.binding_size ||
+      !std::equal(it->second.binding.begin(), it->second.binding.begin() + it->second.binding_size,
+                  record.binding.begin(), record.binding.begin() + record.binding_size)) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce binding mismatch"};
+  }
   recycled_[record.chunk_index] = it->second;
   inflight_.erase(it);
 }
@@ -194,7 +212,13 @@ void NonceGenerator::CommitNonce(const NonceRecord& record) { // TSK118_Nonce_Re
       !std::equal(it->second.mac.begin(), it->second.mac.end(), record.mac.begin(), record.mac.end())) {
     throw Error{ErrorDomain::Validation, 0, "Nonce reservation mismatch"};
   }
-  log_.Commit(record.counter, record.mac); // TSK118_Nonce_Reuse_Vulnerabilities
+  if (it->second.binding_size != record.binding_size ||
+      !std::equal(it->second.binding.begin(), it->second.binding.begin() + it->second.binding_size,
+                  record.binding.begin(), record.binding.begin() + record.binding_size)) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce binding mismatch"};
+  }
+  log_.Commit(record.counter, record.mac,
+              std::span<const uint8_t>(record.binding.data(), record.binding_size)); // TSK118_Nonce_Reuse_Vulnerabilities, TSK128_Missing_AAD_Validation_in_Chunks
   inflight_.erase(it);
 }
 
@@ -206,6 +230,7 @@ std::optional<NonceGenerator::NonceRecord> NonceGenerator::LastPersisted() const
   record.counter = log_.GetLastCounter();
   record.mac = log_.LastMac();
   record.nonce = MakeNonceBytes(epoch_, record.counter);
+  record.binding_size = 0;
   return record;
 }
 

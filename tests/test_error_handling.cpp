@@ -324,7 +324,7 @@ namespace { // TSK034
     std::filesystem::remove(log_path);
     {
       qv::core::NonceLog log(log_path);
-      (void)log.Append(1);
+      (void)log.Append(1, std::span<const uint8_t>{}); // TSK128_Missing_AAD_Validation_in_Chunks
     }
     auto temp_path = log_path;
     temp_path += ".tmp";
@@ -332,7 +332,7 @@ namespace { // TSK034
     bool threw = false;
     try {
       qv::core::NonceLog log(log_path);
-      (void)log.Append(2);
+      (void)log.Append(2, std::span<const uint8_t>{}); // TSK128_Missing_AAD_Validation_in_Chunks
     } catch (const qv::Error& err) {
       threw = (err.domain == qv::ErrorDomain::IO) && (err.code == ENOSPC);
     }
@@ -396,7 +396,7 @@ namespace { // TSK034
         while (next_expected.load(std::memory_order_acquire) != value) {
           std::this_thread::yield();
         }
-        log.Append(value);
+        log.Append(value, std::span<const uint8_t>{}); // TSK128_Missing_AAD_Validation_in_Chunks
         next_expected.fetch_add(1, std::memory_order_release);
       }
     };

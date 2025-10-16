@@ -46,9 +46,12 @@ private:
   std::mutex sequential_mutex_;
   std::mutex persist_mutex_; // TSK067_Nonce_Safety
   mutable std::shared_mutex nonce_mutex_; // TSK118_Nonce_Reuse_Vulnerabilities generator guard
+  mutable std::mutex nonce_freshness_mutex_; // TSK128_Missing_AAD_Validation_in_Chunks freshness guard
   int64_t last_read_chunk_{-1};
   uint64_t sequential_read_count_{0};
   int64_t read_ahead_window_end_{-1};
+  uint64_t nonce_replay_floor_{0};          // TSK128_Missing_AAD_Validation_in_Chunks replay window tracking
+  uint64_t nonce_high_watermark_{0};        // TSK128_Missing_AAD_Validation_in_Chunks observed counter max
 
   std::vector<uint8_t> MakeNonce(const qv::core::NonceGenerator::NonceRecord& record,
                                  int64_t chunk_index) const;

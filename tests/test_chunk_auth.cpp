@@ -1,6 +1,7 @@
 #include "qv/common.h" // TSK040_AAD_Binding_and_Chunk_Authentication serialization helper
 #include "qv/core/nonce.h"
 #include "qv/crypto/aes_gcm.h"
+#include "qv/crypto/sha256.h" // TSK128_Missing_AAD_Validation_in_Chunks binding digest
 #include "qv/error.h" // TSK040_AAD_Binding_and_Chunk_Authentication tamper detection
 
 #include <array>
@@ -32,9 +33,11 @@ int main() {
   constexpr uint64_t kLogicalOffset = 8192;       // TSK040
   const uint32_t chunk_size = static_cast<uint32_t>(plaintext.size()); // TSK040
 
-  auto nonce_record = nonce_gen.NextAuthenticated(); // TSK040 bind nonce log
+  auto chunk_hash = qv::crypto::SHA256_Hash(std::span<const uint8_t>(plaintext.data(), plaintext.size())); // TSK128_Missing_AAD_Validation_in_Chunks
+  auto nonce_record = nonce_gen.NextAuthenticated(
+      kChunkIndex, std::span<const uint8_t>(chunk_hash.data(), chunk_hash.size())); // TSK040 bind nonce log, TSK128_Missing_AAD_Validation_in_Chunks
   auto envelope = qv::core::MakeChunkAAD(kEpoch, kChunkIndex, kLogicalOffset, chunk_size,
-                                         nonce_record.mac); // TSK040
+                                         nonce_record.mac, nonce_record.counter); // TSK040
   auto enc_result = qv::crypto::AES256_GCM_Encrypt(
       std::span<const uint8_t>(plaintext.data(), plaintext.size()),
       qv::AsBytesConst(envelope),
@@ -54,7 +57,7 @@ int main() {
 
   auto metadata_envelope = qv::core::MakeMetadataAAD(
       kEpoch, kChunkIndex, kLogicalOffset, chunk_size,
-      envelope.nonce_chain_mac); // TSK040 ensure context separation
+      envelope.nonce_chain_mac, nonce_record.counter); // TSK040 ensure context separation, TSK128_Missing_AAD_Validation_in_Chunks
   bool metadata_rejected = false;
   try {
     (void)qv::crypto::AES256_GCM_Decrypt(
@@ -72,7 +75,7 @@ int main() {
 
   auto manifest_envelope = qv::core::MakeManifestAAD(
       kEpoch, kChunkIndex, kLogicalOffset, chunk_size,
-      envelope.nonce_chain_mac); // TSK040 cross-context rejection
+      envelope.nonce_chain_mac, nonce_record.counter); // TSK040 cross-context rejection, TSK128_Missing_AAD_Validation_in_Chunks
   bool manifest_rejected = false;
   try {
     (void)qv::crypto::AES256_GCM_Decrypt(
