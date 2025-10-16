@@ -39,6 +39,8 @@ public:
 
   uint64_t RecordSize() const { return record_size_; }
 
+  void Flush();  // TSK131_Missing_Flush_on_Close ensure pending writes reach the container
+
   std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> MetadataMacKey() const {
     return metadata_mac_key_;  // TSK121_Missing_Authentication_in_Metadata expose derived metadata MAC key
   }

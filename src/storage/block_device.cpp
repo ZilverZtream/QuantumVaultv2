@@ -150,9 +150,33 @@ BlockDevice::BlockDevice(const std::filesystem::path& container_path,
 }
 
 BlockDevice::~BlockDevice() {
-  if (file_.is_open()) {
-    file_.flush();
-    file_.close();
+  if (!file_.is_open()) {
+    return;
+  }
+  try {
+    Flush();  // TSK131_Missing_Flush_on_Close flush cached writes before teardown
+  } catch (const std::exception& error) {
+    std::cerr << "BlockDevice flush failed: " << error.what() << std::endl;  // TSK131_Missing_Flush_on_Close diagnostics
+    if (std::uncaught_exceptions() == 0) {
+      throw;
+    }
+  } catch (...) {
+    std::cerr << "BlockDevice flush failed: unknown error" << std::endl;  // TSK131_Missing_Flush_on_Close diagnostics
+    if (std::uncaught_exceptions() == 0) {
+      throw;
+    }
+  }
+  file_.close();
+}
+
+void BlockDevice::Flush() {
+  std::scoped_lock lock(io_mutex_);
+  if (!file_.is_open()) {
+    return;
+  }
+  file_.flush();
+  if (!file_) {
+    throw Error{ErrorDomain::IO, 0, "Failed to flush block device stream"};  // TSK131_Missing_Flush_on_Close propagate failure
   }
 }
 
