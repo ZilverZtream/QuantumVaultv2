@@ -262,6 +262,36 @@ void TestConcurrentNonceGeneration() { // TSK067_Nonce_Safety
   std::filesystem::remove("qv_nonce.log.wal");
 }
 
+void TestNonceReservationLifecycle() { // TSK118_Nonce_Reuse_Vulnerabilities
+  std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal");
+  qv::core::NonceGenerator generator(99, 0);
+  auto reserved = generator.NextAuthenticated(42);
+  assert(reserved.chunk_index == 42 && "reservation must bind chunk index");
+  generator.CommitNonce(reserved);
+  auto persisted = generator.LastPersisted();
+  assert(persisted.has_value() && persisted->counter == reserved.counter &&
+         "commit must persist nonce");
+
+  auto retry = generator.NextAuthenticated(7);
+  generator.ReleaseNonce(retry);
+  auto reused = generator.NextAuthenticated(7);
+  assert(retry.counter == reused.counter &&
+         std::equal(retry.nonce.begin(), retry.nonce.end(), reused.nonce.begin()) &&
+         "released nonce must be reused for same chunk");
+  generator.CommitNonce(reused);
+
+  bool threw = false;
+  try {
+    generator.ReleaseNonce(reserved);
+  } catch (const qv::Error&) {
+    threw = true;
+  }
+  assert(threw && "unbound nonce release should be rejected");
+  std::filesystem::remove("qv_nonce.log");
+  std::filesystem::remove("qv_nonce.log.wal");
+}
+
 } // namespace
 
 int main() {
@@ -285,6 +315,7 @@ int main() {
   TestNonceWalRecovery();       // TSK021_Nonce_Log_Durability_and_Crash_Safety
   TestNonceDetectsCorruption(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   TestConcurrentNonceGeneration(); // TSK067_Nonce_Safety
+  TestNonceReservationLifecycle(); // TSK118_Nonce_Reuse_Vulnerabilities
   std::cout << "nonce test ok\n";
   return 0;
 }

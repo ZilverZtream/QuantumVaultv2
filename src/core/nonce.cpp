@@ -31,7 +31,8 @@ NonceGenerator::NonceGenerator(uint32_t epoch, uint64_t start_counter)
   bool has_entries = log_.EntryCount() > 0;
   uint64_t persisted_next = (persisted == UINT64_MAX) ? UINT64_MAX : persisted + 1;
   uint64_t initial = has_entries ? std::max(start_counter, persisted_next) : start_counter;
-  epoch_started_ = std::chrono::system_clock::now(); // TSK015
+  epoch_started_ = std::chrono::system_clock::now();                    // TSK015
+  epoch_started_monotonic_ = std::chrono::steady_clock::now();          // TSK118_Nonce_Reuse_Vulnerabilities monotonic anchor
   counter_ = initial;  // TSK096_Race_Conditions_and_Thread_Safety
   base_counter_ = initial; // TSK015
   if (initial > kCounterHardLimit) { // TSK015
@@ -41,7 +42,7 @@ NonceGenerator::NonceGenerator(uint32_t epoch, uint64_t start_counter)
 
 NonceGenerator::RekeyReason NonceGenerator::DetermineRekeyReason(
     uint64_t candidate,
-    std::chrono::system_clock::time_point now) const { // TSK015
+    std::chrono::steady_clock::time_point now) const { // TSK015, TSK118_Nonce_Reuse_Vulnerabilities
   if (candidate >= kCounterHardLimit) {
     return RekeyReason::kCounterLimit;
   }
@@ -52,7 +53,7 @@ NonceGenerator::RekeyReason NonceGenerator::DetermineRekeyReason(
     }
   }
   if (policy_.max_age.count() > 0) {
-    auto age = now - epoch_started_;
+    auto age = now - epoch_started_monotonic_;
     if (age >= policy_.max_age) {
       return RekeyReason::kEpochExpired;
     }
@@ -60,13 +61,13 @@ NonceGenerator::RekeyReason NonceGenerator::DetermineRekeyReason(
   return RekeyReason::kNone;
 }
 
-NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated() {
+NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated(int64_t chunk_index) {
   std::lock_guard<std::mutex> lock(state_mutex_); // TSK067_Nonce_Safety
-  auto now = std::chrono::system_clock::now(); // TSK015
+  auto monotonic_now = std::chrono::steady_clock::now(); // TSK118_Nonce_Reuse_Vulnerabilities
   if (counter_ == std::numeric_limits<uint64_t>::max()) { // TSK067_Nonce_Safety
     throw Error{ErrorDomain::Security, 6, "Counter exhausted. Rekey required."};
   }
-  auto reason = DetermineRekeyReason(counter_, now); // TSK015
+  auto reason = DetermineRekeyReason(counter_, monotonic_now); // TSK015, TSK118_Nonce_Reuse_Vulnerabilities
   if (reason != RekeyReason::kNone) {
     const char* msg = "Rekey required"; // TSK015
     int code = 2; // TSK015
@@ -88,15 +89,31 @@ NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated() {
     }
     throw Error{ErrorDomain::Security, code, msg};
   }
+  if (chunk_index != kUnboundChunkIndex) { // TSK118_Nonce_Reuse_Vulnerabilities reuse binding
+    auto recycled = recycled_.find(chunk_index);
+    if (recycled != recycled_.end()) {
+      NonceRecord record = recycled->second;
+      record.chunk_index = chunk_index; // TSK118_Nonce_Reuse_Vulnerabilities ensure binding stays explicit
+      recycled_.erase(recycled);
+      inflight_[record.counter] = record;
+      return record;
+    }
+  }
 
   uint64_t next = counter_;
   counter_ += 1;  // TSK096_Race_Conditions_and_Thread_Safety
 
-  auto mac = log_.Append(next); // TSK014
   NonceRecord record{}; // TSK014
   record.counter = next; // TSK014
-  record.mac = mac; // TSK014
   record.nonce = MakeNonceBytes(epoch_, next); // TSK015
+  record.chunk_index = chunk_index; // TSK118_Nonce_Reuse_Vulnerabilities
+  if (chunk_index == kUnboundChunkIndex) {
+    record.mac = log_.Append(next); // TSK014 legacy immediate commit
+    return record; // TSK014
+  }
+
+  record.mac = log_.Preview(next); // TSK118_Nonce_Reuse_Vulnerabilities defer commit until success
+  inflight_[record.counter] = record; // TSK118_Nonce_Reuse_Vulnerabilities
   return record; // TSK014
 }
 
@@ -116,11 +133,12 @@ NonceGenerator::Status NonceGenerator::EvaluateStatus(
     std::chrono::system_clock::time_point now) const { // TSK015
   Status status{};
   status.now = now;
+  auto monotonic_now = std::chrono::steady_clock::now(); // TSK118_Nonce_Reuse_Vulnerabilities
   {
     std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
     status.epoch_started = epoch_started_;
     status.counter = counter_;
-    status.reason = DetermineRekeyReason(status.counter, now);
+    status.reason = DetermineRekeyReason(status.counter, monotonic_now);
     status.nonces_emitted = status.counter >= base_counter_ ? status.counter - base_counter_ : 0;
     if (policy_.max_nonces != 0 && status.nonces_emitted < policy_.max_nonces) {
       status.remaining_nonce_budget = policy_.max_nonces - status.nonces_emitted;
@@ -137,12 +155,47 @@ NonceGenerator::Status NonceGenerator::EvaluateStatus(
 void NonceGenerator::SetEpochStart(std::chrono::system_clock::time_point start) { // TSK015
   std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
   epoch_started_ = start;
+  epoch_started_monotonic_ = std::chrono::steady_clock::now(); // TSK118_Nonce_Reuse_Vulnerabilities
 }
 
 void NonceGenerator::SetPolicy(uint64_t max_nonces, std::chrono::hours max_age) { // TSK015
   std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
   policy_.max_nonces = max_nonces;
   policy_.max_age = max_age;
+}
+
+void NonceGenerator::ReleaseNonce(const NonceRecord& record) { // TSK118_Nonce_Reuse_Vulnerabilities
+  if (record.chunk_index == kUnboundChunkIndex) {
+    throw Error{ErrorDomain::Validation, 0, "Cannot release unbound nonce"};
+  }
+  std::lock_guard<std::mutex> lock(state_mutex_); // TSK067_Nonce_Safety
+  auto it = inflight_.find(record.counter);
+  if (it == inflight_.end()) {
+    throw Error{ErrorDomain::Validation, 0, "Unknown nonce reservation"};
+  }
+  if (it->second.chunk_index != record.chunk_index ||
+      !std::equal(it->second.mac.begin(), it->second.mac.end(), record.mac.begin(), record.mac.end())) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce reservation mismatch"};
+  }
+  recycled_[record.chunk_index] = it->second;
+  inflight_.erase(it);
+}
+
+void NonceGenerator::CommitNonce(const NonceRecord& record) { // TSK118_Nonce_Reuse_Vulnerabilities
+  if (record.chunk_index == kUnboundChunkIndex) {
+    throw Error{ErrorDomain::Validation, 0, "Cannot commit unbound nonce"};
+  }
+  std::lock_guard<std::mutex> lock(state_mutex_); // TSK067_Nonce_Safety
+  auto it = inflight_.find(record.counter);
+  if (it == inflight_.end()) {
+    throw Error{ErrorDomain::Validation, 0, "Unknown nonce reservation"};
+  }
+  if (it->second.chunk_index != record.chunk_index ||
+      !std::equal(it->second.mac.begin(), it->second.mac.end(), record.mac.begin(), record.mac.end())) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce reservation mismatch"};
+  }
+  log_.Commit(record.counter, record.mac); // TSK118_Nonce_Reuse_Vulnerabilities
+  inflight_.erase(it);
 }
 
 std::optional<NonceGenerator::NonceRecord> NonceGenerator::LastPersisted() const { // TSK015
