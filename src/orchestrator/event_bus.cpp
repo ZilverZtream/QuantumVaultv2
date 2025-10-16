@@ -24,9 +24,16 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view> // TSK144_Network_Protocol_Security_Issues DNS pin parsing
 #include <system_error>
 #include <span>
 #include <vector>
+
+#include <openssl/err.h>   // TSK144_Network_Protocol_Security_Issues TLS error helpers
+#include <openssl/evp.h>   // TSK144_Network_Protocol_Security_Issues certificate pinning digest
+#include <openssl/ssl.h>   // TSK144_Network_Protocol_Security_Issues TLS syslog transport
+#include <openssl/x509.h>  // TSK144_Network_Protocol_Security_Issues certificate inspection
+#include <openssl/x509v3.h> // TSK144_Network_Protocol_Security_Issues hostname verification
 
 #if defined(_WIN32)
 #include <process.h>
@@ -34,12 +41,15 @@
 #include <ws2tcpip.h>
 #include <windows.h>   // TSK079_Audit_Log_Integrity_Chain secure DPAPI storage
 #include <wincrypt.h>   // TSK079_Audit_Log_Integrity_Chain secure DPAPI storage
+#include <windns.h>     // TSK144_Network_Protocol_Security_Issues DNSSEC queries
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <resolv.h>        // TSK144_Network_Protocol_Security_Issues DNSSEC resolver
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <arpa/nameser.h>  // TSK144_Network_Protocol_Security_Issues DNS parsing
 #if defined(__APPLE__)
 #include <Security/Security.h> // TSK079_Audit_Log_Integrity_Chain secure keychain usage
 #else
@@ -89,7 +99,7 @@ constexpr auto kSyslogBackoffMax = std::chrono::seconds(30);        // TSK069_Do
 constexpr uint32_t kStateVersion = 1;                               // TSK079_Audit_Log_Integrity_Chain
 constexpr uint32_t kDerivedKeyVersion = 1;                           // TSK079_Audit_Log_Integrity_Chain
 constexpr size_t kDerivedSaltSize = 32;                              // TSK079_Audit_Log_Integrity_Chain
-constexpr size_t kMaxSyslogDatagramBytes = 8 * 1024;                 // TSK081_EventBus_Throughput_and_Batching UDP safety margin
+constexpr size_t kMaxSyslogDatagramBytes = 8 * 1024;                 // TSK081_EventBus_Throughput_and_Batching payload safety margin
 constexpr size_t kSyslogThrottleBurst = 256;                         // TSK138_Rate_Limiting_And_DoS_Vulnerabilities burst allowance
 constexpr size_t kSyslogThrottleRatePerSecond = 64;                  // TSK138_Rate_Limiting_And_DoS_Vulnerabilities steady refill rate
 constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000ull;         // TSK138_Rate_Limiting_And_DoS_Vulnerabilities integral refill math
@@ -100,6 +110,242 @@ std::string HashTag(std::string_view value) { // TSK139_Memory_Disclosure_And_In
     return std::string{"hash:"};
   }
   return std::string{"hash:"} + digest;
+}
+
+bool IsIpLiteral(const std::string& host) { // TSK144_Network_Protocol_Security_Issues literal detection
+  sockaddr_in addr4{};
+  if (::inet_pton(AF_INET, host.c_str(), &addr4.sin_addr) == 1) {
+    return true;
+  }
+  sockaddr_in6 addr6{};
+  return ::inet_pton(AF_INET6, host.c_str(), &addr6.sin6_addr) == 1;
+}
+
+struct ResolvedEndpoint { // TSK144_Network_Protocol_Security_Issues validated DNS result
+  sockaddr_storage storage{};
+  socklen_t length{0};
+};
+
+bool PopulateLiteralEndpoint(const std::string& host, uint16_t port, ResolvedEndpoint& out) { // TSK144_Network_Protocol_Security_Issues
+  sockaddr_in addr4{};
+  if (::inet_pton(AF_INET, host.c_str(), &addr4.sin_addr) == 1) {
+    addr4.sin_family = AF_INET;
+    addr4.sin_port = htons(port);
+    std::memcpy(&out.storage, &addr4, sizeof(addr4));
+    out.length = sizeof(addr4);
+    return true;
+  }
+  sockaddr_in6 addr6{};
+  if (::inet_pton(AF_INET6, host.c_str(), &addr6.sin6_addr) == 1) {
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons(port);
+    std::memcpy(&out.storage, &addr6, sizeof(addr6));
+    out.length = sizeof(addr6);
+    return true;
+  }
+  return false;
+}
+
+#if defined(_WIN32)
+
+std::wstring Utf8ToWide(const std::string& value) { // TSK144_Network_Protocol_Security_Issues Windows DNSSEC helper
+  if (value.empty()) {
+    return std::wstring{};
+  }
+  int count = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+  if (count <= 0) {
+    return std::wstring{};
+  }
+  std::wstring wide(static_cast<size_t>(count), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), wide.data(), count);
+  return wide;
+}
+
+bool ResolveWithDnssec(const std::string& host, uint16_t port, ResolvedEndpoint& endpoint, std::string* error) { // TSK144_Network_Protocol_Security_Issues
+  if (IsIpLiteral(host)) {
+    return PopulateLiteralEndpoint(host, port, endpoint);
+  }
+  auto wide = Utf8ToWide(host);
+  if (wide.empty()) {
+    if (error) {
+      *error = "unable to convert hostname to UTF-16";
+    }
+    return false;
+  }
+  DNS_QUERY_REQUEST request{};
+  request.Version = DNS_QUERY_REQUEST_VERSION1;
+  request.QueryName = wide.c_str();
+  request.QueryOptions = DNS_QUERY_DNSSEC_OK | DNS_QUERY_TREAT_AS_FQDN | DNS_QUERY_BYPASS_CACHE |
+                         DNS_QUERY_RETURN_MESSAGE; // require DNSSEC validation
+
+  const WORD record_types[2] = {DNS_TYPE_AAAA, DNS_TYPE_A};
+  for (WORD type : record_types) {
+    DNS_QUERY_RESULT result{};
+    result.Version = DNS_QUERY_REQUEST_VERSION1;
+    request.QueryType = type;
+    DNS_STATUS status = DnsQueryEx(&request, &result, nullptr);
+    if (status != ERROR_SUCCESS) {
+      if (status == DNS_INFO_NO_RECORDS || status == DNS_ERROR_RCODE_NAME_ERROR) {
+        if (result.pQueryRecords) {
+          DnsRecordListFree(result.pQueryRecords, DnsFreeRecordList);
+          result.pQueryRecords = nullptr;
+        }
+        if (result.pMessage) {
+          DnsFree(result.pMessage, DnsFreeFlat);
+          result.pMessage = nullptr;
+        }
+        continue;
+      }
+      if (error) {
+        *error = "DNSSEC query failed: " + std::to_string(status);
+      }
+      if (result.pQueryRecords) {
+        DnsRecordListFree(result.pQueryRecords, DnsFreeRecordList);
+      }
+      if (result.pMessage) {
+        DnsFree(result.pMessage, DnsFreeFlat);
+      }
+      return false;
+    }
+    bool authenticated = false;
+    if (result.pMessage) {
+      authenticated = result.pMessage->MessageHead.Flags.AuthenticatedData != 0;
+    }
+    if (!authenticated) {
+      if (error) {
+        *error = "DNSSEC validation missing Authenticated Data flag";
+      }
+      if (result.pQueryRecords) {
+        DnsRecordListFree(result.pQueryRecords, DnsFreeRecordList);
+      }
+      if (result.pMessage) {
+        DnsFree(result.pMessage, DnsFreeFlat);
+      }
+      return false;
+    }
+    for (PDNS_RECORD rec = result.pQueryRecords; rec != nullptr; rec = rec->pNext) {
+      if (rec->wType == DNS_TYPE_A && rec->wType == type) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.S_un.S_addr = rec->Data.A.IpAddress;
+        std::memcpy(&endpoint.storage, &addr, sizeof(addr));
+        endpoint.length = sizeof(addr);
+        DnsRecordListFree(result.pQueryRecords, DnsFreeRecordList);
+        if (result.pMessage) {
+          DnsFree(result.pMessage, DnsFreeFlat);
+        }
+        return true;
+      }
+      if (rec->wType == DNS_TYPE_AAAA && rec->wType == type) {
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(port);
+        std::memcpy(&addr.sin6_addr, &rec->Data.AAAA.Ip6Address, sizeof(addr.sin6_addr));
+        std::memcpy(&endpoint.storage, &addr, sizeof(addr));
+        endpoint.length = sizeof(addr);
+        DnsRecordListFree(result.pQueryRecords, DnsFreeRecordList);
+        if (result.pMessage) {
+          DnsFree(result.pMessage, DnsFreeFlat);
+        }
+        return true;
+      }
+    }
+    if (result.pQueryRecords) {
+      DnsRecordListFree(result.pQueryRecords, DnsFreeRecordList);
+    }
+    if (result.pMessage) {
+      DnsFree(result.pMessage, DnsFreeFlat);
+    }
+  }
+  if (error) {
+    *error = "no DNSSEC validated address records";
+  }
+  return false;
+}
+
+#else
+
+bool ExtractAddressRecord(const ns_rr& record, uint16_t port, ResolvedEndpoint& endpoint) { // TSK144_Network_Protocol_Security_Issues
+  if (ns_rr_type(record) == ns_t_a && ns_rr_rdlen(record) == sizeof(in_addr)) {
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    std::memcpy(&addr.sin_addr, ns_rr_rdata(record), sizeof(in_addr));
+    std::memcpy(&endpoint.storage, &addr, sizeof(addr));
+    endpoint.length = sizeof(addr);
+    return true;
+  }
+  if (ns_rr_type(record) == ns_t_aaaa && ns_rr_rdlen(record) == sizeof(in6_addr)) {
+    sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(port);
+    std::memcpy(&addr.sin6_addr, ns_rr_rdata(record), sizeof(in6_addr));
+    std::memcpy(&endpoint.storage, &addr, sizeof(addr));
+    endpoint.length = sizeof(addr);
+    return true;
+  }
+  return false;
+}
+
+bool QueryDnssecRecord(res_state& resolver, const std::string& host, int type, uint16_t port,
+                       ResolvedEndpoint& endpoint) { // TSK144_Network_Protocol_Security_Issues
+  std::array<unsigned char, 4096> buffer{};
+  int response_len = res_nquery(&resolver, host.c_str(), ns_c_in, type, buffer.data(), buffer.size());
+  if (response_len < 0) {
+    return false;
+  }
+  ns_msg handle;
+  if (ns_initparse(buffer.data(), response_len, &handle) < 0) {
+    return false;
+  }
+  if (ns_msg_getflag(handle, ns_f_ad) == 0) {
+    return false;
+  }
+  const int answer_count = ns_msg_count(handle, ns_s_an);
+  for (int i = 0; i < answer_count; ++i) {
+    ns_rr record;
+    if (ns_parserr(&handle, ns_s_an, i, &record) != 0) {
+      continue;
+    }
+    if (ExtractAddressRecord(record, port, endpoint)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ResolveWithDnssec(const std::string& host, uint16_t port, ResolvedEndpoint& endpoint, std::string* error) { // TSK144_Network_Protocol_Security_Issues
+  if (IsIpLiteral(host)) {
+    return PopulateLiteralEndpoint(host, port, endpoint);
+  }
+  res_state resolver{};
+  if (res_ninit(&resolver) != 0) {
+    if (error) {
+      *error = "res_ninit failed";
+    }
+    return false;
+  }
+  resolver.options |= RES_USE_DNSSEC;
+  bool success = QueryDnssecRecord(resolver, host, ns_t_aaaa, port, endpoint) ||
+                 QueryDnssecRecord(resolver, host, ns_t_a, port, endpoint);
+  res_nclose(&resolver);
+  if (!success && error) {
+    *error = "no DNSSEC validated address records";
+  }
+  return success;
+}
+
+#endif
+
+std::string OpenSslLastError() { // TSK144_Network_Protocol_Security_Issues translate OpenSSL errors
+  unsigned long code = ERR_get_error();
+  if (code == 0) {
+    return "unknown TLS error";
+  }
+  char buffer[256];
+  ERR_error_string_n(code, buffer, sizeof(buffer));
+  return std::string(buffer);
 }
 
 bool LooksLikeFilesystemPath(std::string_view value) { // TSK139_Memory_Disclosure_And_Information_Leaks
@@ -1324,22 +1570,41 @@ class SyslogPublisher { // TSK029
   std::optional<std::string> BuildMessage(const Event& event); // TSK081_EventBus_Throughput_and_Batching serialization helper
   bool SendDatagram(const std::string& payload,
                     std::chrono::steady_clock::time_point attempt_time); // TSK081_EventBus_Throughput_and_Batching IO helper
+  void ResetTransport();                                                // TSK144_Network_Protocol_Security_Issues TLS cleanup
+  bool EnsureConnected(std::chrono::steady_clock::time_point attempt_time,
+                       std::string* error = nullptr); // TSK144_Network_Protocol_Security_Issues reconnect
+  bool VerifyCertificatePin(); // TSK144_Network_Protocol_Security_Issues certificate pinning
 #if defined(_WIN32)
   SOCKET socket_{INVALID_SOCKET};
 #else
   int socket_{-1};
 #endif
-  sockaddr_storage remote_{};
-  socklen_t remote_len_{0};
   bool configured_{false};
   std::string hostname_ = DetectHostname();
   std::string app_name_ = "quantumvault";
   std::string procid_ = DetectProcessId();
   std::chrono::steady_clock::time_point next_allowed_send_{}; // TSK069_DoS_Resource_Exhaustion_Guards
   uint32_t backoff_exp_{0};                                   // TSK069_DoS_Resource_Exhaustion_Guards
+  SSL_CTX* ssl_ctx_{nullptr};                                 // TSK144_Network_Protocol_Security_Issues TLS context
+  SSL* ssl_{nullptr};                                         // TSK144_Network_Protocol_Security_Issues TLS session
+  std::string syslog_host_;                                   // TSK144_Network_Protocol_Security_Issues SNI/cert host
+  uint16_t syslog_port_{0};                                   // TSK144_Network_Protocol_Security_Issues connection port
 };
 
 SyslogPublisher::~SyslogPublisher() { // TSK029
+  ResetTransport();
+}
+
+void SyslogPublisher::ResetTransport() { // TSK144_Network_Protocol_Security_Issues close TLS session
+  if (ssl_) {
+    SSL_shutdown(ssl_);
+    SSL_free(ssl_);
+    ssl_ = nullptr;
+  }
+  if (ssl_ctx_) {
+    SSL_CTX_free(ssl_ctx_);
+    ssl_ctx_ = nullptr;
+  }
 #if defined(_WIN32)
   if (socket_ != INVALID_SOCKET) {
     closesocket(socket_);
@@ -1351,84 +1616,270 @@ SyslogPublisher::~SyslogPublisher() { // TSK029
     socket_ = -1;
   }
 #endif
+  configured_ = false;
+}
+
+bool SyslogPublisher::VerifyCertificatePin() { // TSK144_Network_Protocol_Security_Issues pin enforcement
+  const char* pins_env = std::getenv("QV_SYSLOG_TLS_PIN_SHA256");
+  if (!pins_env || *pins_env == '\0') {
+    return true;
+  }
+  if (!ssl_) {
+    return false;
+  }
+  X509* cert = SSL_get_peer_certificate(ssl_);
+  if (!cert) {
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"missing peer certificate\"}" << std::endl;
+    return false;
+  }
+  EVP_PKEY* key = X509_get_pubkey(cert);
+  if (!key) {
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"missing peer public key\"}" << std::endl;
+    X509_free(cert);
+    return false;
+  }
+  unsigned char* der = nullptr;
+  const int der_len = i2d_PUBKEY(key, &der);
+  EVP_PKEY_free(key);
+  if (der_len <= 0 || !der) {
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"unable to encode peer key\"}" << std::endl;
+    X509_free(cert);
+    if (der) {
+      OPENSSL_free(der);
+    }
+    return false;
+  }
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int digest_len = 0;
+  if (EVP_Digest(der, static_cast<size_t>(der_len), digest, &digest_len, EVP_sha256(), nullptr) != 1) {
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"failed to hash peer key\"}" << std::endl;
+    OPENSSL_free(der);
+    X509_free(cert);
+    return false;
+  }
+  OPENSSL_free(der);
+  X509_free(cert);
+  std::string fingerprint;
+  fingerprint.reserve(digest_len * 2);
+  static constexpr char kHex[] = "0123456789abcdef";
+  for (unsigned int i = 0; i < digest_len; ++i) {
+    fingerprint.push_back(kHex[digest[i] >> 4]);
+    fingerprint.push_back(kHex[digest[i] & 0x0F]);
+  }
+  std::string_view pins(pins_env);
+  size_t pos = 0;
+  while (pos < pins.size()) {
+    size_t next = pins.find_first_of(";, ", pos);
+    const size_t count = (next == std::string::npos) ? pins.size() - pos : next - pos;
+    std::string candidate;
+    candidate.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      char ch = pins[pos + i];
+      if (std::isxdigit(static_cast<unsigned char>(ch))) {
+        candidate.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+      }
+    }
+    if (!candidate.empty() && candidate == fingerprint) {
+      return true;
+    }
+    if (next == std::string::npos) {
+      break;
+    }
+    pos = next + 1;
+  }
+  std::clog << "{\"event\":\"syslog_error\",\"message\":\"syslog TLS pin mismatch\"}" << std::endl;
+  return false;
+}
+
+bool SyslogPublisher::EnsureConnected(std::chrono::steady_clock::time_point attempt_time, std::string* error) { // TSK144_Network_Protocol_Security_Issues reconnect
+  if (ssl_ && configured_) {
+    return true;
+  }
+  ResetTransport();
+  if (syslog_host_.empty() || syslog_port_ == 0) {
+    if (error) {
+      *error = "syslog endpoint not configured";
+    }
+    return false;
+  }
+  ResolvedEndpoint endpoint;
+  std::string dns_error;
+  if (!ResolveWithDnssec(syslog_host_, syslog_port_, endpoint, &dns_error)) {
+    if (error) {
+      *error = dns_error.empty() ? std::string("DNSSEC validation failed") : dns_error;
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"DNSSEC validation failed\"}" << std::endl;
+    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
+    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
+    return false;
+  }
+  int family = endpoint.storage.ss_family;
+#if defined(_WIN32)
+  SOCKET sock = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
+  if (sock == INVALID_SOCKET) {
+    if (error) {
+      *error = "socket creation failed";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"socket creation failed\"}" << std::endl;
+    return false;
+  }
+  if (::connect(sock, reinterpret_cast<const sockaddr*>(&endpoint.storage), endpoint.length) == SOCKET_ERROR) {
+    if (error) {
+      *error = "connect failed";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"connect failed\"}" << std::endl;
+    closesocket(sock);
+    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
+    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
+    return false;
+  }
+  socket_ = sock;
+#else
+  int sock = ::socket(family, SOCK_STREAM, IPPROTO_TCP);
+  if (sock < 0) {
+    if (error) {
+      *error = "socket creation failed";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"socket creation failed\"}" << std::endl;
+    return false;
+  }
+  if (::connect(sock, reinterpret_cast<const sockaddr*>(&endpoint.storage), endpoint.length) != 0) {
+    if (error) {
+      *error = "connect failed";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"connect failed\"}" << std::endl;
+    ::close(sock);
+    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
+    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
+    return false;
+  }
+  socket_ = sock;
+#endif
+  ssl_ctx_ = SSL_CTX_new(TLS_client_method());
+  if (!ssl_ctx_) {
+    if (error) {
+      *error = "TLS context creation failed";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"TLS context creation failed\"}" << std::endl;
+    ResetTransport();
+    return false;
+  }
+#if defined(TLS1_2_VERSION)
+  SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_2_VERSION);
+#endif
+  SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_PEER, nullptr);
+  const char* ca_file = std::getenv("QV_SYSLOG_TLS_CA_FILE");
+  const char* ca_path = std::getenv("QV_SYSLOG_TLS_CA_PATH");
+  if ((ca_file || ca_path)) {
+    if (SSL_CTX_load_verify_locations(ssl_ctx_, ca_file, ca_path) != 1) {
+      if (error) {
+        *error = "failed to load custom CA trust";
+      }
+      std::clog << "{\"event\":\"syslog_error\",\"message\":\"failed to load custom CA trust\"}" << std::endl;
+      ResetTransport();
+      return false;
+    }
+  } else if (SSL_CTX_set_default_verify_paths(ssl_ctx_) != 1) {
+    if (error) {
+      *error = "failed to load default trust store";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"failed to load default trust store\"}" << std::endl;
+    ResetTransport();
+    return false;
+  }
+  ssl_ = SSL_new(ssl_ctx_);
+  if (!ssl_) {
+    if (error) {
+      *error = "TLS session creation failed";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"TLS session creation failed\"}" << std::endl;
+    ResetTransport();
+    return false;
+  }
+  if (SSL_set_tlsext_host_name(ssl_, syslog_host_.c_str()) != 1) {
+    if (error) {
+      *error = "failed to set SNI";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"failed to set SNI\"}" << std::endl;
+    ResetTransport();
+    return false;
+  }
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+  if (SSL_set1_host(ssl_, syslog_host_.c_str()) != 1) {
+    if (error) {
+      *error = "failed to configure hostname verification";
+    }
+      std::clog << "{\"event\":\"syslog_error\",\"message\":\"failed to configure hostname verification\"}"
+              << std::endl;
+    ResetTransport();
+    return false;
+  }
+  SSL_set_hostflags(ssl_, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+#else
+  X509_VERIFY_PARAM* param = SSL_get0_param(ssl_);
+  if (!param || X509_VERIFY_PARAM_set1_host(param, syslog_host_.c_str(), syslog_host_.size()) != 1) {
+    if (error) {
+      *error = "failed to configure hostname verification";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"failed to configure hostname verification\"}"
+              << std::endl;
+    ResetTransport();
+    return false;
+  }
+  X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+#endif
+  if (SSL_set_fd(ssl_, static_cast<int>(socket_)) != 1) {
+    if (error) {
+      *error = "failed to bind TLS to socket";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"failed to bind TLS to socket\"}" << std::endl;
+    ResetTransport();
+    return false;
+  }
+  if (SSL_connect(ssl_) <= 0) {
+    if (error) {
+      *error = "TLS handshake failed: " + OpenSslLastError();
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"TLS handshake failed\"}" << std::endl;
+    ResetTransport();
+    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
+    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
+    return false;
+  }
+  if (SSL_get_verify_result(ssl_) != X509_V_OK) {
+    if (error) {
+      *error = "certificate validation failed";
+    }
+    std::clog << "{\"event\":\"syslog_error\",\"message\":\"certificate validation failed\"}" << std::endl;
+    ResetTransport();
+    return false;
+  }
+  if (!VerifyCertificatePin()) {
+    if (error) {
+      *error = "certificate pin mismatch";
+    }
+    ResetTransport();
+    return false;
+  }
+  configured_ = true;
+  backoff_exp_ = 0;
+  next_allowed_send_ = attempt_time;
+  return true;
 }
 
 bool SyslogPublisher::Configure(const std::string& host, uint16_t port, std::string* error) { // TSK029
 #if defined(_WIN32)
   EnsureWinsock();
 #endif
-  addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_DGRAM;
-  hints.ai_protocol = IPPROTO_UDP;
-  auto service = std::to_string(port);
-  addrinfo* result = nullptr;
-  const int rc = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &result);
-  if (rc != 0 || result == nullptr) {
-    if (error) {
-#if defined(_WIN32)
-      *error = "getaddrinfo failed: " + std::to_string(rc);
-#else
-      *error = std::string("getaddrinfo failed: ") + gai_strerror(rc);
-#endif
-    }
-    return false;
-  }
-  bool success = false;
-  for (addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
-#if defined(_WIN32)
-    SOCKET sock = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (sock == INVALID_SOCKET) {
-      continue;
-    }
-    if (ai->ai_addrlen > sizeof(remote_)) {
-      closesocket(sock);
-      continue;
-    }
-    if (socket_ != INVALID_SOCKET) {
-      closesocket(socket_);
-    }
-    socket_ = sock;
-#else
-    int sock = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (sock < 0) {
-      continue;
-    }
-    if (ai->ai_addrlen > sizeof(remote_)) {
-      ::close(sock);
-      continue;
-    }
-    if (socket_ >= 0) {
-      ::close(socket_);
-    }
-    socket_ = sock;
-#endif
-    std::memcpy(&remote_, ai->ai_addr, ai->ai_addrlen);
-    remote_len_ = static_cast<socklen_t>(ai->ai_addrlen);
-    success = true;
-    break;
-  }
-  ::freeaddrinfo(result);
-  if (!success) {
-    if (error) {
-      *error = "failed to initialize syslog endpoint";
-    }
-#if defined(_WIN32)
-    if (socket_ != INVALID_SOCKET) {
-      closesocket(socket_);
-      socket_ = INVALID_SOCKET;
-    }
-#else
-    if (socket_ >= 0) {
-      ::close(socket_);
-      socket_ = -1;
-    }
-#endif
-    return false;
-  }
-  configured_ = true;
+  syslog_host_ = host;
+  syslog_port_ = port;
   hostname_ = DetectHostname();
   procid_ = DetectProcessId();
+  backoff_exp_ = 0;
+  next_allowed_send_ = std::chrono::steady_clock::now();
+  if (!EnsureConnected(std::chrono::steady_clock::now(), error)) {
+    return false;
+  }
   return true;
 }
 
@@ -1459,31 +1910,25 @@ std::optional<std::string> SyslogPublisher::BuildMessage(const Event& event) { /
 
 bool SyslogPublisher::SendDatagram(const std::string& payload,
                                    std::chrono::steady_clock::time_point attempt_time) { // TSK081_EventBus_Throughput_and_Batching
-#if defined(_WIN32)
-  if (socket_ == INVALID_SOCKET) {
+  if (!EnsureConnected(attempt_time)) {
     return false;
   }
-  int sent = ::sendto(socket_, payload.c_str(), static_cast<int>(payload.size()), 0,
-                      reinterpret_cast<const sockaddr*>(&remote_), remote_len_);
-  if (sent == SOCKET_ERROR) {
-    std::clog << "{\"event\":\"syslog_error\",\"message\":\"sendto failed\"}" << std::endl;
-    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
-    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
-    return false;
+  const std::string framed = std::to_string(payload.size()) + ' ' + payload; // TSK144_Network_Protocol_Security_Issues TLS framing
+  size_t offset = 0;
+  while (offset < framed.size()) {
+    ERR_clear_error();
+    const int rc = SSL_write(ssl_, framed.data() + offset, static_cast<int>(framed.size() - offset));
+    if (rc <= 0) {
+      const int ssl_err = SSL_get_error(ssl_, rc);
+      std::clog << "{\"event\":\"syslog_error\",\"message\":\"TLS write failed\",\"code\":" << ssl_err
+                << "}" << std::endl; // TSK144_Network_Protocol_Security_Issues surface transport failure
+      ResetTransport();
+      next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
+      backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
+      return false;
+    }
+    offset += static_cast<size_t>(rc);
   }
-#else
-  if (socket_ < 0) {
-    return false;
-  }
-  auto sent = ::sendto(socket_, payload.c_str(), payload.size(), 0,
-                       reinterpret_cast<const sockaddr*>(&remote_), remote_len_);
-  if (sent < 0) {
-    std::clog << "{\"event\":\"syslog_error\",\"message\":\"sendto failed\"}" << std::endl;
-    next_allowed_send_ = attempt_time + ComputeBackoff(backoff_exp_);
-    backoff_exp_ = std::min<uint32_t>(backoff_exp_ + 1, 16u);
-    return false;
-  }
-#endif
   backoff_exp_ = 0;
   next_allowed_send_ = attempt_time;
   return true;
