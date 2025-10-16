@@ -294,7 +294,7 @@ namespace {
     }
 #if defined(_WIN32)
     const std::wstring native = target.wstring();
-    HANDLE handle = ::CreateFileW(native.c_str(), GENERIC_READ,
+    HANDLE handle = ::CreateFileW(native.c_str(), GENERIC_READ | GENERIC_WRITE,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                   OPEN_EXISTING,
                                   FILE_FLAG_BACKUP_SEMANTICS | FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -331,6 +331,37 @@ namespace {
       const int err = errno;
       throw qv::Error{qv::ErrorDomain::IO, err,
                       "Failed to close directory after sync: " + SanitizePath(target)};
+    }
+#endif
+  }
+
+  std::filesystem::path MakeTempSiblingPath(const std::filesystem::path& target) { // TSK143_Missing_Fsync_And_Durability_Issues unique staging
+    auto dir = target.parent_path();
+    if (dir.empty()) {
+      dir = std::filesystem::current_path();
+    }
+    const std::string base = target.has_filename() ? target.filename().string() : std::string{"manifest.json"};
+    const auto pattern = base + ".tmp.%%%%-%%%%-%%%%-%%%%";
+    return dir / std::filesystem::unique_path(pattern);
+  }
+
+  void ReplaceFileAtomically(const std::filesystem::path& staged,
+                             const std::filesystem::path& destination) { // TSK143_Missing_Fsync_And_Durability_Issues durable finalize
+#if defined(_WIN32)
+    const std::wstring from_native = staged.wstring();
+    const std::wstring to_native = destination.wstring();
+    if (!::MoveFileExW(from_native.c_str(), to_native.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      const DWORD err = ::GetLastError();
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err),
+                      "Failed to finalize manifest swap: " + SanitizePath(destination)};
+    }
+#else
+    std::error_code rename_err;
+    std::filesystem::rename(staged, destination, rename_err);
+    if (rename_err) {
+      throw qv::Error{qv::ErrorDomain::IO, rename_err.value(),
+                      "Failed to finalize manifest swap: " + SanitizePath(destination)};
     }
 #endif
   }
@@ -2431,9 +2462,32 @@ namespace {
 
     const auto manifest_body = manifest_json.str();
     const std::vector<uint8_t> manifest_bytes(manifest_body.begin(), manifest_body.end());
-    qv::orchestrator::AtomicReplace(
-        manifest_path,
-        std::span<const uint8_t>(manifest_bytes.data(), manifest_bytes.size())); // TSK143_Missing_Fsync_And_Durability_Issues durable manifest swap
+    const auto staged_manifest = MakeTempSiblingPath(manifest_path); // TSK143_Missing_Fsync_And_Durability_Issues stage manifest
+    int manifest_fd = OpenFileForWrite(staged_manifest);
+    if (manifest_fd < 0) {
+      const int err = errno;
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to open manifest staging file: " + SanitizePath(staged_manifest)};
+    }
+    try {
+      WriteAllToFd(manifest_fd,
+                   reinterpret_cast<const char*>(manifest_bytes.data()),
+                   manifest_bytes.size(),
+                   staged_manifest);
+      SyncFileDescriptor(manifest_fd, staged_manifest);
+    } catch (...) {
+#if defined(_WIN32)
+      _close(manifest_fd);
+#else
+      ::close(manifest_fd);
+#endif
+      std::error_code cleanup_err;
+      std::filesystem::remove(staged_manifest, cleanup_err);
+      throw;
+    }
+    CloseFileDescriptor(manifest_fd, staged_manifest);
+    ReplaceFileAtomically(staged_manifest, manifest_path);
+    SyncDirectoryPath(manifest_path.parent_path()); // TSK143_Missing_Fsync_And_Durability_Issues persist manifest directory metadata
 #if !defined(_WIN32)
     try {
       std::filesystem::permissions(
