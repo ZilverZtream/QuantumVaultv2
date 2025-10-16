@@ -141,6 +141,7 @@ namespace {
   constexpr uint32_t kPluginResultMessageType = 0x51565253u;    // "QVRS"
   constexpr rlim_t kPluginMemoryLimitBytes = 64ull * 1024ull * 1024ull; // 64 MiB cap.
   constexpr rlim_t kPluginCpuLimitSeconds = 5;                                // 5s CPU.
+  constexpr rlim_t kPluginThreadLimit = 64;            // TSK147_Resource_Exhaustion_Attacks cap worker threads
   constexpr std::chrono::milliseconds kPluginHandshakeTimeout{5000}; // TSK077
   constexpr std::chrono::milliseconds kPluginInitTimeout{5000};       // TSK077
 #endif
@@ -333,6 +334,18 @@ namespace {
       kPluginCpuLimitSeconds, kPluginCpuLimitSeconds
     };
     ::setrlimit(RLIMIT_CPU, &cpu_limit);
+
+#if defined(RLIMIT_NPROC)
+    struct rlimit thread_limit {
+      kPluginThreadLimit, kPluginThreadLimit
+    };
+    ::setrlimit(RLIMIT_NPROC, &thread_limit); // TSK147_Resource_Exhaustion_Attacks bound thread count
+#elif defined(RLIMIT_THREADS)
+    struct rlimit thread_limit {
+      kPluginThreadLimit, kPluginThreadLimit
+    };
+    ::setrlimit(RLIMIT_THREADS, &thread_limit); // TSK147_Resource_Exhaustion_Attacks bound thread count
+#endif
   }
 
 #if defined(__linux__)

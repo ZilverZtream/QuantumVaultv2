@@ -137,6 +137,7 @@ namespace qv::orchestrator {
     std::shared_ptr<SyslogPublisher> syslog_client_; // TSK029
     std::condition_variable syslog_cv_;              // TSK081_EventBus_Throughput_and_Batching queue signaling
     std::deque<Event> pending_syslog_;               // TSK081_EventBus_Throughput_and_Batching buffered events
+    std::deque<uint8_t> pending_syslog_attempts_;    // TSK147_Resource_Exhaustion_Attacks retry counters
     std::thread dispatcher_thread_;                  // TSK081_EventBus_Throughput_and_Batching background worker
     bool stop_dispatcher_{false};                    // TSK081_EventBus_Throughput_and_Batching lifecycle guard
     uint64_t dropped_syslog_streak_{0};              // TSK081_EventBus_Throughput_and_Batching backpressure logging
@@ -145,6 +146,7 @@ namespace qv::orchestrator {
     uint64_t throttled_syslog_streak_{0};            // TSK138_Rate_Limiting_And_DoS_Vulnerabilities throttle logging
 
     static constexpr size_t kMaxSyslogQueueDepth = 1024; // TSK081_EventBus_Throughput_and_Batching backpressure limit
+    static constexpr uint8_t kMaxSyslogRetryAttempts = 6; // TSK147_Resource_Exhaustion_Attacks drop after repeated failures
     static constexpr size_t kMaxSyslogBatchSize = 32;     // TSK081_EventBus_Throughput_and_Batching batch size
   };
 

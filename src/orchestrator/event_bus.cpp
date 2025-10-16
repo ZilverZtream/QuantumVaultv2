@@ -2023,6 +2023,7 @@ EventBus::~EventBus() { // TSK081_EventBus_Throughput_and_Batching
     std::lock_guard<std::mutex> guard(syslog_mutex_);
     stop_dispatcher_ = true;
     pending_syslog_.clear();                    // TSK110_Initialization_and_Cleanup_Order clear queued work
+    pending_syslog_attempts_.clear();           // TSK147_Resource_Exhaustion_Attacks discard retry bookkeeping
     syslog_client_.reset();                     // TSK110_Initialization_and_Cleanup_Order release transport
     dropped_syslog_streak_ = 0;                 // TSK113_Performance_and_Scalability reset backpressure state
     throttled_syslog_streak_ = 0;               // TSK138_Rate_Limiting_And_DoS_Vulnerabilities reset throttle streaks
@@ -2100,10 +2101,14 @@ void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
 
     auto client = syslog_client_;
     std::vector<Event> batch;
+    std::vector<uint8_t> batch_attempts; // TSK147_Resource_Exhaustion_Attacks track retry depth
     batch.reserve(kMaxSyslogBatchSize);
+    batch_attempts.reserve(kMaxSyslogBatchSize);
     while (!pending_syslog_.empty() && batch.size() < kMaxSyslogBatchSize) {
       batch.push_back(std::move(pending_syslog_.front()));
       pending_syslog_.pop_front();
+      batch_attempts.push_back(pending_syslog_attempts_.front());
+      pending_syslog_attempts_.pop_front();
     }
 
     lock.unlock();
@@ -2115,9 +2120,22 @@ void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
     if (!stats.unsent_indices.empty()) {
       std::lock_guard<std::mutex> requeue_lock(syslog_mutex_);
       for (auto it = stats.unsent_indices.rbegin(); it != stats.unsent_indices.rend(); ++it) {
-        if (*it < batch.size()) {
-          pending_syslog_.push_front(std::move(batch[*it]));
+        if (*it >= batch.size()) {
+          continue;
         }
+        const auto next_attempt = static_cast<uint32_t>(batch_attempts[*it]) + 1u;
+        if (next_attempt > kMaxSyslogRetryAttempts) {
+          std::clog << "{\"event\":\"syslog_drop\",\"reason\":\"retries_exhausted\",\"count\":"
+                    << next_attempt << "}" << std::endl; // TSK147_Resource_Exhaustion_Attacks cap retries
+          continue;
+        }
+        if (pending_syslog_.size() >= kMaxSyslogQueueDepth) {
+          std::clog << "{\"event\":\"syslog_drop\",\"reason\":\"queue_full\",\"depth\":"
+                    << pending_syslog_.size() << "}" << std::endl; // TSK147_Resource_Exhaustion_Attacks enforce queue bound
+          continue;
+        }
+        pending_syslog_.push_front(std::move(batch[*it]));
+        pending_syslog_attempts_.push_front(static_cast<uint8_t>(next_attempt));
       }
       if (!stop_dispatcher_) {
         syslog_cv_.notify_one();
@@ -2167,6 +2185,7 @@ void EventBus::Publish(const Event& event) { // TSK029
                     << dropped_syslog_streak_ << "}" << std::endl;
         }
         pending_syslog_.push_back(event);
+        pending_syslog_attempts_.push_back(0); // TSK147_Resource_Exhaustion_Attacks initialize retry budget
         dropped_syslog_streak_ = 0;
         notify_dispatcher = true;
       }
