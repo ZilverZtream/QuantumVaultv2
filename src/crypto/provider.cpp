@@ -1,12 +1,9 @@
 #include "qv/crypto/provider.h"
 
+#include <openssl/crypto.h> // TSK023_Production_Crypto_Provider_Complete_Integration FIPS mode toggle // TSK123_Missing_Constant_Time_Comparisons constant-time memcmp
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
-
-#if defined(QV_FIPS_MODE) && !defined(_WIN32)
-#include <openssl/crypto.h> // TSK023_Production_Crypto_Provider_Complete_Integration FIPS mode toggle
-#endif
 
 #if QV_HAVE_SODIUM
 #include <sodium.h> // TSK023_Production_Crypto_Provider_Complete_Integration libsodium initialization
@@ -222,33 +219,35 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
                  {0x8a, 0x67, 0x08, 0xe6, 0x94, 0x68, 0x91, 0x5c, 0x53, 0x67, 0x57, 0x39,
                   0x24, 0xfe, 0x1a, 0xe3}}};
 
-  auto constant_time_equal = [](std::span<const uint8_t> lhs,
-                                std::span<const uint8_t> rhs) noexcept {
-    if (lhs.size() != rhs.size()) {
-      return false;
-    }
-    uint8_t diff = 0;
-    for (size_t i = 0; i < lhs.size(); ++i) {
-      diff |= static_cast<uint8_t>(lhs[i] ^ rhs[i]);
-    }
-    return diff == 0;
-  };
-
   OpenSSLCryptoProvider provider;
   for (size_t index = 0; index < kVectors.size(); ++index) {
     const auto& tv = kVectors[index];
+    auto log_kat_failure = [&](std::string_view context) {
+      std::clog << "[crypto] AES-GCM KAT failure: " << context << " (vector=" << index << ")"
+                << std::endl; // TSK123_Missing_Constant_Time_Comparisons detailed diagnostics without leaking via error
+    };
     const auto enc = provider.EncryptAES256GCM(
         std::span<const uint8_t>(tv.plaintext.data(), tv.plaintext.size()),
         std::span<const uint8_t>(tv.aad.data(), tv.aad.size()),
         std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(tv.nonce),
         std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key));
 
-    if (!constant_time_equal(std::span<const uint8_t>(enc.ciphertext.data(), enc.ciphertext.size()),
-                             std::span<const uint8_t>(tv.ciphertext.data(), tv.ciphertext.size()))) {
-      ThrowCryptoError("AES-GCM KAT ciphertext mismatch #" + std::to_string(index));
+    auto ciphertext_span =
+        std::span<const uint8_t>(enc.ciphertext.data(), enc.ciphertext.size());
+    auto expected_ciphertext_span =
+        std::span<const uint8_t>(tv.ciphertext.data(), tv.ciphertext.size());
+    if (ciphertext_span.size() != expected_ciphertext_span.size()) {
+      log_kat_failure("ciphertext length mismatch");
+      ThrowCryptoError("AES-GCM KAT ciphertext mismatch"); // TSK123_Missing_Constant_Time_Comparisons generic failure
+    }
+    if (!ciphertext_span.empty() &&
+        CRYPTO_memcmp(ciphertext_span.data(), expected_ciphertext_span.data(), ciphertext_span.size()) != 0) {
+      log_kat_failure("ciphertext mismatch");
+      ThrowCryptoError("AES-GCM KAT ciphertext mismatch"); // TSK123_Missing_Constant_Time_Comparisons constant-time compare
     }
     if (!qv::crypto::ct::CompareEqual(enc.tag, tv.tag)) {
-      ThrowCryptoError("AES-GCM KAT tag mismatch #" + std::to_string(index));
+      log_kat_failure("tag mismatch");
+      ThrowCryptoError("AES-GCM KAT tag mismatch"); // TSK123_Missing_Constant_Time_Comparisons
     }
 
     const auto dec = provider.DecryptAES256GCM(
@@ -258,9 +257,17 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
         std::span<const uint8_t, AES256_GCM::TAG_SIZE>(tv.tag),
         std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key));
 
-    if (!constant_time_equal(std::span<const uint8_t>(dec.data(), dec.size()),
-                             std::span<const uint8_t>(tv.plaintext.data(), tv.plaintext.size()))) {
-      ThrowCryptoError("AES-GCM KAT decrypt mismatch #" + std::to_string(index));
+    auto plaintext_span = std::span<const uint8_t>(dec.data(), dec.size());
+    auto expected_plaintext_span =
+        std::span<const uint8_t>(tv.plaintext.data(), tv.plaintext.size());
+    if (plaintext_span.size() != expected_plaintext_span.size()) {
+      log_kat_failure("plaintext length mismatch");
+      ThrowCryptoError("AES-GCM KAT decrypt mismatch");
+    }
+    if (!plaintext_span.empty() &&
+        CRYPTO_memcmp(plaintext_span.data(), expected_plaintext_span.data(), plaintext_span.size()) != 0) {
+      log_kat_failure("plaintext mismatch");
+      ThrowCryptoError("AES-GCM KAT decrypt mismatch");
     }
 
     if (!tv.ciphertext.empty()) {
@@ -273,7 +280,8 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
             std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(tv.nonce),
             std::span<const uint8_t, AES256_GCM::TAG_SIZE>(tv.tag),
             std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key));
-        ThrowCryptoError("AES-GCM tamper (ciphertext) undetected #" + std::to_string(index));
+        log_kat_failure("tampered ciphertext accepted");
+        ThrowCryptoError("AES-GCM tamper (ciphertext) undetected");
       } catch (const qv::AuthenticationFailureError&) {
         // Expected failure
       }
@@ -288,7 +296,8 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
           std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(tv.nonce),
           std::span<const uint8_t, AES256_GCM::TAG_SIZE>(tampered_tag),
           std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key));
-      ThrowCryptoError("AES-GCM tamper (tag) undetected #" + std::to_string(index));
+      log_kat_failure("tampered tag accepted");
+      ThrowCryptoError("AES-GCM tamper (tag) undetected");
     } catch (const qv::AuthenticationFailureError&) {
       // Expected failure
     }

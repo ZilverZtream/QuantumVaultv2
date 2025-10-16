@@ -61,6 +61,8 @@ ChunkHeader PrepareHeaderForWrite(const ChunkHeader& header, std::span<const uin
   ChunkHeader prepared = header;
   prepared.integrity_version = qv::ToLittleEndian(kHeaderIntegrityVersion);
   prepared.header_mac.fill(0);
+  std::fill(std::begin(prepared.reserved), std::end(prepared.reserved),
+            0); // TSK123_Missing_Constant_Time_Comparisons sanitize reserved fields for MAC binding
   const HeaderMac mac = ComputeHeaderMAC(prepared, key);
   prepared.header_mac = mac;
   return prepared;
@@ -68,13 +70,17 @@ ChunkHeader PrepareHeaderForWrite(const ChunkHeader& header, std::span<const uin
 
 void VerifyHeaderMACOrThrow(ChunkHeader& header, std::span<const uint8_t> key) {
   const uint32_t version = qv::FromLittleEndian32(header.integrity_version);
-  if (version != kHeaderIntegrityVersion) {
+  const uint32_t version_diff =
+      version ^ kHeaderIntegrityVersion; // TSK123_Missing_Constant_Time_Comparisons constant-time CRC-style diff
+  if (version_diff != 0) {
     throw Error{ErrorDomain::Validation, 0,
                 "Chunk header integrity version unsupported"}; // TSK122_Weak_CRC32_for_Chunk_Headers
   }
   const HeaderMac stored_mac = header.header_mac;
   ChunkHeader canonical = header;
   canonical.header_mac.fill(0);
+  std::fill(std::begin(canonical.reserved), std::end(canonical.reserved),
+            0); // TSK123_Missing_Constant_Time_Comparisons canonicalize reserved bytes before MAC
   const HeaderMac computed = ComputeHeaderMAC(canonical, key);
   if (!qv::crypto::ct::CompareEqual(stored_mac, computed)) {
     throw Error{ErrorDomain::Validation, 0, "Chunk header MAC mismatch"};
