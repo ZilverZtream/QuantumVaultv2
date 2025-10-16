@@ -3,6 +3,7 @@
 // TSK062_FUSE_Filesystem_Integration_Linux simple chunk-backed filesystem façade
 
 #include <algorithm>
+#include <array>     // TSK127_Incorrect_Filesystem_Metadata_Recovery base64 decoding table
 #include <cassert>
 #include <cerrno>   // TSK116_Incorrect_Error_Propagation propagate validation errno details
 #include <charconv> // TSK121_Missing_Authentication_in_Metadata robust numeric parsing
@@ -17,6 +18,8 @@
 #include <sstream>
 #include <string_view>
 #include <vector>
+
+#include <zstd.h>  // TSK127_Incorrect_Filesystem_Metadata_Recovery metadata compression support
 
 #if defined(__linux__)
 #include <unistd.h>
@@ -291,6 +294,117 @@ std::optional<std::vector<uint8_t>> HexDecode(const std::string& hex) {  // TSK1
   return decoded;
 }
 
+std::string Base64Encode(std::span<const uint8_t> data) {  // TSK127_Incorrect_Filesystem_Metadata_Recovery metadata payload encoding
+  static constexpr char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string encoded;
+  encoded.reserve(((data.size() + 2) / 3) * 4);
+  size_t index = 0;
+  while (index + 3 <= data.size()) {
+    uint32_t triple = (static_cast<uint32_t>(data[index]) << 16) |
+                      (static_cast<uint32_t>(data[index + 1]) << 8) |
+                      static_cast<uint32_t>(data[index + 2]);
+    encoded.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+    encoded.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+    encoded.push_back(kAlphabet[(triple >> 6) & 0x3F]);
+    encoded.push_back(kAlphabet[triple & 0x3F]);
+    index += 3;
+  }
+  size_t remaining = data.size() - index;
+  if (remaining == 1) {
+    uint32_t triple = static_cast<uint32_t>(data[index]) << 16;
+    encoded.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+    encoded.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+    encoded.push_back('=');
+    encoded.push_back('=');
+  } else if (remaining == 2) {
+    uint32_t triple = (static_cast<uint32_t>(data[index]) << 16) |
+                      (static_cast<uint32_t>(data[index + 1]) << 8);
+    encoded.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+    encoded.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+    encoded.push_back(kAlphabet[(triple >> 6) & 0x3F]);
+    encoded.push_back('=');
+  }
+  return encoded;
+}
+
+std::optional<std::vector<uint8_t>> Base64Decode(std::string_view input) {  // TSK127_Incorrect_Filesystem_Metadata_Recovery metadata payload decoding
+  std::string filtered;
+  filtered.reserve(input.size());
+  for (char ch : input) {
+    if (!std::isspace(static_cast<unsigned char>(ch))) {
+      filtered.push_back(ch);
+    }
+  }
+  if (filtered.empty() || filtered.size() % 4 != 0) {
+    return std::nullopt;
+  }
+  static constexpr uint8_t kInvalid = 0xFF;
+  static constexpr std::array<uint8_t, 256> kReverse = [] {
+    std::array<uint8_t, 256> map{};
+    map.fill(kInvalid);
+    const std::string alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < alphabet.size(); ++i) {
+      map[static_cast<uint8_t>(alphabet[i])] = static_cast<uint8_t>(i);
+    }
+    map[static_cast<uint8_t>('=')] = 0;
+    return map;
+  }();
+  size_t output_length = (filtered.size() / 4) * 3;
+  if (filtered.back() == '=') {
+    --output_length;
+    if (filtered.size() >= 2 && filtered[filtered.size() - 2] == '=') {
+      --output_length;
+    }
+  }
+  std::vector<uint8_t> decoded(output_length, 0);
+  size_t out_index = 0;
+  for (size_t i = 0; i < filtered.size(); i += 4) {
+    uint8_t a = kReverse[static_cast<uint8_t>(filtered[i])];
+    uint8_t b = kReverse[static_cast<uint8_t>(filtered[i + 1])];
+    uint8_t c = kReverse[static_cast<uint8_t>(filtered[i + 2])];
+    uint8_t d = kReverse[static_cast<uint8_t>(filtered[i + 3])];
+    if (a == kInvalid || b == kInvalid || c == kInvalid || d == kInvalid) {
+      return std::nullopt;
+    }
+    uint32_t triple = (static_cast<uint32_t>(a) << 18) |
+                      (static_cast<uint32_t>(b) << 12) |
+                      (static_cast<uint32_t>(c) << 6) |
+                      static_cast<uint32_t>(d);
+    decoded[out_index++] = static_cast<uint8_t>((triple >> 16) & 0xFF);
+    if (filtered[i + 2] != '=') {
+      decoded[out_index++] = static_cast<uint8_t>((triple >> 8) & 0xFF);
+    }
+    if (filtered[i + 3] != '=') {
+      decoded[out_index++] = static_cast<uint8_t>(triple & 0xFF);
+    }
+  }
+  decoded.resize(out_index);
+  return decoded;
+}
+
+std::optional<std::string> CompressMetadataBody(const std::string& body) {  // TSK127_Incorrect_Filesystem_Metadata_Recovery zstd framing
+  if (body.empty()) {
+    return std::nullopt;
+  }
+  size_t bound = ZSTD_compressBound(body.size());
+  std::vector<uint8_t> compressed(bound);
+  size_t compressed_size = ZSTD_compress(compressed.data(), bound, body.data(), body.size(), 3);
+  if (ZSTD_isError(compressed_size)) {
+    return std::nullopt;
+  }
+  compressed.resize(compressed_size);
+  if (compressed.size() >= body.size()) {
+    return std::nullopt;
+  }
+  auto encoded = Base64Encode(std::span<const uint8_t>(compressed.data(), compressed.size()));
+  std::ostringstream framed;
+  framed << "ENC ZSTD " << body.size() << ' ' << compressed.size() << '\n';
+  framed << encoded << '\n';
+  return framed.str();
+}
+
 bool ConstantTimeEqual(std::span<const uint8_t> a, std::span<const uint8_t> b) {  // TSK121_Missing_Authentication_in_Metadata
   if (a.size() != b.size()) {
     return false;
@@ -339,6 +453,12 @@ struct MetadataParseContext {  // TSK121_Missing_Authentication_in_Metadata incr
   uint64_t next_chunk_index;
   bool next_seen;
   uint64_t data_start_chunk;
+  uint64_t max_reasonable_next{0};                        // TSK127_Incorrect_Filesystem_Metadata_Recovery NEXT guardrail
+  bool best_effort{false};                                // TSK127_Incorrect_Filesystem_Metadata_Recovery recovery flag
+  size_t total_entries{0};                                // TSK127_Incorrect_Filesystem_Metadata_Recovery tracking
+  size_t skipped_entries{0};                              // TSK127_Incorrect_Filesystem_Metadata_Recovery tracking
+  size_t rescued_entries{0};                              // TSK127_Incorrect_Filesystem_Metadata_Recovery salvage stats
+  std::vector<std::string> rescued_paths;                 // TSK127_Incorrect_Filesystem_Metadata_Recovery salvage audit
 };
 
 DirectoryEntry* EnsureDirectoryForMetadata(MetadataParseContext& context, const std::string& path) {
@@ -379,12 +499,18 @@ bool ApplyNextMetadataEntry(const std::vector<std::string>& tokens, MetadataPars
   if (tokens.size() != 2) {
     return false;
   }
+  if (context.next_seen) {
+    return false;  // TSK127_Incorrect_Filesystem_Metadata_Recovery reject duplicate NEXT entries
+  }
   uint64_t next = 0;
   if (!ParseUint64Token(tokens[1], &next)) {
     return false;
   }
   if (next < context.data_start_chunk) {
     return false;
+  }
+  if (context.max_reasonable_next != 0 && next > context.max_reasonable_next) {
+    return false;  // TSK127_Incorrect_Filesystem_Metadata_Recovery clamp unreasonable cursor
   }
   context.next_chunk_index = next;
   context.next_seen = true;
@@ -488,6 +614,76 @@ bool ApplyFileMetadataEntry(const std::vector<std::string>& tokens, MetadataPars
   return true;
 }
 
+bool AttemptRescueFromTokens(const std::vector<std::string>& tokens, MetadataParseContext& context) {
+  if (tokens.empty()) {
+    return false;
+  }
+  const auto& tag = tokens[0];
+  if (tag == "DIR" && tokens.size() >= 2) {
+    auto path = UnescapeMetadataToken(tokens[1]);
+    if (!path) {
+      return false;
+    }
+    auto* dir = EnsureDirectoryForMetadata(context, *path);
+    if (!dir) {
+      return false;
+    }
+    dir->mtime = CurrentTimespec();
+    context.rescued_paths.push_back(*path);
+    return true;
+  }
+  if (tag == "FILE" && tokens.size() >= 4) {
+    auto path = UnescapeMetadataToken(tokens[1]);
+    if (!path) {
+      return false;
+    }
+    uint64_t size = 0;
+    uint64_t start_chunk = 0;
+    if (!ParseUint64Token(tokens[2], &size) || !ParseUint64Token(tokens[3], &start_chunk)) {
+      return false;
+    }
+    if (start_chunk < context.data_start_chunk) {
+      return false;
+    }
+    if (kChunkPayloadSize != 0 &&
+        start_chunk > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+      return false;
+    }
+    std::filesystem::path fs_path(*path);
+    auto parent_path = fs_path.parent_path().string();
+    if (parent_path.empty()) {
+      parent_path = "/";
+    }
+    auto* dir = EnsureDirectoryForMetadata(context, parent_path);
+    if (!dir) {
+      return false;
+    }
+    auto filename = fs_path.filename().string();
+    if (filename.empty()) {
+      return false;
+    }
+    FileEntry entry{};
+    entry.name = filename;
+    entry.size = size;
+    entry.start_offset = start_chunk * kChunkPayloadSize;
+    entry.mode = kDefaultFileMode;
+    entry.mtime = CurrentTimespec();
+    entry.ctime = entry.mtime;
+    entry.uid = 0;
+    entry.gid = 0;
+    auto it = std::find_if(dir->files.begin(), dir->files.end(),
+                           [&](const FileEntry& existing) { return existing.name == entry.name; });
+    if (it != dir->files.end()) {
+      *it = entry;
+    } else {
+      dir->files.push_back(entry);
+    }
+    context.rescued_paths.push_back(*path);
+    return true;
+  }
+  return false;
+}
+
 bool ApplyMetadataTokens(const std::vector<std::string>& tokens, MetadataParseContext& context) {
   if (tokens.empty()) {
     return false;
@@ -553,9 +749,18 @@ VolumeFilesystem::VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device)
   next_chunk_index_ = data_start_chunk_;
   next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
 
+  bool metadata_loaded = false;
   try {
-    LoadMetadata();
+    metadata_loaded = LoadMetadata();
   } catch (...) {
+    try {
+      metadata_loaded = LoadMetadata(true);
+    } catch (...) {
+      InitializeFreshMetadata();
+      metadata_loaded = false;
+    }
+  }
+  if (!metadata_loaded || metadata_dirty_) {
     FilesystemMutexGuard lock(fs_mutex_);
     MetadataWritebackGuard metadata_guard(*this);
     metadata_guard.MarkDirty();
@@ -1578,6 +1783,19 @@ void VolumeFilesystem::SerializeDirectory(std::ostringstream& out, const Directo
   }
 }
 
+void VolumeFilesystem::InitializeFreshMetadata() {  // TSK127_Incorrect_Filesystem_Metadata_Recovery shared reset helper
+  root_->files.clear();
+  root_->subdirs.clear();
+  root_->name = "/";
+  root_->mtime = CurrentTimespec();
+  next_chunk_index_ = data_start_chunk_;
+  next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
+  metadata_dirty_ = true;
+  last_metadata_total_entries_ = 0;
+  last_metadata_skipped_entries_ = 0;
+  last_metadata_rescued_entries_ = 0;
+}
+
 void VolumeFilesystem::SaveMetadata() {
   FilesystemMutexGuard lock(fs_mutex_);
   MarkMetadataDirtyLocked();
@@ -1601,19 +1819,31 @@ void VolumeFilesystem::PersistMetadataLocked() {
   serialized << "NEXT " << next_chunk_index_ << '\n';
   SerializeDirectory(serialized, root_.get(), "/");
   auto body = serialized.str();
-  auto mac_key = device_->MetadataMacKey();
-  auto mac = qv::crypto::HMAC_SHA256::Compute(
-      std::span<const uint8_t>(mac_key.data(), mac_key.size()),
-      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
-  std::ostringstream framed;
-  framed << "MAC " << HexEncode(std::span<const uint8_t>(mac.data(), mac.size())) << '\n' << body;
-  auto payload = framed.str();  // TSK121_Missing_Authentication_in_Metadata authenticate metadata contents
+  std::string body_payload = body;
   const size_t total_bytes = metadata_chunk_count_ * kChunkPayloadSize;
+  auto build_payload = [&](const std::string& body_data) {
+    auto mac_key = device_->MetadataMacKey();
+    auto mac = qv::crypto::HMAC_SHA256::Compute(
+        std::span<const uint8_t>(mac_key.data(), mac_key.size()),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body_data.data()), body_data.size()));
+    std::ostringstream framed;
+    framed << "MAC " << HexEncode(std::span<const uint8_t>(mac.data(), mac.size()))
+           << '\n' << body_data;
+    return framed.str();
+  };
+
+  auto payload = build_payload(body_payload);  // TSK127_Incorrect_Filesystem_Metadata_Recovery adaptive payload sizing
   if (payload.size() > total_bytes) {
-    throw qv::Error{qv::ErrorDomain::State, 0, "Metadata size exceeds reserved area"};
+    if (auto compressed = CompressMetadataBody(body)) {
+      body_payload = *compressed;
+      payload = build_payload(body_payload);
+    }
+    if (payload.size() > total_bytes) {
+      throw qv::Error{qv::ErrorDomain::State, 0, "Metadata size exceeds reserved area"};
+    }
   }
   std::vector<uint8_t> buffer(total_bytes, 0);
-  std::memcpy(buffer.data(), payload.data(), payload.size());
+  std::memcpy(buffer.data(), payload.data(), std::min(buffer.size(), payload.size()));
   for (uint64_t i = 0; i < metadata_chunk_count_; ++i) {
     storage::ChunkHeader header{};
     header.chunk_index = static_cast<int64_t>(metadata_chunk_start_ + i);
@@ -1626,73 +1856,140 @@ void VolumeFilesystem::PersistMetadataLocked() {
   }
 }
 
-void VolumeFilesystem::LoadMetadata() {
-  auto reset_to_empty = [&]() {
-    root_->files.clear();
-    root_->subdirs.clear();
-    root_->name = "/";
-    root_->mtime = CurrentTimespec();
-    next_chunk_index_ = data_start_chunk_;
-    next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
-  };
+bool VolumeFilesystem::LoadMetadata(bool best_effort) {
+  last_metadata_best_effort_ = best_effort;
+  last_metadata_total_entries_ = 0;
+  last_metadata_skipped_entries_ = 0;
+  last_metadata_rescued_entries_ = 0;
 
   std::vector<uint8_t> buffer(metadata_chunk_count_ * kChunkPayloadSize, 0);
-  size_t bytes_read = 0;
+  bool had_chunk_failure = false;
+  size_t valid_chunks = 0;
   for (uint64_t i = 0; i < metadata_chunk_count_; ++i) {
     try {
       auto chunk = device_->ReadChunk(static_cast<int64_t>(metadata_chunk_start_ + i));
-      std::copy(chunk.ciphertext.begin(), chunk.ciphertext.end(),
-                buffer.begin() + static_cast<std::ptrdiff_t>(i * kChunkPayloadSize));
-      bytes_read += chunk.ciphertext.size();
+      const auto& ciphertext = chunk.ciphertext;
+      const size_t offset = static_cast<size_t>(i * kChunkPayloadSize);
+      const size_t copy_size = std::min(ciphertext.size(), static_cast<size_t>(kChunkPayloadSize));
+      std::copy(ciphertext.begin(), ciphertext.begin() + copy_size,
+                buffer.begin() + static_cast<std::ptrdiff_t>(offset));
+      ++valid_chunks;
     } catch (...) {
-      if (bytes_read == 0) {
-        reset_to_empty();
-        return;
-      }
-      break;
+      had_chunk_failure = true;  // TSK127_Incorrect_Filesystem_Metadata_Recovery continue best-effort read
     }
   }
-  if (bytes_read == 0) {
-    reset_to_empty();
-    return;
-  }
-  std::string serialized(reinterpret_cast<char*>(buffer.data()), bytes_read);
-  auto null_pos = serialized.find('\0');
-  if (null_pos != std::string::npos) {
-    serialized.resize(null_pos);
-  }
-  if (serialized.empty()) {
-    reset_to_empty();
-    return;
+  if (valid_chunks == 0) {
+    InitializeFreshMetadata();
+    return false;
   }
 
+  size_t used_bytes = buffer.size();
+  while (used_bytes > 0 && buffer[used_bytes - 1] == 0) {
+    --used_bytes;
+  }
+  if (used_bytes == 0) {
+    InitializeFreshMetadata();
+    return false;
+  }
+
+  std::string serialized(reinterpret_cast<char*>(buffer.data()), used_bytes);
   auto newline_pos = serialized.find('\n');
   if (newline_pos == std::string::npos) {
-    reset_to_empty();
+    InitializeFreshMetadata();
     metadata_dirty_ = true;
-    return;
+    return false;
   }
+
   auto mac_line = serialized.substr(0, newline_pos);
-  auto body = serialized.substr(newline_pos + 1);
+  std::string body = serialized.substr(newline_pos + 1);
+
+  bool mac_valid = false;
   auto mac_tokens = SplitMetadataTokens(mac_line);
-  if (!mac_tokens || mac_tokens->size() != 2 || (*mac_tokens)[0] != "MAC") {
-    reset_to_empty();
-    metadata_dirty_ = true;
-    return;
+  if (mac_tokens && mac_tokens->size() == 2 && (*mac_tokens)[0] == "MAC") {
+    auto mac_bytes = HexDecode((*mac_tokens)[1]);
+    if (mac_bytes && mac_bytes->size() == qv::crypto::HMAC_SHA256::TAG_SIZE) {
+      auto mac_key = device_->MetadataMacKey();
+      auto computed = qv::crypto::HMAC_SHA256::Compute(
+          std::span<const uint8_t>(mac_key.data(), mac_key.size()),
+          std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+      mac_valid = ConstantTimeEqual(
+          std::span<const uint8_t>(computed.data(), computed.size()),
+          std::span<const uint8_t>(mac_bytes->data(), mac_bytes->size()));
+    }
   }
-  auto mac_bytes = HexDecode((*mac_tokens)[1]);
-  if (!mac_bytes || mac_bytes->size() != qv::crypto::HMAC_SHA256::TAG_SIZE) {
-    reset_to_empty();
+  if (!mac_valid) {
+    if (!best_effort) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Metadata MAC verification failed"};
+    }
     metadata_dirty_ = true;
-    return;
   }
-  auto mac_key = device_->MetadataMacKey();
-  auto computed = qv::crypto::HMAC_SHA256::Compute(
-      std::span<const uint8_t>(mac_key.data(), mac_key.size()),
-      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
-  if (!ConstantTimeEqual(std::span<const uint8_t>(computed.data(), computed.size()),
-                         std::span<const uint8_t>(mac_bytes->data(), mac_bytes->size()))) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0, "Metadata MAC verification failed"};
+
+  std::string metadata_text;
+  bool compressed_body = false;
+  if (body.rfind("ENC ", 0) == 0) {
+    auto header_end = body.find('\n');
+    if (header_end == std::string::npos) {
+      if (!best_effort) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Compressed metadata missing terminator"};
+      }
+      InitializeFreshMetadata();
+      return false;
+    }
+    auto header = body.substr(0, header_end);
+    auto encoding_tokens = SplitMetadataTokens(header);
+    if (!encoding_tokens || encoding_tokens->size() != 4 || (*encoding_tokens)[0] != "ENC" ||
+        (*encoding_tokens)[1] != "ZSTD") {
+      if (!best_effort) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Unsupported metadata encoding"};
+      }
+      metadata_dirty_ = true;
+    } else {
+      uint64_t original_size = 0;
+      uint64_t compressed_size = 0;
+      if (!ParseUint64Token((*encoding_tokens)[2], &original_size) ||
+          !ParseUint64Token((*encoding_tokens)[3], &compressed_size)) {
+        if (!best_effort) {
+          throw qv::Error{qv::ErrorDomain::Validation, 0, "Invalid compressed metadata lengths"};
+        }
+        metadata_dirty_ = true;
+      } else {
+        if (original_size > std::numeric_limits<size_t>::max()) {
+          if (!best_effort) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0, "Compressed metadata length overflow"};
+          }
+          metadata_dirty_ = true;
+          original_size = 0;
+        }
+        auto encoded_data = body.substr(header_end + 1);
+        auto decoded = Base64Decode(encoded_data);
+        if (!decoded || decoded->size() != compressed_size || original_size == 0) {
+          if (!best_effort) {
+            throw qv::Error{qv::ErrorDomain::Validation, 0, "Compressed metadata payload truncated"};
+          }
+          metadata_dirty_ = true;
+        } else {
+          std::string decompressed(static_cast<size_t>(original_size), '\0');
+          size_t result = ZSTD_decompress(decompressed.data(), decompressed.size(), decoded->data(), decoded->size());
+          if (ZSTD_isError(result) || result != static_cast<size_t>(original_size)) {
+            if (!best_effort) {
+              throw qv::Error{qv::ErrorDomain::Validation, 0, "Metadata decompression failed"};
+            }
+            metadata_dirty_ = true;
+          } else {
+            metadata_text.assign(decompressed.begin(), decompressed.end());
+            compressed_body = true;
+          }
+        }
+      }
+    }
+  }
+  if (!compressed_body) {
+    metadata_text = body;
+  }
+  if (metadata_text.empty()) {
+    InitializeFreshMetadata();
+    metadata_dirty_ = true;
+    return false;
   }
 
   MetadataParseContext context{};
@@ -1702,24 +1999,38 @@ void VolumeFilesystem::LoadMetadata() {
   context.next_chunk_index = data_start_chunk_;
   context.next_seen = false;
   context.data_start_chunk = data_start_chunk_;
+  context.max_reasonable_next =
+      data_start_chunk_ + static_cast<uint64_t>(storage::kChunksPerGroup) * storage::kChunksPerGroup;
+  if (context.max_reasonable_next < data_start_chunk_) {
+    context.max_reasonable_next = 0;
+  }
+  context.best_effort = best_effort;
 
   bool parse_error = false;
   size_t applied_lines = 0;
-  std::istringstream iss(body);
+  std::istringstream iss(metadata_text);
   std::string line;
   while (std::getline(iss, line)) {
     if (line.empty()) {
       continue;
     }
+    context.total_entries++;
     auto tokens = SplitMetadataTokens(line);
     if (!tokens) {
       parse_error = true;
+      context.skipped_entries++;
       continue;
     }
     if (ApplyMetadataTokens(*tokens, context)) {
       ++applied_lines;
+      continue;
+    }
+    parse_error = true;
+    if (context.best_effort && AttemptRescueFromTokens(*tokens, context)) {
+      context.rescued_entries++;
+      ++applied_lines;
     } else {
-      parse_error = true;
+      context.skipped_entries++;
     }
   }
 
@@ -1738,9 +2049,9 @@ void VolumeFilesystem::LoadMetadata() {
   }
 
   if (!context.root) {
-    reset_to_empty();
+    InitializeFreshMetadata();
     metadata_dirty_ = true;
-    return;
+    return false;
   }
 
   root_ = context.root;
@@ -1749,9 +2060,16 @@ void VolumeFilesystem::LoadMetadata() {
   if (applied_lines == 0) {
     root_->mtime = CurrentTimespec();
   }
-  if (parse_error) {
+
+  last_metadata_total_entries_ = context.total_entries;
+  last_metadata_skipped_entries_ = context.skipped_entries;
+  last_metadata_rescued_entries_ = context.rescued_entries;
+
+  if (parse_error || had_chunk_failure || !mac_valid || context.rescued_entries > 0 ||
+      context.skipped_entries > 0) {
     metadata_dirty_ = true;
   }
+  return applied_lines > 0;
 }
 
 timespec VolumeFilesystem::CurrentTimespec() {

@@ -83,6 +83,10 @@ class VolumeFilesystem {
   uint64_t data_start_chunk_ = 0;
   uint64_t next_chunk_index_ = 0;
   bool metadata_dirty_ = false;  // TSK117_Race_Conditions_in_Filesystem batch metadata persistence
+  size_t last_metadata_total_entries_ = 0;      // TSK127_Incorrect_Filesystem_Metadata_Recovery recovery accounting
+  size_t last_metadata_skipped_entries_ = 0;    // TSK127_Incorrect_Filesystem_Metadata_Recovery recovery accounting
+  size_t last_metadata_rescued_entries_ = 0;    // TSK127_Incorrect_Filesystem_Metadata_Recovery salvage accounting
+  bool last_metadata_best_effort_ = false;      // TSK127_Incorrect_Filesystem_Metadata_Recovery remember recovery mode
 
 public:
   explicit VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device);
@@ -138,7 +142,8 @@ private:
   void FlushMetadataLocked();
   void SaveMetadata();
   void PersistMetadataLocked();
-  void LoadMetadata();  // TSK121_Missing_Authentication_in_Metadata hardened metadata recovery
+  bool LoadMetadata(bool best_effort = false);  // TSK121_Missing_Authentication_in_Metadata hardened metadata recovery
+  void InitializeFreshMetadata();               // TSK127_Incorrect_Filesystem_Metadata_Recovery reset helper
   void SerializeDirectory(std::ostringstream& out, const DirectoryEntry* dir,
                           const std::string& path);
   static timespec CurrentTimespec();
