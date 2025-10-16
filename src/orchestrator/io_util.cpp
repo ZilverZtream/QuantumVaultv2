@@ -1,18 +1,25 @@
 #include "qv/orchestrator/io_util.h"
 
 #include "qv/common.h"  // TSK109_Error_Code_Handling UTF-8 path diagnostics
+#include "qv/crypto/random.h"  // TSK140_Temporary_File_Security_Vulnerabilities entropy for temp tokens
 
+#include <array>   // TSK140_Temporary_File_Security_Vulnerabilities token generation
 #include <cerrno>
 #include <chrono>   // TSK101_File_IO_Persistence_and_Atomicity retry backoff
+#include <csignal>  // TSK140_Temporary_File_Security_Vulnerabilities signal cleanup hooks
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // TSK140_Temporary_File_Security_Vulnerabilities atexit hooks
 #include <filesystem>
 #include <iostream> // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
+#include <mutex>    // TSK140_Temporary_File_Security_Vulnerabilities tracked temp registry
 #include <span>
 #include <sstream>      // TSK109_Error_Code_Handling formatted context traces
 #include <string>
 #include <string_view>  // TSK109_Error_Code_Handling context formatter interface
 #include <type_traits>  // TSK109_Error_Code_Handling generic context helpers
+#include <unordered_set>  // TSK140_Temporary_File_Security_Vulnerabilities track active temps
+#include <vector>         // TSK140_Temporary_File_Security_Vulnerabilities batched cleanup
 #include <system_error>
 #include <thread> // TSK101_File_IO_Persistence_and_Atomicity retry backoff
 
@@ -45,6 +52,8 @@ constexpr const char* kAtomicReplaceErrorMessage =
     "Atomic file replace failed"; // TSK068_Atomic_Header_Writes uniform error text
 constexpr const char* kAtomicUnsupportedMessage =
     "Filesystem does not support atomic rename"; // TSK107_Platform_Specific_Issues user-facing error
+constexpr const char* kTempFilesystemUnencryptedMessage =
+    "Temporary path is not on an encrypted filesystem"; // TSK140_Temporary_File_Security_Vulnerabilities enforcement message
 
 class ErrorContext { // TSK109_Error_Code_Handling accumulate nested call context
  public:
@@ -429,9 +438,79 @@ void WriteAll(int fd, std::span<const uint8_t> payload, ErrorContext& ctx) { // 
   }
 }
 
+class TempFileRegistry { // TSK140_Temporary_File_Security_Vulnerabilities global cleanup coordinator
+ public:
+  static TempFileRegistry& Instance() {
+    static TempFileRegistry instance;
+    return instance;
+  }
+
+  void Track(const std::filesystem::path& path) {
+    EnsureHandlers();
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracked_.insert(path);
+  }
+
+  void Untrack(const std::filesystem::path& path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracked_.erase(path);
+  }
+
+  void CleanupAll() noexcept {
+    std::vector<std::filesystem::path> snapshot;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot.assign(tracked_.begin(), tracked_.end());
+      tracked_.clear();
+    }
+    for (const auto& candidate : snapshot) {
+      std::error_code ec;
+      if (!std::filesystem::remove(candidate, ec) && ec) {
+        std::cerr << "TempFileRegistry cleanup failed for " << candidate << ": " << ec.message()
+                  << '\n';
+      }
+    }
+  }
+
+  static void HandleSignal(int signal) noexcept {
+    TempFileRegistry::Instance().CleanupAll();
+    std::signal(signal, SIG_DFL);
+    std::raise(signal);
+  }
+
+ private:
+  TempFileRegistry() = default;
+
+  void EnsureHandlers() {
+    std::call_once(handlers_once_, [] {
+      std::atexit([] { TempFileRegistry::Instance().CleanupAll(); });
+#if defined(SIGINT)
+      std::signal(SIGINT, TempFileRegistry::HandleSignal);
+#endif
+#if defined(SIGTERM)
+      std::signal(SIGTERM, TempFileRegistry::HandleSignal);
+#endif
+#if defined(SIGHUP)
+      std::signal(SIGHUP, TempFileRegistry::HandleSignal);
+#endif
+#if defined(SIGQUIT)
+      std::signal(SIGQUIT, TempFileRegistry::HandleSignal);
+#endif
+    });
+  }
+
+  std::mutex mutex_;
+  std::unordered_set<std::filesystem::path> tracked_;
+  std::once_flag handlers_once_;
+};
+
 class TempFileGuard { // TSK068_Atomic_Header_Writes ensure cleanup on failure
  public:
-  explicit TempFileGuard(std::filesystem::path path) noexcept : path_(std::move(path)) {}
+  explicit TempFileGuard(std::filesystem::path path) noexcept : path_(std::move(path)) {
+    if (!path_.empty()) {
+      TempFileRegistry::Instance().Track(path_); // TSK140_Temporary_File_Security_Vulnerabilities ensure lifecycle tracking
+    }
+  }
   TempFileGuard(const TempFileGuard&) = delete;
   TempFileGuard& operator=(const TempFileGuard&) = delete;
   ~TempFileGuard() noexcept {
@@ -440,23 +519,117 @@ class TempFileGuard { // TSK068_Atomic_Header_Writes ensure cleanup on failure
       if (!std::filesystem::remove(path_, ec) && ec) { // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
         std::cerr << "TempFileGuard cleanup failed for " << path_ << ": " << ec.message()
                   << '\n';
+      } else {
+        TempFileRegistry::Instance().Untrack(path_); // TSK140_Temporary_File_Security_Vulnerabilities stop tracking once removed
       }
     }
   }
 
-  void Release() noexcept { path_.clear(); }
+  void Release() noexcept {
+    if (!path_.empty()) {
+      TempFileRegistry::Instance().Untrack(path_); // TSK140_Temporary_File_Security_Vulnerabilities manual lifecycle release
+    }
+    path_.clear();
+  }
 
  private:
   std::filesystem::path path_;
 };
 
+std::string GenerateTempToken() { // TSK140_Temporary_File_Security_Vulnerabilities cryptographically strong token
+  std::array<uint8_t, 16> random{};
+  qv::crypto::SystemRandomBytes(std::span<uint8_t>(random.data(), random.size()));
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string token;
+  token.reserve(random.size() * 2);
+  for (auto byte : random) {
+    token.push_back(kHex[(byte >> 4) & 0x0F]);
+    token.push_back(kHex[byte & 0x0F]);
+  }
+  return token;
+}
+
 std::filesystem::path MakeTempPath(const std::filesystem::path& dir,
                                    const std::filesystem::path& base) { // TSK068_Atomic_Header_Writes unique temp
-  auto token = std::filesystem::unique_path("%%%%%%%%");
+  const auto token = GenerateTempToken(); // TSK140_Temporary_File_Security_Vulnerabilities expand entropy surface
   std::filesystem::path temp_name = base.filename();
   temp_name += ".tmp.";
   temp_name += token;
   return dir / temp_name; // TSK107_Platform_Specific_Issues avoid lossy conversions
+}
+
+bool PathOnEncryptedFilesystem(const std::filesystem::path& dir) { // TSK140_Temporary_File_Security_Vulnerabilities enforce encrypted staging
+  std::filesystem::path probe = dir;
+  if (probe.empty()) {
+    std::error_code ec;
+    probe = std::filesystem::current_path(ec);
+    if (ec) {
+      return false;
+    }
+  }
+
+#if defined(_WIN32)
+  const std::wstring native = ToWidePath(probe);
+  const DWORD attributes = ::GetFileAttributesW(native.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    return false;
+  }
+#if defined(FILE_ATTRIBUTE_ENCRYPTED)
+  if ((attributes & FILE_ATTRIBUTE_ENCRYPTED) != 0U) {
+    return true;
+  }
+#endif
+  return false;
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+  struct statfs info {
+  };
+  if (::statfs(probe.c_str(), &info) != 0) {
+    return false;
+  }
+#if defined(MNT_CRYPT)
+  return (info.f_flags & MNT_CRYPT) != 0;
+#else
+  return false;
+#endif
+#elif defined(__linux__) && defined(STATX_ATTR_ENCRYPTED)
+  struct statx encrypted {
+  };
+  if (::statx(AT_FDCWD, probe.c_str(), AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+              STATX_BASIC_STATS | STATX_ATTRIBUTES, &encrypted) != 0) {
+    return false;
+  }
+  if ((encrypted.stx_attributes_mask & STATX_ATTR_ENCRYPTED) == 0) {
+    return false;
+  }
+  return (encrypted.stx_attributes & STATX_ATTR_ENCRYPTED) != 0;
+#else
+  (void)probe;
+  return false;
+#endif
+}
+
+void EnsurePrivatePermissions(int fd, const std::filesystem::path& path, const ErrorContext& ctx) {
+#if defined(_WIN32)
+  (void)fd;
+  const std::wstring native = ToWidePath(path);
+  if (_wchmod(native.c_str(), _S_IREAD | _S_IWRITE) != 0) {
+    const int saved_error = errno;
+    ThrowIoError(ctx,
+                 saved_error,
+                 std::string(kAtomicReplaceErrorMessage) + ": failed to harden temp file permissions",
+                 saved_error,
+                 ClassifyNativeError(saved_error)); // TSK140_Temporary_File_Security_Vulnerabilities enforce private ACLs
+  }
+#else
+  if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+    const int saved_errno = errno;
+    ThrowIoError(ctx,
+                 saved_errno,
+                 std::string(kAtomicReplaceErrorMessage) + ": failed to harden temp file permissions",
+                 saved_errno,
+                 ClassifyNativeError(saved_errno)); // TSK140_Temporary_File_Security_Vulnerabilities enforce private ACLs
+  }
+#endif
 }
 
 }  // namespace
@@ -485,6 +658,14 @@ void AtomicReplace(const std::filesystem::path& target, std::span<const uint8_t>
       }
     });
 
+    if (!PathOnEncryptedFilesystem(dir)) {
+      ThrowIoError(ctx,
+                   0,
+                   kTempFilesystemUnencryptedMessage,
+                   std::nullopt,
+                   qv::Retryability::kFatal); // TSK140_Temporary_File_Security_Vulnerabilities enforce encrypted staging
+    }
+
     auto temp_path = MakeTempPath(dir, target);
     TempFileGuard cleanup(temp_path);
 
@@ -500,6 +681,8 @@ void AtomicReplace(const std::filesystem::path& target, std::span<const uint8_t>
       }
       return handle;
     });
+
+    EnsurePrivatePermissions(fd, temp_path, ctx); // TSK140_Temporary_File_Security_Vulnerabilities enforce restrictive ACLs
 
     try {
       WithContext(ctx, "writing payload", [&] { WriteAll(fd, payload, ctx); });
