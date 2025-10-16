@@ -25,7 +25,7 @@ namespace qv::core {
   class NonceLog {
     struct LogEntry {
       uint64_t counter;
-      std::array<uint8_t, 32> mac;
+    std::array<uint8_t, 32> mac;
     };
     std::array<uint8_t, 32> key_{};
     std::array<uint8_t, 32> last_mac_{};
@@ -38,9 +38,12 @@ namespace qv::core {
     NonceLog() = default;
     explicit NonceLog(const std::filesystem::path& path);
     NonceLog(const std::filesystem::path& path, std::nothrow_t) noexcept; // TSK032_Backup_Recovery_and_Disaster_Recovery
-    std::array<uint8_t, 32> Append(uint64_t counter); // TSK014
-    std::array<uint8_t, 32> Preview(uint64_t counter); // TSK118_Nonce_Reuse_Vulnerabilities deferred logging
-    void Commit(uint64_t counter, std::span<const uint8_t, 32> mac); // TSK118_Nonce_Reuse_Vulnerabilities
+    std::array<uint8_t, 32> Append(uint64_t counter,
+                                   std::span<const uint8_t> binding); // TSK014, TSK128_Missing_AAD_Validation_in_Chunks binding
+    std::array<uint8_t, 32> Preview(uint64_t counter,
+                                    std::span<const uint8_t> binding); // TSK118_Nonce_Reuse_Vulnerabilities deferred logging
+    void Commit(uint64_t counter, std::span<const uint8_t, 32> mac,
+                std::span<const uint8_t> binding); // TSK118_Nonce_Reuse_Vulnerabilities
     std::array<uint8_t, 32> LastMac() const;          // TSK014
     bool VerifyChain();
     size_t Repair(); // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -69,6 +72,8 @@ namespace qv::core {
       std::array<uint8_t, 12> nonce;
       uint64_t counter;
       std::array<uint8_t, 32> mac;
+      std::array<uint8_t, 32> binding{};        // TSK128_Missing_AAD_Validation_in_Chunks bind MAC to payload digest
+      uint8_t binding_size{0};                  // TSK128_Missing_AAD_Validation_in_Chunks explicit length for binding data
       int64_t chunk_index{kUnboundChunkIndex}; // TSK118_Nonce_Reuse_Vulnerabilities bind reservation to chunk
     };
     struct Status { // TSK015
@@ -80,7 +85,8 @@ namespace qv::core {
       RekeyReason reason{RekeyReason::kNone};
     };
     explicit NonceGenerator(uint32_t epoch, uint64_t start_counter = 0);
-    NonceRecord NextAuthenticated(int64_t chunk_index = kUnboundChunkIndex); // TSK014, TSK118_Nonce_Reuse_Vulnerabilities
+    NonceRecord NextAuthenticated(int64_t chunk_index = kUnboundChunkIndex,
+                                  std::span<const uint8_t> binding = {}); // TSK014, TSK118_Nonce_Reuse_Vulnerabilities, TSK128_Missing_AAD_Validation_in_Chunks
     void ReleaseNonce(const NonceRecord& record); // TSK118_Nonce_Reuse_Vulnerabilities
     void CommitNonce(const NonceRecord& record);  // TSK118_Nonce_Reuse_Vulnerabilities
     std::array<uint8_t, 12> Next();
@@ -169,7 +175,8 @@ namespace qv::core {
                                                                   'U', 'N', 'K', 'D'}; // TSK014
 
   inline constexpr std::array<uint8_t, 8> BindChunkAADContext( // TSK083_AAD_Recompute_and_Binding
-      uint8_t cipher_id, uint8_t tag_size, uint8_t nonce_size) {
+      uint8_t cipher_id, uint8_t tag_size, uint8_t nonce_size,
+      uint32_t epoch = 0, uint32_t header_version = 0) { // TSK128_Missing_AAD_Validation_in_Chunks strengthen binding
     auto context = kAADContextChunkData;
     context[0] ^= cipher_id;
     context[1] ^= tag_size;
@@ -177,8 +184,8 @@ namespace qv::core {
     context[3] ^= static_cast<uint8_t>(cipher_id ^ tag_size);
     context[4] ^= static_cast<uint8_t>(cipher_id ^ nonce_size);
     context[5] ^= static_cast<uint8_t>(tag_size ^ nonce_size);
-    context[6] ^= static_cast<uint8_t>((cipher_id + tag_size) & 0xFFu);
-    context[7] ^= static_cast<uint8_t>((cipher_id + nonce_size) & 0xFFu);
+    context[6] ^= static_cast<uint8_t>(((cipher_id + tag_size) ^ static_cast<uint8_t>(epoch)) & 0xFFu);
+    context[7] ^= static_cast<uint8_t>(((cipher_id + nonce_size) ^ static_cast<uint8_t>(header_version)) & 0xFFu);
     return context;
   }
   inline constexpr std::array<uint8_t, 8> kAADContextMetadata = {'Q', 'V', 'M', 'E',
@@ -222,6 +229,7 @@ namespace qv::core {
     int64_t chunk_index;
     uint64_t logical_offset;
     uint32_t chunk_size;
+    uint64_t nonce_counter;              // TSK128_Missing_AAD_Validation_in_Chunks freshness binding
     uint8_t context[8];
   };
 
@@ -233,9 +241,9 @@ namespace qv::core {
 
   static_assert(sizeof(EpochTLV) == 8,
                 "EpochTLV packing mismatch"); // TSK016_Windows_Compatibility_Fixes
-  static_assert(sizeof(AADData) == 32,
+  static_assert(sizeof(AADData) == 40,
                 "AADData packing mismatch"); // TSK016_Windows_Compatibility_Fixes
-  static_assert(sizeof(AADEnvelope) == 64,
+  static_assert(sizeof(AADEnvelope) == 72,
                 "AADEnvelope packing mismatch"); // TSK016_Windows_Compatibility_Fixes
 
   inline constexpr uint64_t ToLittleEndian64(uint64_t value) { // TSK014
@@ -243,7 +251,8 @@ namespace qv::core {
   }
 
   inline AADData MakeAADData(uint32_t epoch, int64_t chunk_index, uint64_t logical_offset,
-                             uint32_t chunk_size, const std::array<uint8_t, 8>& context) { // TSK014
+                             uint32_t chunk_size, const std::array<uint8_t, 8>& context,
+                             uint64_t nonce_counter = 0) { // TSK014, TSK128_Missing_AAD_Validation_in_Chunks
     AADData data{};
     data.epoch = qv::ToLittleEndian(epoch);
     const uint64_t index_le = ToLittleEndian64(static_cast<uint64_t>(chunk_index));
@@ -251,6 +260,8 @@ namespace qv::core {
     const uint64_t offset_le = ToLittleEndian64(logical_offset);
     std::memcpy(&data.logical_offset, &offset_le, sizeof(offset_le));
     data.chunk_size = qv::ToLittleEndian(chunk_size);
+    const uint64_t counter_le = ToLittleEndian64(nonce_counter);
+    std::memcpy(&data.nonce_counter, &counter_le, sizeof(counter_le));
     std::copy(context.begin(), context.end(), std::begin(data.context));
     return data;
   }
@@ -265,25 +276,38 @@ namespace qv::core {
 
   inline AADEnvelope MakeChunkAAD(uint32_t epoch, int64_t chunk_index, uint64_t logical_offset,
                                   uint32_t chunk_size,
-                                  std::span<const uint8_t, 32> nonce_chain_mac) { // TSK014
+                                  std::span<const uint8_t, 32> nonce_chain_mac,
+                                  uint64_t nonce_counter = 0) { // TSK014, TSK128_Missing_AAD_Validation_in_Chunks
     return MakeAADEnvelope(
-        MakeAADData(epoch, chunk_index, logical_offset, chunk_size, kAADContextChunkData),
+        MakeAADData(epoch, chunk_index, logical_offset, chunk_size, kAADContextChunkData, nonce_counter),
         nonce_chain_mac);
+  }
+
+  inline uint64_t ExtractNonceCounter(std::span<const uint8_t> nonce) { // TSK128_Missing_AAD_Validation_in_Chunks
+    constexpr size_t kEpochPrefix = sizeof(uint32_t);
+    if (nonce.size() < kEpochPrefix + sizeof(uint64_t)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Nonce too short for counter"};
+    }
+    uint64_t counter_be = 0;
+    std::memcpy(&counter_be, nonce.data() + kEpochPrefix, sizeof(counter_be));
+    return qv::kIsLittleEndian ? qv::detail::ByteSwap64(counter_be) : counter_be;
   }
 
   inline AADEnvelope MakeMetadataAAD(
       uint32_t epoch, int64_t record_index, uint64_t logical_offset, uint32_t record_size,
-      std::span<const uint8_t, 32> nonce_chain_mac) { // TSK040_AAD_Binding_and_Chunk_Authentication metadata scope
+      std::span<const uint8_t, 32> nonce_chain_mac,
+      uint64_t nonce_counter = 0) { // TSK040_AAD_Binding_and_Chunk_Authentication metadata scope, TSK128_Missing_AAD_Validation_in_Chunks
     return MakeAADEnvelope(
-        MakeAADData(epoch, record_index, logical_offset, record_size, kAADContextMetadata),
+        MakeAADData(epoch, record_index, logical_offset, record_size, kAADContextMetadata, nonce_counter),
         nonce_chain_mac);
   }
 
   inline AADEnvelope MakeManifestAAD(
       uint32_t epoch, int64_t record_index, uint64_t logical_offset, uint32_t record_size,
-      std::span<const uint8_t, 32> nonce_chain_mac) { // TSK040_AAD_Binding_and_Chunk_Authentication manifest scope
+      std::span<const uint8_t, 32> nonce_chain_mac,
+      uint64_t nonce_counter = 0) { // TSK040_AAD_Binding_and_Chunk_Authentication manifest scope, TSK128_Missing_AAD_Validation_in_Chunks
     return MakeAADEnvelope(
-        MakeAADData(epoch, record_index, logical_offset, record_size, kAADContextManifest),
+        MakeAADData(epoch, record_index, logical_offset, record_size, kAADContextManifest, nonce_counter),
         nonce_chain_mac);
   }
 

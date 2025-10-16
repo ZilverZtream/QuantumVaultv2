@@ -22,6 +22,7 @@ int main() {
       0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // chunk index
       0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // logical offset
       0x00, 0x10, 0x00, 0x00, // chunk size
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nonce counter // TSK128_Missing_AAD_Validation_in_Chunks
       'Q',  'V',  'C',  'H',  'U',  'N',  'K',  'D', // context
       0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
       0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
@@ -45,7 +46,7 @@ int main() {
   assert(!identical && "changing offsets must change AAD"); // TSK014
 
   auto metadata_data = qv::core::MakeAADData(kEpoch, kChunkIndex, kOffset, kChunkSize,
-                                             qv::core::kAADContextMetadata);
+                                             qv::core::kAADContextMetadata, 0); // TSK128_Missing_AAD_Validation_in_Chunks
   [[maybe_unused]] bool context_equal = true;
   for (size_t i = 0; i < std::size(metadata_data.context); ++i) {
     if (metadata_data.context[i] != envelope.data.context[i]) {

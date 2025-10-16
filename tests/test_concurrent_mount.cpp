@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <span>      // TSK128_Missing_AAD_Validation_in_Chunks
 #include <string>
 #include <string_view>
 #include <thread>
@@ -76,7 +77,7 @@ namespace { // TSK034
         while (next_expected.load(std::memory_order_acquire) != counter_value) {
           std::this_thread::yield();
         }
-        log.Append(counter_value);
+        log.Append(counter_value, std::span<const uint8_t>{}); // TSK128_Missing_AAD_Validation_in_Chunks
         next_expected.fetch_add(1, std::memory_order_release);
       }
     };

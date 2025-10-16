@@ -136,7 +136,7 @@ void TestNonceWalRecovery() { // TSK021_Nonce_Log_Durability_and_Crash_Safety
   std::filesystem::remove("qv_nonce.log.wal");
   {
     qv::core::NonceLog log(std::filesystem::path("qv_nonce.log"));
-    [[maybe_unused]] auto mac = log.Append(1);
+    [[maybe_unused]] auto mac = log.Append(1, std::span<const uint8_t>{}); // TSK128_Missing_AAD_Validation_in_Chunks
   }
   std::filesystem::path wal_path{"qv_nonce.log.wal"};
   assert(std::filesystem::exists(wal_path) && "wal file must exist after append");
@@ -189,7 +189,7 @@ void TestNonceDetectsCorruption() { // TSK021_Nonce_Log_Durability_and_Crash_Saf
   std::filesystem::remove("qv_nonce.log.wal");
   {
     qv::core::NonceLog log(std::filesystem::path("qv_nonce.log"));
-    [[maybe_unused]] auto mac = log.Append(1);
+    [[maybe_unused]] auto mac = log.Append(1, std::span<const uint8_t>{}); // TSK128_Missing_AAD_Validation_in_Chunks
   }
   auto log_path = std::filesystem::path("qv_nonce.log");
   auto size = std::filesystem::file_size(log_path);
