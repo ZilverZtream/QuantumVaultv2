@@ -771,6 +771,8 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
         tag{}; // TSK024_Key_Rotation_and_Lifecycle_Management
     std::array<uint8_t, sizeof(DerivedKeyset)>
         encrypted_keys{}; // TSK024_Key_Rotation_and_Lifecycle_Management
+    std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE>
+        hmac{}; // TSK137_Backup_Security_And_Integrity_Gaps integrity binding
   };
 #pragma pack(pop)
 
@@ -847,6 +849,22 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
               enc_result.ciphertext.end(), // TSK024_Key_Rotation_and_Lifecycle_Management
               record.encrypted_keys.begin());
 
+    static constexpr std::string_view kBackupHmacInfo{
+        "QV-BACKUP-HMAC/v1"}; // TSK137_Backup_Security_And_Integrity_Gaps context binding
+    auto hmac_key = qv::crypto::HKDF_SHA256(
+        std::span<const uint8_t>(enc.shared_secret.data(), enc.shared_secret.size()),
+        std::span<const uint8_t>(aad.data(), aad.size()),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kBackupHmacInfo.data()),
+                                 kBackupHmacInfo.size())); // TSK137_Backup_Security_And_Integrity_Gaps
+    const auto record_bytes = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(&record),
+        sizeof(record) - record.hmac.size()); // TSK137_Backup_Security_And_Integrity_Gaps exclude MAC field
+    record.hmac = qv::crypto::HMAC_SHA256::Compute(
+        std::span<const uint8_t>(hmac_key.data(), hmac_key.size()),
+        record_bytes); // TSK137_Backup_Security_And_Integrity_Gaps protect backup contents
+    qv::security::Zeroizer::Wipe(
+        std::span<uint8_t>(hmac_key.data(), hmac_key.size())); // TSK137_Backup_Security_And_Integrity_Gaps
+
     auto metadata_dir = MetadataDirFor(container); // TSK024_Key_Rotation_and_Lifecycle_Management
     std::filesystem::create_directories(
         metadata_dir);                // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -869,6 +887,25 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
       throw qv::Error{qv::ErrorDomain::IO, err,
                       "Failed to persist backup file: " + backup_path.string()};
     }
+    out.flush(); // TSK137_Backup_Security_And_Integrity_Gaps ensure durability
+    if (!out) {
+      const int err = errno; // TSK137_Backup_Security_And_Integrity_Gaps
+      throw qv::Error{qv::ErrorDomain::IO, err,
+                      "Failed to finalize backup file: " + backup_path.string()};
+    }
+    out.close();
+
+#if !defined(_WIN32)
+    try {
+      std::filesystem::permissions(
+          backup_path,
+          std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+          std::filesystem::perm_options::replace); // TSK137_Backup_Security_And_Integrity_Gaps tighten perms
+    } catch (const std::filesystem::filesystem_error& err) {
+      throw qv::Error{qv::ErrorDomain::IO, static_cast<int>(err.code().value()),
+                      "Failed to set backup permissions: " + backup_path.string()};
+    }
+#endif
 
     qv::security::Zeroizer::Wipe(
         std::span<uint8_t>(enc.shared_secret.data(), enc.shared_secret.size()));
