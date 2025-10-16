@@ -182,7 +182,6 @@ FUSEAdapter::FUSEAdapter(std::shared_ptr<storage::BlockDevice> device)
   g_inflight_calls.store(0, std::memory_order_release);
   g_draining.store(false, std::memory_order_release);
   filesystem_ = std::move(filesystem);
-  g_filesystem.store(filesystem_.get(), std::memory_order_release); // TSK116_Incorrect_Error_Propagation ensure global set post-construction
 }
 
 FUSEAdapter::~FUSEAdapter() {
@@ -209,7 +208,16 @@ void FUSEAdapter::Mount(const std::filesystem::path& mountpoint) {
     throw qv::Error{qv::ErrorDomain::IO, 0, "FUSE mount failed"};
   }
 
-  fuse_thread_ = std::thread([this]() { fuse_loop(fuse_); });
+  g_filesystem.store(filesystem_.get(), std::memory_order_release);  // TSK117_Race_Conditions_in_Filesystem publish after mount
+  try {
+    fuse_thread_ = std::thread([this]() { fuse_loop(fuse_); });
+  } catch (...) {
+    g_filesystem.store(nullptr, std::memory_order_release);
+    fuse_unmount(fuse_);
+    fuse_destroy(fuse_);
+    fuse_ = nullptr;
+    throw;
+  }
 }
 
 void FUSEAdapter::RequestUnmount() {
