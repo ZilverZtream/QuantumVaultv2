@@ -420,8 +420,21 @@ uint64_t VolumeFilesystem::AllocateChunks(uint64_t count, uint64_t* previous_nex
   if (count == 0) {
     return 0;
   }
+  if (next_chunk_index_ > std::numeric_limits<uint64_t>::max() - count) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Chunk index allocation overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard addition
+  }
   const auto start = next_chunk_index_;
   next_chunk_index_ += count;
+  if (next_chunk_index_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Chunk allocation exceeds signed range"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard cast
+  }
+  if (kChunkPayloadSize != 0 &&
+      next_chunk_index_ > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Chunk offset allocation overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard multiply
+  }
   next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
   return start;
 }
@@ -429,11 +442,33 @@ uint64_t VolumeFilesystem::AllocateChunks(uint64_t count, uint64_t* previous_nex
 void VolumeFilesystem::RestoreAllocationState(uint64_t previous_next) {
   std::lock_guard allocation_lock(allocation_mutex_);
   next_chunk_index_ = previous_next;
+  if (next_chunk_index_ > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Restored chunk index exceeds signed range"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard cast
+  }
+  if (kChunkPayloadSize != 0 &&
+      next_chunk_index_ > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Restored chunk offset overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard multiply
+  }
   next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
 }
 
 void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8_t>& data) {
-  const uint64_t required_chunks = data.empty() ? 0 : (data.size() + kChunkPayloadSize - 1) / kChunkPayloadSize;
+  const uint64_t chunk_payload = kChunkPayloadSize;
+  if (!data.empty()) {
+    if (chunk_payload == 0) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Chunk payload size is zero"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard invalid configuration
+    }
+    const uint64_t data_size = static_cast<uint64_t>(data.size());
+    if (data_size > std::numeric_limits<uint64_t>::max() - (chunk_payload - 1)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Chunk requirement overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard ceil division
+    }
+  }
+  const uint64_t required_chunks = data.empty()
+                                      ? 0
+                                      : (static_cast<uint64_t>(data.size()) + chunk_payload - 1) / chunk_payload;
   const uint64_t old_start_chunk = file.start_offset / kChunkPayloadSize;
   const uint64_t old_chunks = file.size == 0 ? 0 : (file.size + kChunkPayloadSize - 1) / kChunkPayloadSize;
 
@@ -473,6 +508,23 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
     bool committed_ = false;
   } allocation_guard(*this, file, file.start_offset, allocated_new_range, previous_next_chunk);
 
+  if (required_chunks > 0) {
+    if (start_chunk > std::numeric_limits<uint64_t>::max() - (required_chunks - 1)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Chunk range overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard iteration bounds
+    }
+    const uint64_t last_chunk = start_chunk + required_chunks - 1;
+    if (last_chunk > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Chunk index exceeds 64-bit signed range"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard cast
+    }
+    if (kChunkPayloadSize != 0 &&
+        last_chunk > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Chunk logical offset overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard multiply
+    }
+  }
+
   for (uint64_t i = 0; i < required_chunks; ++i) {
     std::vector<uint8_t> chunk_buffer(kChunkPayloadSize, 0);
     auto offset = static_cast<size_t>(i * kChunkPayloadSize);
@@ -489,6 +541,11 @@ void VolumeFilesystem::WriteFileContent(FileEntry& file, const std::vector<uint8
     device_->WriteChunk(header, std::span<const uint8_t>(chunk_buffer.data(), chunk_buffer.size()));
   }
 
+  if (kChunkPayloadSize != 0 &&
+      start_chunk > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "File start offset overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard multiply
+  }
   file.start_offset = start_chunk * kChunkPayloadSize;
   allocation_guard.Commit();
 }

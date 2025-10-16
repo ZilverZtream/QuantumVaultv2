@@ -182,14 +182,18 @@ uint64_t BlockDevice::ByteOffsetForChunk(int64_t chunk_index) const { // TSK107_
     throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};
   }
   const uint64_t u_index = static_cast<uint64_t>(chunk_index);
-  if (record_size_ != 0 && u_index > std::numeric_limits<uint64_t>::max() / record_size_) {
-    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"}; // TSK100_Integer_Overflow_and_Arithmetic guard chunk offset
+  if (record_size_ != 0 && u_index > 0 &&
+      record_size_ > std::numeric_limits<uint64_t>::max() / u_index) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"};  // TSK100_Integer_Overflow_and_Arithmetic guard chunk offset // TSK119_Integer_Overflow_in_Chunk_Calculations avoid division-based overflow
   }
   return u_index * record_size_;
 }
 
 std::streampos BlockDevice::OffsetForChunk(int64_t chunk_index) const { // TSK107_Platform_Specific_Issues
   const uint64_t offset = ByteOffsetForChunk(chunk_index);
+  if (offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk offset exceeds stream range"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard cast
+  }
   static_assert(sizeof(std::streamoff) >= sizeof(int64_t),
                 "BlockDevice requires 64-bit stream offsets"); // TSK107_Platform_Specific_Issues enforce large file support
 #if defined(_WIN32)
