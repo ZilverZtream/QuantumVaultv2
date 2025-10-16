@@ -808,8 +808,7 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
           cfg.target_ms = qv::ToLittleEndian(cfg.target_ms);
           parsed.argon2 = cfg;
           parsed.have_argon2 = true;
-          parsed.algorithm = PasswordKdf::kArgon2id;
-          std::copy(cfg.salt.begin(), cfg.salt.end(), parsed.pbkdf_salt.begin());
+          parsed.algorithm = PasswordKdf::kArgon2id; // TSK148_Cryptographic_Implementation_Weaknesses keep Argon2 salt isolated
           break;
         }
         case kTlvTypeHybridSalt: {
@@ -956,14 +955,35 @@ std::filesystem::path SanitizeContainerPath(const std::filesystem::path& path) {
     aad.insert(aad.end(), epoch_bytes,
                epoch_bytes + sizeof(epoch_le)); // TSK024_Key_Rotation_and_Lifecycle_Management
 
+    static constexpr std::string_view kBackupNonceInfo{
+        "QV-BACKUP-NONCE/v1"}; // TSK148_Cryptographic_Implementation_Weaknesses bind nonce to shared secret
+    auto nonce_mask = qv::crypto::HKDF_SHA256(
+        std::span<const uint8_t>(enc.shared_secret.data(), enc.shared_secret.size()),
+        std::span<const uint8_t>(aad.data(), aad.size()),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kBackupNonceInfo.data()),
+                                 kBackupNonceInfo.size()));
+    qv::security::Zeroizer::ScopeWiper nonce_mask_guard(nonce_mask.data(), nonce_mask.size());
+    for (size_t i = 0; i < nonce.size(); ++i) { // TSK148_Cryptographic_Implementation_Weaknesses harden IV derivation
+      nonce[i] ^= nonce_mask[i];
+    }
+
+    static constexpr std::string_view kBackupEncInfo{
+        "QV-BACKUP-ENC/v1"}; // TSK148_Cryptographic_Implementation_Weaknesses stretch backup key material
+    auto backup_key = qv::crypto::HKDF_SHA256(
+        std::span<const uint8_t>(enc.shared_secret.data(), enc.shared_secret.size()),
+        std::span<const uint8_t>(aad.data(), aad.size()),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kBackupEncInfo.data()),
+                                 kBackupEncInfo.size()));
+    qv::security::Zeroizer::ScopeWiper backup_key_guard(backup_key.data(), backup_key.size());
+
     auto keyset_bytes = qv::AsBytesConst(keyset); // TSK024_Key_Rotation_and_Lifecycle_Management
     auto enc_result =
         qv::crypto::AES256_GCM_Encrypt( // TSK024_Key_Rotation_and_Lifecycle_Management
             keyset_bytes, std::span<const uint8_t>(aad.data(), aad.size()),
             std::span<const uint8_t, qv::crypto::AES256_GCM::NONCE_SIZE>(nonce.data(),
                                                                          nonce.size()),
-            std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE>(enc.shared_secret.data(),
-                                                                       enc.shared_secret.size()));
+            std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE>(backup_key.data(),
+                                                                       backup_key.size()));
     VectorWipeGuard ciphertext_guard(
         enc_result.ciphertext); // TSK028_Secure_Deletion_and_Data_Remanence
     qv::security::Zeroizer::ScopeWiper tag_guard(enc_result.tag.data(), enc_result.tag.size());
@@ -1183,7 +1203,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
     if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
       Argon2Config cfg{};
       cfg.target_ms = CheckedCast<uint32_t>(kdf_policy_.target_duration.count());
-      std::copy(password_salt.begin(), password_salt.end(), cfg.salt.begin());
+      FillRandom(std::span<uint8_t>(cfg.salt.data(), cfg.salt.size())); // TSK148_Cryptographic_Implementation_Weaknesses dedicated Argon2 salt
       classical_key = DerivePasswordKeyArgon2id(password_span, cfg);
       argon2_config = cfg;
     } else {
@@ -1448,7 +1468,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
     if (kdf_policy_.algorithm == PasswordKdf::kArgon2id) {
       Argon2Config cfg{};
       cfg.target_ms = CheckedCast<uint32_t>(kdf_policy_.target_duration.count());
-      std::copy(new_password_salt.begin(), new_password_salt.end(), cfg.salt.begin());
+      FillRandom(std::span<uint8_t>(cfg.salt.data(), cfg.salt.size())); // TSK148_Cryptographic_Implementation_Weaknesses renew Argon2 salt on rekey
       new_classical_key = DerivePasswordKeyArgon2id(new_span, cfg);
       new_argon2 = cfg;
     } else {
