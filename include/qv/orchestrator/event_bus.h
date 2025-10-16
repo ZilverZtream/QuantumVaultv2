@@ -2,6 +2,7 @@
 // TSK019
 
 #include <array>
+#include <atomic>             // TSK113_Performance_and_Scalability lock-free subscriber snapshot
 #include <chrono>
 #include <cstdint>
 #include <condition_variable> // TSK081_EventBus_Throughput_and_Batching dispatcher coordination
@@ -126,8 +127,11 @@ namespace qv::orchestrator {
     void DispatchLoop(); // TSK081_EventBus_Throughput_and_Batching async publisher
     void StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching ensure background thread
 
-    std::vector<Subscriber> subs_;
-    std::mutex mutex_;
+    using SubscriberList = std::vector<Subscriber>;
+
+    std::shared_ptr<const SubscriberList> subscribers_snapshot_;
+    std::mutex subscribers_mutex_;
+    std::mutex syslog_mutex_;
     std::shared_ptr<SyslogPublisher> syslog_client_; // TSK029
     std::condition_variable syslog_cv_;              // TSK081_EventBus_Throughput_and_Batching queue signaling
     std::deque<Event> pending_syslog_;               // TSK081_EventBus_Throughput_and_Batching buffered events

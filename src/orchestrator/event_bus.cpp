@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>  // TSK113_Performance_and_Scalability relaxed subscriber access
 #include <charconv>
 #include <cctype>
 #include <chrono>
@@ -1515,26 +1516,37 @@ SyslogPublisher::PublishStats SyslogPublisher::PublishBatch(std::span<const Even
 }
 
 EventBus::EventBus() { // TSK029
-  subs_.push_back([](const Event& e) { DefaultJsonLogger().Log(e); });
+  auto initial = std::make_shared<SubscriberList>();
+  initial->push_back([](const Event& e) { DefaultJsonLogger().Log(e); });
+  {
+    std::lock_guard<std::mutex> guard(subscribers_mutex_); // TSK113_Performance_and_Scalability minimize contention
+    std::atomic_store_explicit(&subscribers_snapshot_, std::const_pointer_cast<const SubscriberList>(initial),
+                               std::memory_order_release);
+  }
   StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching begin async handling
 }
 
 EventBus::~EventBus() { // TSK081_EventBus_Throughput_and_Batching
   {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::lock_guard<std::mutex> guard(syslog_mutex_);
     stop_dispatcher_ = true;
-    subs_.clear();                              // TSK110_Initialization_and_Cleanup_Order drop subscribers before join
     pending_syslog_.clear();                    // TSK110_Initialization_and_Cleanup_Order clear queued work
     syslog_client_.reset();                     // TSK110_Initialization_and_Cleanup_Order release transport
+    dropped_syslog_streak_ = 0;                 // TSK113_Performance_and_Scalability reset backpressure state
   }
   syslog_cv_.notify_all();
   if (dispatcher_thread_.joinable()) {
     dispatcher_thread_.join();
   }
+  {
+    std::lock_guard<std::mutex> guard(subscribers_mutex_);
+    std::atomic_store_explicit(&subscribers_snapshot_, std::shared_ptr<const SubscriberList>{},
+                               std::memory_order_release);
+  }
 }
 
 void EventBus::StartDispatcher() { // TSK081_EventBus_Throughput_and_Batching
-  std::lock_guard<std::mutex> guard(mutex_);
+  std::lock_guard<std::mutex> guard(syslog_mutex_);
   if (dispatcher_thread_.joinable()) {
     return;
   }
@@ -1543,7 +1555,7 @@ void EventBus::StartDispatcher() { // TSK081_EventBus_Throughput_and_Batching
 }
 
 void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
-  std::unique_lock<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> lock(syslog_mutex_);
   for (;;) {
     syslog_cv_.wait(lock, [this]() {
       return stop_dispatcher_ || (!pending_syslog_.empty() && syslog_client_);
@@ -1556,7 +1568,7 @@ void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
     std::vector<Event> batch;
     batch.reserve(kMaxSyslogBatchSize);
     while (!pending_syslog_.empty() && batch.size() < kMaxSyslogBatchSize) {
-      batch.push_back(pending_syslog_.front());
+      batch.push_back(std::move(pending_syslog_.front()));
       pending_syslog_.pop_front();
     }
 
@@ -1567,10 +1579,10 @@ void EventBus::DispatchLoop() { // TSK081_EventBus_Throughput_and_Batching
     }
 
     if (!stats.unsent_indices.empty()) {
-      std::lock_guard<std::mutex> requeue_lock(mutex_);
+      std::lock_guard<std::mutex> requeue_lock(syslog_mutex_);
       for (auto it = stats.unsent_indices.rbegin(); it != stats.unsent_indices.rend(); ++it) {
         if (*it < batch.size()) {
-          pending_syslog_.push_front(batch[*it]);
+          pending_syslog_.push_front(std::move(batch[*it]));
         }
       }
       if (!stop_dispatcher_) {
@@ -1601,11 +1613,10 @@ void EventBus::Publish(const Event& event) { // TSK029
     return;
   }
   PublishReentrancyGuard guard(in_publish);
-  std::vector<Subscriber> targets;
+  auto targets = std::atomic_load_explicit(&subscribers_snapshot_, std::memory_order_acquire);
   bool notify_dispatcher = false;                       // TSK081_EventBus_Throughput_and_Batching
   {
-    std::lock_guard<std::mutex> guard(mutex_);
-    targets = subs_;
+    std::lock_guard<std::mutex> guard(syslog_mutex_);
     if (syslog_client_) { // TSK081_EventBus_Throughput_and_Batching enqueue for async dispatch
       if (pending_syslog_.size() >= kMaxSyslogQueueDepth) {
         ++dropped_syslog_streak_;
@@ -1624,9 +1635,11 @@ void EventBus::Publish(const Event& event) { // TSK029
       }
     }
   }
-  for (auto& subscriber : targets) {
-    if (subscriber) {
-      subscriber(event);
+  if (targets) {
+    for (const auto& subscriber : *targets) {
+      if (subscriber) {
+        subscriber(event);
+      }
     }
   }
   if (notify_dispatcher) { // TSK081_EventBus_Throughput_and_Batching
@@ -1635,8 +1648,12 @@ void EventBus::Publish(const Event& event) { // TSK029
 }
 
 void EventBus::Subscribe(Subscriber fn) { // TSK029
-  std::lock_guard<std::mutex> guard(mutex_);
-  subs_.push_back(std::move(fn));
+  std::lock_guard<std::mutex> guard(subscribers_mutex_);
+  auto current = std::atomic_load_explicit(&subscribers_snapshot_, std::memory_order_acquire);
+  auto updated = current ? std::make_shared<SubscriberList>(*current) : std::make_shared<SubscriberList>();
+  updated->push_back(std::move(fn));
+  std::atomic_store_explicit(&subscribers_snapshot_, std::const_pointer_cast<const SubscriberList>(updated),
+                             std::memory_order_release);
 }
 
 bool EventBus::ConfigureSyslog(const std::string& host, uint16_t port, std::string* error) { // TSK029
@@ -1645,7 +1662,7 @@ bool EventBus::ConfigureSyslog(const std::string& host, uint16_t port, std::stri
     return false;
   }
   {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::lock_guard<std::mutex> guard(syslog_mutex_);
     syslog_client_ = std::move(client);
   }
   StartDispatcher(); // TSK081_EventBus_Throughput_and_Batching ensure worker active
