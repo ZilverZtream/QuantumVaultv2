@@ -25,6 +25,9 @@ constexpr uint64_t kPayloadSize = kChunkSize;
 // TSK078_Chunk_Integrity_and_Bounds: CRC32 implementation for chunk headers.
 constexpr uint32_t kCRC32Polynomial = 0xEDB88320u;
 
+constexpr std::array<uint8_t, 16> kMetadataMacContext{
+    'Q', 'V', '-', 'M', 'E', 'T', 'A', 'D', 'A', 'T', 'A', '-', 'M', 'A', 'C', '1'};  // TSK121_Missing_Authentication_in_Metadata
+
 constexpr std::array<uint32_t, 256> MakeCRC32Table() {
   std::array<uint32_t, 256> table{};
   for (uint32_t i = 0; i < table.size(); ++i) {
@@ -141,6 +144,9 @@ BlockDevice::BlockDevice(const std::filesystem::path& container_path,
       epoch_(epoch),
       default_cipher_(default_cipher),
       record_size_(kHeaderSize + kPayloadSize) {
+  metadata_mac_key_ = qv::crypto::HMAC_SHA256::Compute(
+      std::span<const uint8_t>(master_key_.data(), master_key_.size()),
+      std::span<const uint8_t>(kMetadataMacContext.data(), kMetadataMacContext.size()));
   EnsureOpenUnlocked();
 }
 

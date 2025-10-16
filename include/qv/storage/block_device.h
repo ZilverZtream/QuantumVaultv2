@@ -12,6 +12,7 @@
 #include "qv/crypto/aegis.h"
 #include "qv/error.h"
 #include "qv/storage/chunk_layout.h"
+#include "qv/crypto/hmac_sha256.h"  // TSK121_Missing_Authentication_in_Metadata derive metadata MAC key
 
 namespace qv::storage {
 
@@ -38,6 +39,10 @@ public:
 
   uint64_t RecordSize() const { return record_size_; }
 
+  std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> MetadataMacKey() const {
+    return metadata_mac_key_;  // TSK121_Missing_Authentication_in_Metadata expose derived metadata MAC key
+  }
+
 private:
   std::filesystem::path path_;
   std::array<uint8_t, 32> master_key_{};
@@ -46,6 +51,8 @@ private:
   std::fstream file_;
   uint64_t record_size_{sizeof(ChunkHeader) + kChunkSize};
   std::mutex io_mutex_;
+
+  std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> metadata_mac_key_{};  // TSK121_Missing_Authentication_in_Metadata cached metadata authenticator
 
   void EnsureOpenUnlocked();
   void EnsureSizeUnlocked(uint64_t size);
