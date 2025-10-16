@@ -70,6 +70,17 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE) # TSK008
 find_package(OpenSSL REQUIRED)
 find_package(sodium QUIET) # TSK008
 find_package(PkgConfig QUIET) # TSK035_Platform_Specific_Security_Integration
+find_path(ZSTD_INCLUDE_DIR zstd.h) # TSK127_Incorrect_Filesystem_Metadata_Recovery locate headers
+find_library(ZSTD_LIBRARY NAMES zstd libzstd zstd_static) # TSK127_Incorrect_Filesystem_Metadata_Recovery locate library
+if (NOT ZSTD_INCLUDE_DIR OR NOT ZSTD_LIBRARY)
+  message(FATAL_ERROR "libzstd (zstd.h) is required for TSK127_Incorrect_Filesystem_Metadata_Recovery")
+endif()
+if (NOT TARGET ZSTD::ZSTD)
+  add_library(ZSTD::ZSTD UNKNOWN IMPORTED)
+  set_target_properties(ZSTD::ZSTD PROPERTIES
+      IMPORTED_LOCATION ${ZSTD_LIBRARY}
+      INTERFACE_INCLUDE_DIRECTORIES ${ZSTD_INCLUDE_DIR})
+endif()
 set(qv_have_libsecret OFF) # TSK035_Platform_Specific_Security_Integration
 set(qv_have_tpm OFF)       # TSK035_Platform_Specific_Security_Integration
 if (UNIX AND NOT APPLE AND PkgConfig_FOUND)
@@ -178,6 +189,7 @@ target_include_directories(qv
       $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 ) # TSK008
 target_link_libraries(qv PRIVATE qv_core qv_orchestrator qv_storage)
+target_link_libraries(qv PRIVATE ZSTD::ZSTD) # TSK127_Incorrect_Filesystem_Metadata_Recovery link compression runtime
 if (WIN32)
   target_link_libraries(qv PRIVATE Crypt32) # TSK035_Platform_Specific_Security_Integration
   find_path(WINFSP_INCLUDE_DIR winfsp/winfsp.h
@@ -203,6 +215,7 @@ if (WIN32)
       qv_core
       qv_orchestrator
       qv_storage
+      ZSTD::ZSTD # TSK127_Incorrect_Filesystem_Metadata_Recovery ensure compression available
       ${WINFSP_LIBRARY})
     target_compile_definitions(qv.winfsp PRIVATE QV_HAVE_WINFSP=1)
   else()
@@ -241,6 +254,7 @@ if (UNIX)
     qv_core
     qv_orchestrator
     qv_storage
+    ZSTD::ZSTD # TSK127_Incorrect_Filesystem_Metadata_Recovery ensure fuse binary links zstd
     ${FUSE3_LIBRARIES})
 endif()
 
