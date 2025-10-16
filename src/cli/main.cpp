@@ -71,6 +71,7 @@
 #else // _WIN32
 #include <cerrno>
 #include <fcntl.h>    // TSK028_Secure_Deletion_and_Data_Remanence
+#include <signal.h>   // TSK132_Weak_Password_Handling scoped signal handlers
 #include <sys/stat.h> // TSK028_Secure_Deletion_and_Data_Remanence
 #include <sys/types.h>
 #include <termios.h>
@@ -91,6 +92,32 @@
 #endif
 
 namespace {
+
+  constexpr size_t kMaxPasswordLen = 1024; // TSK132_Weak_Password_Handling enforce password size ceiling
+
+  std::atomic<uint8_t*> g_signal_buffer{nullptr};      // TSK132_Weak_Password_Handling signal wipe state
+  std::atomic<size_t> g_signal_length{0};              // TSK132_Weak_Password_Handling signal wipe state
+
+  class SensitiveDataRegistration { // TSK132_Weak_Password_Handling signal wipe integration
+   public:
+    SensitiveDataRegistration(uint8_t* ptr, size_t len) noexcept
+        : previous_ptr_(g_signal_buffer.exchange(ptr, std::memory_order_acq_rel)),
+          previous_len_(g_signal_length.exchange(len, std::memory_order_acq_rel)) {}
+
+    ~SensitiveDataRegistration() {
+      g_signal_buffer.store(previous_ptr_, std::memory_order_release);
+      g_signal_length.store(previous_len_, std::memory_order_release);
+    }
+
+    void Update(uint8_t* ptr, size_t len) noexcept {
+      g_signal_buffer.store(ptr, std::memory_order_release);
+      g_signal_length.store(len, std::memory_order_release);
+    }
+
+   private:
+    uint8_t* previous_ptr_;
+    size_t previous_len_;
+  };
 
   constexpr const char kGenericAuthFailureMessage[] =
       "Authentication failed or volume unavailable."; // TSK080_Error_Info_Redaction_in_Release
@@ -191,6 +218,19 @@ namespace {
     }
     out = std::filesystem::path(std::string(raw));
     return true;
+  }
+
+  bool PasswordsEqual(std::string_view lhs,
+                      std::string_view rhs) noexcept { // TSK132_Weak_Password_Handling constant-time compare
+    volatile uint8_t diff = static_cast<uint8_t>((lhs.size() ^ rhs.size()) & 0xFFu);
+    for (size_t i = 0; i < kMaxPasswordLen; ++i) {
+      const uint8_t a = i < lhs.size() ? static_cast<uint8_t>(lhs[i]) : 0u;
+      const uint8_t b = i < rhs.size() ? static_cast<uint8_t>(rhs[i]) : 0u;
+      diff |= static_cast<uint8_t>(a ^ b);
+    }
+    diff |= static_cast<uint8_t>((lhs.size() > kMaxPasswordLen) | (rhs.size() > kMaxPasswordLen));
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return diff == 0;
   }
 
   // TSK009
@@ -1116,6 +1156,35 @@ namespace {
     bool restored_;
   };
 
+  BOOL WINAPI PasswordConsoleHandler(DWORD control_type) { // TSK132_Weak_Password_Handling wipe on signal
+    switch (control_type) {
+      case CTRL_C_EVENT:
+      case CTRL_BREAK_EVENT:
+      case CTRL_CLOSE_EVENT: {
+        auto* buffer = g_signal_buffer.load(std::memory_order_acquire);
+        const size_t len = g_signal_length.load(std::memory_order_acquire);
+        if (buffer && len > 0) {
+          volatile uint8_t* wipe = buffer;
+          for (size_t i = 0; i < len; ++i) {
+            wipe[i] = 0;
+          }
+          g_signal_buffer.store(nullptr, std::memory_order_release);
+          g_signal_length.store(0, std::memory_order_release);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    return FALSE;
+  }
+
+  class PasswordSignalGuard { // TSK132_Weak_Password_Handling ensure handler scoped
+   public:
+    PasswordSignalGuard() { SetConsoleCtrlHandler(PasswordConsoleHandler, TRUE); }
+    ~PasswordSignalGuard() { SetConsoleCtrlHandler(PasswordConsoleHandler, FALSE); }
+  };
+
   std::string ReadPassword(const std::string& prompt) {
     HANDLE h_in = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE h_out = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1141,8 +1210,14 @@ namespace {
     DWORD written = 0;
     WriteConsoleA(h_out, prompt.c_str(), static_cast<DWORD>(prompt.size()), &written, nullptr);
 
-    std::wstring buffer;
-    buffer.reserve(128);
+    PasswordSignalGuard signal_guard; // TSK132_Weak_Password_Handling scope handler
+
+    std::array<wchar_t, kMaxPasswordLen + 1> buffer{}; // TSK132_Weak_Password_Handling fixed buffer
+    qv::security::Zeroizer::ScopeWiper<wchar_t> buf_guard(buffer.data(), buffer.size());
+    SensitiveDataRegistration registration(reinterpret_cast<uint8_t*>(buffer.data()), 0);
+
+    size_t pos = 0;
+    bool overflow = false;
     while (true) {
       wchar_t ch = 0;
       DWORD read = 0;
@@ -1161,31 +1236,56 @@ namespace {
         break;
       }
       if (ch == L'\b') {
-        if (!buffer.empty()) {
-          buffer.pop_back();
+        if (pos > 0) {
+          --pos;
+          buffer[pos] = 0;
+          registration.Update(reinterpret_cast<uint8_t*>(buffer.data()), pos * sizeof(wchar_t));
         }
         continue;
       }
-      buffer.push_back(ch);
+      if (pos >= kMaxPasswordLen) {
+        overflow = true;
+        continue;
+      }
+      buffer[pos++] = ch;
+      registration.Update(reinterpret_cast<uint8_t*>(buffer.data()), pos * sizeof(wchar_t));
     }
 
     guard.Restore();
     WriteConsoleA(h_out, "\n", 1, &written, nullptr);
 
-    if (buffer.empty()) {
+    if (overflow) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Password exceeds maximum length (1024 bytes)."}; // TSK132_Weak_Password_Handling
+    }
+
+    if (pos == 0) {
       return std::string{};
     }
 
-    int needed = WideCharToMultiByte(CP_UTF8, 0, buffer.data(), static_cast<int>(buffer.size()),
-                                     nullptr, 0, nullptr, nullptr);
+    int needed =
+        WideCharToMultiByte(CP_UTF8, 0, buffer.data(), static_cast<int>(pos), nullptr, 0, nullptr, nullptr);
     if (needed <= 0) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kPasswordReadFailed, // TSK020
                       "Failed to convert password encoding.", GetLastError()};
     }
+    if (needed > static_cast<int>(kMaxPasswordLen)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Password exceeds maximum length (1024 bytes)."}; // TSK132_Weak_Password_Handling
+    }
     std::string password(static_cast<size_t>(needed), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, buffer.data(), static_cast<int>(buffer.size()), password.data(),
-                        needed, nullptr, nullptr);
+    registration.Update(reinterpret_cast<uint8_t*>(password.data()), password.size());
+    qv::security::Zeroizer::ScopeWiper<char> password_guard(password.data(), password.size());
+    const int written =
+        WideCharToMultiByte(CP_UTF8, 0, buffer.data(), static_cast<int>(pos), password.data(), needed, nullptr,
+                             nullptr);
+    if (written != needed) {
+      throw qv::Error{qv::ErrorDomain::IO,
+                      qv::errors::io::kPasswordReadFailed, // TSK020
+                      "Failed to convert password encoding.", GetLastError()};
+    }
+    password_guard.Release();
     return password;
   }
 #else  // _WIN32
@@ -1207,6 +1307,40 @@ namespace {
     int fd_;
     termios state_;
     bool restored_;
+  };
+
+  void PasswordSignalHandler(int sig) { // TSK132_Weak_Password_Handling wipe on interrupt
+    auto* buffer = g_signal_buffer.load(std::memory_order_acquire);
+    const size_t len = g_signal_length.load(std::memory_order_acquire);
+    if (buffer && len > 0) {
+      volatile uint8_t* wipe = buffer;
+      for (size_t i = 0; i < len; ++i) {
+        wipe[i] = 0;
+      }
+      g_signal_buffer.store(nullptr, std::memory_order_release);
+      g_signal_length.store(0, std::memory_order_release);
+    }
+    _exit(128 + sig);
+  }
+
+  class PasswordSignalGuard { // TSK132_Weak_Password_Handling scoped handler
+   public:
+    PasswordSignalGuard() {
+      struct sigaction sa {};
+      sa.sa_handler = PasswordSignalHandler;
+      sigemptyset(&sa.sa_mask);
+      sa.sa_flags = 0;
+      sigaction(SIGINT, &sa, &old_int_);
+      sigaction(SIGTERM, &sa, &old_term_);
+    }
+    ~PasswordSignalGuard() {
+      sigaction(SIGINT, &old_int_, nullptr);
+      sigaction(SIGTERM, &old_term_, nullptr);
+    }
+
+   private:
+    struct sigaction old_int_ {};
+    struct sigaction old_term_ {};
   };
 
   std::string ReadPassword(const std::string& prompt) {
@@ -1233,15 +1367,64 @@ namespace {
     }
 
     std::cout << prompt << std::flush;
-    std::string password;
-    if (!std::getline(std::cin, password)) {
-      const int err = errno;
-      throw qv::Error{qv::ErrorDomain::IO,
-                      qv::errors::io::kPasswordReadFailed, // TSK020
-                      "Failed to read password input.", err};
+
+    PasswordSignalGuard signal_guard; // TSK132_Weak_Password_Handling scope handler
+
+    std::array<char, kMaxPasswordLen + 1> buffer{}; // TSK132_Weak_Password_Handling fixed buffer
+    qv::security::Zeroizer::ScopeWiper<char> buf_guard(buffer.data(), buffer.size());
+    SensitiveDataRegistration registration(reinterpret_cast<uint8_t*>(buffer.data()), 0);
+
+    size_t pos = 0;
+    bool overflow = false;
+    while (true) {
+      char ch = 0;
+      ssize_t n = ::read(STDIN_FILENO, &ch, 1);
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        const int err = errno;
+        throw qv::Error{qv::ErrorDomain::IO,
+                        qv::errors::io::kPasswordReadFailed, // TSK020
+                        "Failed to read password input.", err};
+      }
+      if (n == 0) {
+        break;
+      }
+      if (ch == '\r') {
+        continue;
+      }
+      if (ch == '\n') {
+        break;
+      }
+      if (ch == '\b') {
+        if (pos > 0) {
+          --pos;
+          buffer[pos] = 0;
+          registration.Update(reinterpret_cast<uint8_t*>(buffer.data()), pos);
+        }
+        continue;
+      }
+      if (pos >= kMaxPasswordLen) {
+        overflow = true;
+        continue;
+      }
+      buffer[pos++] = ch;
+      registration.Update(reinterpret_cast<uint8_t*>(buffer.data()), pos);
     }
+
     guard.Restore();
     std::cout << std::endl;
+
+    if (overflow) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Password exceeds maximum length (1024 bytes)."}; // TSK132_Weak_Password_Handling
+    }
+
+    std::string password(buffer.data(), pos);
+    registration.Update(reinterpret_cast<uint8_t*>(password.data()), password.size());
+    qv::security::Zeroizer::ScopeWiper<char> password_guard(password.data(), password.size());
+    password_guard.Release();
     return password;
   }
 #endif // _WIN32
@@ -1442,7 +1625,7 @@ namespace {
     qv::security::Zeroizer::ScopeWiper<char> password_guard(password.data(), password.size());
     auto confirm = ReadPassword("Confirm password: ");
     qv::security::Zeroizer::ScopeWiper<char> confirm_guard(confirm.data(), confirm.size());
-    if (password != confirm) {
+    if (!PasswordsEqual(password, confirm)) { // TSK132_Weak_Password_Handling constant-time mismatch check
       std::cerr << "Validation error: Passwords do not match." << std::endl;
       return kExitUsage; // TSK125_Missing_Secure_Deletion_for_Keys guards zero on scope exit
     }
