@@ -355,7 +355,7 @@ namespace {
     constexpr uint32_t kAuditArch = 0; // TSK142_Plugin_Security_Bypass_Vulnerabilities
 #endif
     if constexpr (kAuditArch != 0) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
-      filter.push_back({static_cast<uint16_t>(BPF_JMP | BPF_JEQ | BPF_K), 0, 1, kAuditArch});
+      filter.push_back({static_cast<uint16_t>(BPF_JMP | BPF_JEQ | BPF_K), 1, 0, kAuditArch});
       filter.push_back({static_cast<uint16_t>(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_KILL_PROCESS});
     }
     filter.push_back({static_cast<uint16_t>(BPF_LD | BPF_W | BPF_ABS), 0, 0,
