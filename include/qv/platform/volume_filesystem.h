@@ -138,10 +138,9 @@ private:
   void FlushMetadataLocked();
   void SaveMetadata();
   void PersistMetadataLocked();
-  void LoadMetadata();
+  void LoadMetadata();  // TSK121_Missing_Authentication_in_Metadata hardened metadata recovery
   void SerializeDirectory(std::ostringstream& out, const DirectoryEntry* dir,
                           const std::string& path);
-  void ParseMetadataLine(const std::string& line);
   static timespec CurrentTimespec();
 };
 

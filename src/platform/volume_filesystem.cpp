@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>   // TSK116_Incorrect_Error_Propagation propagate validation errno details
+#include <charconv> // TSK121_Missing_Authentication_in_Metadata robust numeric parsing
 #include <chrono>
 #include <cctype>   // TSK120_Incorrect_Path_Normalization printable-path validation helpers
 #include <cstring>
@@ -26,6 +27,7 @@ using mode_t = unsigned int;
 #endif
 
 #include "qv/error.h"
+#include "qv/crypto/hmac_sha256.h"  // TSK121_Missing_Authentication_in_Metadata metadata integrity
 
 namespace qv::platform {
 namespace {
@@ -177,6 +179,330 @@ timespec TimespecFrom(std::time_t sec, long nsec) {
   ts.tv_sec = sec;
   ts.tv_nsec = nsec;
   return ts;
+}
+constexpr long kNanosecondsPerSecond = 1000000000L;  // TSK121_Missing_Authentication_in_Metadata normalize timespec bounds
+
+std::string EscapeMetadataToken(std::string_view value) {  // TSK121_Missing_Authentication_in_Metadata lossless token encoding
+  std::string escaped;
+  escaped.reserve(value.size());
+  constexpr char kHex[] = "0123456789ABCDEF";
+  for (unsigned char ch : value) {
+    if (ch <= 0x20 || ch == 0x7F || ch == '%') {
+      escaped.push_back('%');
+      escaped.push_back(kHex[(ch >> 4) & 0x0F]);
+      escaped.push_back(kHex[ch & 0x0F]);
+    } else {
+      escaped.push_back(static_cast<char>(ch));
+    }
+  }
+  return escaped;
+}
+
+std::optional<std::string> UnescapeMetadataToken(const std::string& token) {  // TSK121_Missing_Authentication_in_Metadata
+  std::string result;
+  result.reserve(token.size());
+  auto HexValue = [](char ch) -> int {
+    if (ch >= '0' && ch <= '9') {
+      return ch - '0';
+    }
+    if (ch >= 'A' && ch <= 'F') {
+      return 10 + (ch - 'A');
+    }
+    if (ch >= 'a' && ch <= 'f') {
+      return 10 + (ch - 'a');
+    }
+    return -1;
+  };
+  for (size_t i = 0; i < token.size(); ++i) {
+    char ch = token[i];
+    if (ch != '%') {
+      result.push_back(ch);
+      continue;
+    }
+    if (i + 2 >= token.size()) {
+      return std::nullopt;
+    }
+    const int hi = HexValue(token[i + 1]);
+    const int lo = HexValue(token[i + 2]);
+    if (hi < 0 || lo < 0) {
+      return std::nullopt;
+    }
+    result.push_back(static_cast<char>((hi << 4) | lo));
+    i += 2;
+  }
+  return result;
+}
+
+std::optional<std::vector<std::string>> SplitMetadataTokens(const std::string& line) {  // TSK121_Missing_Authentication_in_Metadata
+  std::vector<std::string> tokens;
+  std::string current;
+  for (char ch : line) {
+    if (ch == ' ') {
+      tokens.push_back(current);
+      current.clear();
+      continue;
+    }
+    current.push_back(ch);
+  }
+  if (!current.empty() || (!line.empty() && line.back() == ' ')) {
+    tokens.push_back(current);
+  }
+  if (tokens.empty()) {
+    return std::vector<std::string>{};
+  }
+  return tokens;
+}
+
+std::string HexEncode(std::span<const uint8_t> data) {  // TSK121_Missing_Authentication_in_Metadata metadata MAC encoding
+  static constexpr char kHexDigits[] = "0123456789abcdef";
+  std::string encoded(data.size() * 2, '\0');
+  for (size_t i = 0; i < data.size(); ++i) {
+    encoded[2 * i] = kHexDigits[(data[i] >> 4) & 0x0F];
+    encoded[2 * i + 1] = kHexDigits[data[i] & 0x0F];
+  }
+  return encoded;
+}
+
+std::optional<std::vector<uint8_t>> HexDecode(const std::string& hex) {  // TSK121_Missing_Authentication_in_Metadata
+  if (hex.size() % 2 != 0) {
+    return std::nullopt;
+  }
+  std::vector<uint8_t> decoded(hex.size() / 2);
+  auto HexValue = [](char ch) -> int {
+    if (ch >= '0' && ch <= '9') {
+      return ch - '0';
+    }
+    if (ch >= 'A' && ch <= 'F') {
+      return 10 + (ch - 'A');
+    }
+    if (ch >= 'a' && ch <= 'f') {
+      return 10 + (ch - 'a');
+    }
+    return -1;
+  };
+  for (size_t i = 0; i < decoded.size(); ++i) {
+    const int hi = HexValue(hex[2 * i]);
+    const int lo = HexValue(hex[2 * i + 1]);
+    if (hi < 0 || lo < 0) {
+      return std::nullopt;
+    }
+    decoded[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  return decoded;
+}
+
+bool ConstantTimeEqual(std::span<const uint8_t> a, std::span<const uint8_t> b) {  // TSK121_Missing_Authentication_in_Metadata
+  if (a.size() != b.size()) {
+    return false;
+  }
+  uint8_t diff = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+  }
+  return diff == 0;
+}
+
+bool ParseUint64Token(const std::string& token, uint64_t* value) {  // TSK121_Missing_Authentication_in_Metadata
+  if (!value || token.empty()) {
+    return false;
+  }
+  uint64_t parsed = 0;
+  auto result = std::from_chars(token.data(), token.data() + token.size(), parsed);
+  if (result.ec != std::errc() || result.ptr != token.data() + token.size()) {
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
+
+bool ParseInt64Token(const std::string& token, int64_t* value) {  // TSK121_Missing_Authentication_in_Metadata
+  if (!value || token.empty()) {
+    return false;
+  }
+  int64_t parsed = 0;
+  auto result = std::from_chars(token.data(), token.data() + token.size(), parsed);
+  if (result.ec != std::errc() || result.ptr != token.data() + token.size()) {
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
+
+bool ValidateTimespecFields(int64_t sec, int64_t nsec) {  // TSK121_Missing_Authentication_in_Metadata
+  return nsec >= 0 && nsec < kNanosecondsPerSecond &&
+         sec >= std::numeric_limits<std::time_t>::min() &&
+         sec <= std::numeric_limits<std::time_t>::max();
+}
+
+struct MetadataParseContext {  // TSK121_Missing_Authentication_in_Metadata incremental metadata reconstruction
+  std::shared_ptr<DirectoryEntry> root;
+  uint64_t next_chunk_index;
+  bool next_seen;
+  uint64_t data_start_chunk;
+};
+
+DirectoryEntry* EnsureDirectoryForMetadata(MetadataParseContext& context, const std::string& path) {
+  try {
+    auto normalized = NormalizePath(path);
+    auto* current = context.root.get();
+    if (normalized == "/") {
+      return current;
+    }
+    std::filesystem::path fs_path(normalized);
+    for (const auto& part : fs_path) {
+      auto name = part.string();
+      if (name.empty() || name == "/" || name == ".") {
+        continue;
+      }
+      if (name == "..") {
+        return nullptr;
+      }
+      auto it = std::find_if(current->subdirs.begin(), current->subdirs.end(),
+                             [&](const std::shared_ptr<DirectoryEntry>& child) { return child->name == name; });
+      if (it == current->subdirs.end()) {
+        auto dir = std::make_shared<DirectoryEntry>();
+        dir->name = name;
+        dir->mtime = CurrentTimespec();
+        current->subdirs.emplace_back(dir);
+        current = dir.get();
+      } else {
+        current = it->get();
+      }
+    }
+    return current;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+bool ApplyNextMetadataEntry(const std::vector<std::string>& tokens, MetadataParseContext& context) {
+  if (tokens.size() != 2) {
+    return false;
+  }
+  uint64_t next = 0;
+  if (!ParseUint64Token(tokens[1], &next)) {
+    return false;
+  }
+  if (next < context.data_start_chunk) {
+    return false;
+  }
+  context.next_chunk_index = next;
+  context.next_seen = true;
+  return true;
+}
+
+bool ApplyDirectoryMetadataEntry(const std::vector<std::string>& tokens, MetadataParseContext& context) {
+  if (tokens.size() != 4) {
+    return false;
+  }
+  auto path = UnescapeMetadataToken(tokens[1]);
+  if (!path) {
+    return false;
+  }
+  int64_t sec = 0;
+  int64_t nsec = 0;
+  if (!ParseInt64Token(tokens[2], &sec) || !ParseInt64Token(tokens[3], &nsec)) {
+    return false;
+  }
+  if (!ValidateTimespecFields(sec, nsec)) {
+    return false;
+  }
+  auto* dir = EnsureDirectoryForMetadata(context, *path);
+  if (!dir) {
+    return false;
+  }
+  dir->mtime = TimespecFrom(static_cast<std::time_t>(sec), static_cast<long>(nsec));
+  return true;
+}
+
+bool ApplyFileMetadataEntry(const std::vector<std::string>& tokens, MetadataParseContext& context) {
+  if (tokens.size() != 11) {
+    return false;
+  }
+  auto path = UnescapeMetadataToken(tokens[1]);
+  if (!path) {
+    return false;
+  }
+  uint64_t size = 0;
+  uint64_t start_chunk = 0;
+  uint64_t mode_value = 0;
+  int64_t msec = 0;
+  int64_t mnsec = 0;
+  int64_t csec = 0;
+  int64_t cnsec = 0;
+  uint64_t uid_value = 0;
+  uint64_t gid_value = 0;
+  if (!ParseUint64Token(tokens[2], &size) || !ParseUint64Token(tokens[3], &start_chunk) ||
+      !ParseUint64Token(tokens[4], &mode_value) || !ParseInt64Token(tokens[5], &msec) ||
+      !ParseInt64Token(tokens[6], &mnsec) || !ParseInt64Token(tokens[7], &csec) ||
+      !ParseInt64Token(tokens[8], &cnsec) || !ParseUint64Token(tokens[9], &uid_value) ||
+      !ParseUint64Token(tokens[10], &gid_value)) {
+    return false;
+  }
+  if (start_chunk < context.data_start_chunk) {
+    return false;
+  }
+  if (!ValidateTimespecFields(msec, mnsec) || !ValidateTimespecFields(csec, cnsec)) {
+    return false;
+  }
+  if (mode_value > static_cast<uint64_t>(std::numeric_limits<mode_t>::max())) {
+    return false;
+  }
+  if (uid_value > static_cast<uint64_t>(std::numeric_limits<uid_t>::max()) ||
+      gid_value > static_cast<uint64_t>(std::numeric_limits<gid_t>::max())) {
+    return false;
+  }
+  if (kChunkPayloadSize != 0 && start_chunk > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+    return false;
+  }
+  auto normalized = NormalizePath(*path);
+  std::filesystem::path fs_path(normalized);
+  auto parent_path = fs_path.parent_path().string();
+  if (parent_path.empty()) {
+    parent_path = "/";
+  }
+  auto* dir = EnsureDirectoryForMetadata(context, parent_path);
+  if (!dir) {
+    return false;
+  }
+  auto filename = fs_path.filename().string();
+  if (filename.empty()) {
+    return false;
+  }
+  FileEntry entry{};
+  entry.name = filename;
+  entry.size = size;
+  entry.start_offset = start_chunk * kChunkPayloadSize;
+  entry.mode = static_cast<mode_t>(mode_value);
+  entry.mtime = TimespecFrom(static_cast<std::time_t>(msec), static_cast<long>(mnsec));
+  entry.ctime = TimespecFrom(static_cast<std::time_t>(csec), static_cast<long>(cnsec));
+  entry.uid = static_cast<uid_t>(uid_value);
+  entry.gid = static_cast<gid_t>(gid_value);
+  auto it = std::find_if(dir->files.begin(), dir->files.end(),
+                         [&](const FileEntry& existing) { return existing.name == entry.name; });
+  if (it != dir->files.end()) {
+    *it = entry;
+  } else {
+    dir->files.push_back(entry);
+  }
+  return true;
+}
+
+bool ApplyMetadataTokens(const std::vector<std::string>& tokens, MetadataParseContext& context) {
+  if (tokens.empty()) {
+    return false;
+  }
+  const auto& tag = tokens[0];
+  if (tag == "NEXT") {
+    return ApplyNextMetadataEntry(tokens, context);
+  }
+  if (tag == "DIR") {
+    return ApplyDirectoryMetadataEntry(tokens, context);
+  }
+  if (tag == "FILE") {
+    return ApplyFileMetadataEntry(tokens, context);
+  }
+  return false;
 }
 }  // namespace
 
@@ -1235,12 +1561,13 @@ int VolumeFilesystem::Truncate(const char* path, off_t size) {
 
 void VolumeFilesystem::SerializeDirectory(std::ostringstream& out, const DirectoryEntry* dir,
                                           const std::string& path) {
-  out << "DIR " << path << ' ' << dir->mtime.tv_sec << ' ' << dir->mtime.tv_nsec << '\n';
+  out << "DIR " << EscapeMetadataToken(path) << ' ' << dir->mtime.tv_sec << ' ' << dir->mtime.tv_nsec
+      << '\n';  // TSK121_Missing_Authentication_in_Metadata escape directory paths
   for (const auto& file : dir->files) {
     uint64_t start_chunk = kChunkPayloadSize == 0 ? 0 : file.start_offset / kChunkPayloadSize;
     auto mode_bits = file.mode == 0 ? kDefaultFileMode : file.mode;
     auto file_path = path == "/" ? "/" + file.name : path + "/" + file.name;
-    out << "FILE " << file_path << ' ' << file.size << ' ' << start_chunk << ' ' << mode_bits << ' '
+    out << "FILE " << EscapeMetadataToken(file_path) << ' ' << file.size << ' ' << start_chunk << ' '
         << file.mtime.tv_sec << ' ' << file.mtime.tv_nsec << ' ' << file.ctime.tv_sec << ' '
         << file.ctime.tv_nsec << ' ' << static_cast<uint64_t>(file.uid) << ' '
         << static_cast<uint64_t>(file.gid) << '\n';
@@ -1273,7 +1600,14 @@ void VolumeFilesystem::PersistMetadataLocked() {
   std::ostringstream serialized;
   serialized << "NEXT " << next_chunk_index_ << '\n';
   SerializeDirectory(serialized, root_.get(), "/");
-  auto payload = serialized.str();
+  auto body = serialized.str();
+  auto mac_key = device_->MetadataMacKey();
+  auto mac = qv::crypto::HMAC_SHA256::Compute(
+      std::span<const uint8_t>(mac_key.data(), mac_key.size()),
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+  std::ostringstream framed;
+  framed << "MAC " << HexEncode(std::span<const uint8_t>(mac.data(), mac.size())) << '\n' << body;
+  auto payload = framed.str();  // TSK121_Missing_Authentication_in_Metadata authenticate metadata contents
   const size_t total_bytes = metadata_chunk_count_ * kChunkPayloadSize;
   if (payload.size() > total_bytes) {
     throw qv::Error{qv::ErrorDomain::State, 0, "Metadata size exceeds reserved area"};
@@ -1292,98 +1626,131 @@ void VolumeFilesystem::PersistMetadataLocked() {
   }
 }
 
-void VolumeFilesystem::ParseMetadataLine(const std::string& line) {
-  if (line.empty()) {
-    return;
-  }
-  std::istringstream iss(line);
-  std::string tag;
-  iss >> tag;
-  if (tag == "NEXT") {
-    uint64_t next_chunk = 0;
-    iss >> next_chunk;
-    if (next_chunk < data_start_chunk_) {
-    next_chunk = data_start_chunk_;
-    }
-    next_chunk_index_ = next_chunk;
-    next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
-    return;
-  }
-  if (tag == "DIR") {
-    std::string path;
-    long sec = 0;
-    long nsec = 0;
-    iss >> path >> sec >> nsec;
-    auto* dir = EnsureDirectory(path);
-    dir->mtime = TimespecFrom(sec, nsec);
-    return;
-  }
-  if (tag == "FILE") {
-    std::string path;
-    uint64_t size = 0;
-    uint64_t start_chunk = 0;
-    mode_t mode = 0;
-    long msec = 0;
-    long mnsec = 0;
-    long csec = 0;
-    long cnsec = 0;
-    uint64_t uid = 0;
-    uint64_t gid = 0;
-    iss >> path >> size >> start_chunk >> mode >> msec >> mnsec >> csec >> cnsec >> uid >> gid;
-    auto parent_path = std::filesystem::path(path).parent_path().string();
-    if (parent_path.empty()) {
-      parent_path = "/";
-    }
-    auto* dir = EnsureDirectory(parent_path);
-    FileEntry entry{};
-    entry.name = std::filesystem::path(path).filename().string();
-    entry.size = size;
-    entry.start_offset = start_chunk * kChunkPayloadSize;
-    entry.mode = mode;
-    entry.mtime = TimespecFrom(msec, mnsec);
-    entry.ctime = TimespecFrom(csec, cnsec);
-    entry.uid = static_cast<uid_t>(uid);
-    entry.gid = static_cast<gid_t>(gid);
-    dir->files.push_back(entry);
-  }
-}
-
 void VolumeFilesystem::LoadMetadata() {
+  auto reset_to_empty = [&]() {
+    root_->files.clear();
+    root_->subdirs.clear();
+    root_->name = "/";
+    root_->mtime = CurrentTimespec();
+    next_chunk_index_ = data_start_chunk_;
+    next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
+  };
+
   std::vector<uint8_t> buffer(metadata_chunk_count_ * kChunkPayloadSize, 0);
+  size_t bytes_read = 0;
   for (uint64_t i = 0; i < metadata_chunk_count_; ++i) {
     try {
       auto chunk = device_->ReadChunk(static_cast<int64_t>(metadata_chunk_start_ + i));
       std::copy(chunk.ciphertext.begin(), chunk.ciphertext.end(),
                 buffer.begin() + static_cast<std::ptrdiff_t>(i * kChunkPayloadSize));
+      bytes_read += chunk.ciphertext.size();
     } catch (...) {
-      root_->files.clear();
-      root_->subdirs.clear();
-      next_chunk_index_ = data_start_chunk_;
-      next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
-      return;
+      if (bytes_read == 0) {
+        reset_to_empty();
+        return;
+      }
+      break;
     }
   }
-  std::string serialized(reinterpret_cast<char*>(buffer.data()), buffer.size());
+  if (bytes_read == 0) {
+    reset_to_empty();
+    return;
+  }
+  std::string serialized(reinterpret_cast<char*>(buffer.data()), bytes_read);
   auto null_pos = serialized.find('\0');
   if (null_pos != std::string::npos) {
     serialized.resize(null_pos);
   }
   if (serialized.empty()) {
-    root_->files.clear();
-    root_->subdirs.clear();
-    next_chunk_index_ = data_start_chunk_;
-    next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
+    reset_to_empty();
     return;
   }
-  root_->files.clear();
-  root_->subdirs.clear();
-  root_->mtime = CurrentTimespec();
-  next_chunk_index_ = data_start_chunk_;
-  next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
-  std::istringstream iss(serialized);
+
+  auto newline_pos = serialized.find('\n');
+  if (newline_pos == std::string::npos) {
+    reset_to_empty();
+    metadata_dirty_ = true;
+    return;
+  }
+  auto mac_line = serialized.substr(0, newline_pos);
+  auto body = serialized.substr(newline_pos + 1);
+  auto mac_tokens = SplitMetadataTokens(mac_line);
+  if (!mac_tokens || mac_tokens->size() != 2 || (*mac_tokens)[0] != "MAC") {
+    reset_to_empty();
+    metadata_dirty_ = true;
+    return;
+  }
+  auto mac_bytes = HexDecode((*mac_tokens)[1]);
+  if (!mac_bytes || mac_bytes->size() != qv::crypto::HMAC_SHA256::TAG_SIZE) {
+    reset_to_empty();
+    metadata_dirty_ = true;
+    return;
+  }
+  auto mac_key = device_->MetadataMacKey();
+  auto computed = qv::crypto::HMAC_SHA256::Compute(
+      std::span<const uint8_t>(mac_key.data(), mac_key.size()),
+      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+  if (!ConstantTimeEqual(std::span<const uint8_t>(computed.data(), computed.size()),
+                         std::span<const uint8_t>(mac_bytes->data(), mac_bytes->size()))) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Metadata MAC verification failed"};
+  }
+
+  MetadataParseContext context{};
+  context.root = std::make_shared<DirectoryEntry>();
+  context.root->name = "/";
+  context.root->mtime = CurrentTimespec();
+  context.next_chunk_index = data_start_chunk_;
+  context.next_seen = false;
+  context.data_start_chunk = data_start_chunk_;
+
+  bool parse_error = false;
+  size_t applied_lines = 0;
+  std::istringstream iss(body);
   std::string line;
   while (std::getline(iss, line)) {
-    ParseMetadataLine(line);
+    if (line.empty()) {
+      continue;
+    }
+    auto tokens = SplitMetadataTokens(line);
+    if (!tokens) {
+      parse_error = true;
+      continue;
+    }
+    if (ApplyMetadataTokens(*tokens, context)) {
+      ++applied_lines;
+    } else {
+      parse_error = true;
+    }
+  }
+
+  if (!context.next_seen) {
+    parse_error = true;
+    context.next_chunk_index = data_start_chunk_;
+  }
+  if (context.next_chunk_index > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    parse_error = true;
+    context.next_chunk_index = data_start_chunk_;
+  }
+  if (kChunkPayloadSize != 0 &&
+      context.next_chunk_index > std::numeric_limits<uint64_t>::max() / kChunkPayloadSize) {
+    parse_error = true;
+    context.next_chunk_index = data_start_chunk_;
+  }
+
+  if (!context.root) {
+    reset_to_empty();
+    metadata_dirty_ = true;
+    return;
+  }
+
+  root_ = context.root;
+  next_chunk_index_ = context.next_chunk_index;
+  next_file_offset_ = next_chunk_index_ * kChunkPayloadSize;
+  if (applied_lines == 0) {
+    root_->mtime = CurrentTimespec();
+  }
+  if (parse_error) {
+    metadata_dirty_ = true;
   }
 }
 
