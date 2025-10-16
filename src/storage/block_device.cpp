@@ -14,6 +14,9 @@
 #include <limits>       // TSK100_Integer_Overflow_and_Arithmetic overflow guards
 #include <vector>
 
+#include "qv/crypto/ct.h"              // TSK122_Weak_CRC32_for_Chunk_Headers constant-time MAC verify
+#include "qv/crypto/hmac_sha256.h"      // TSK122_Weak_CRC32_for_Chunk_Headers header authentication
+
 namespace qv::storage {
 
 // TSK061_Block_Device_and_Chunk_Storage_Engine
@@ -22,59 +25,41 @@ namespace {
 constexpr uint64_t kHeaderSize = sizeof(ChunkHeader);
 constexpr uint64_t kPayloadSize = kChunkSize;
 
-// TSK078_Chunk_Integrity_and_Bounds: CRC32 implementation for chunk headers.
-constexpr uint32_t kCRC32Polynomial = 0xEDB88320u;
+constexpr uint32_t kHeaderIntegrityVersion = 1; // TSK122_Weak_CRC32_for_Chunk_Headers version binding
 
-constexpr std::array<uint32_t, 256> MakeCRC32Table() {
-  std::array<uint32_t, 256> table{};
-  for (uint32_t i = 0; i < table.size(); ++i) {
-    uint32_t value = i;
-    for (uint32_t bit = 0; bit < 8; ++bit) {
-      if (value & 1u) {
-        value = (value >> 1) ^ kCRC32Polynomial;
-      } else {
-        value >>= 1;
-      }
-    }
-    table[i] = value;
-  }
-  return table;
+using HeaderMac = std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE>;
+
+HeaderMac ComputeHeaderMAC(const ChunkHeader& header, std::span<const uint8_t> key) {
+  ChunkHeader canonical = header;
+  canonical.header_mac.fill(0);
+  auto header_bytes = qv::AsBytesConst(canonical);
+  return qv::crypto::HMAC_SHA256::Compute(key, header_bytes);
 }
 
-constexpr std::array<uint32_t, 256> kCRC32Table = MakeCRC32Table();
-
-uint32_t ComputeCRC32(std::span<const uint8_t> data) {
-  uint32_t crc = 0xFFFFFFFFu;
-  for (auto byte : data) {
-    uint32_t index = (crc ^ static_cast<uint32_t>(byte)) & 0xFFu;
-    crc = (crc >> 8) ^ kCRC32Table[index];
-  }
-  return crc ^ 0xFFFFFFFFu;
-}
-
-uint32_t ExtractStoredCRC(const ChunkHeader& header) {
-  uint32_t stored = 0;
-  std::memcpy(&stored, header.reserved.data(), sizeof(stored));
-  if (!qv::kIsLittleEndian) {
-    stored = qv::detail::ByteSwap32(stored);  // NOLINT(bugprone-narrowing-conversions)
-  }
-  return stored;
-}
-
-uint32_t ComputeHeaderCRC(const ChunkHeader& header) {
-  ChunkHeader copy = header;
-  std::fill(copy.reserved.begin(), copy.reserved.end(), 0);
-  auto header_bytes = qv::AsBytesConst(copy);
-  return ComputeCRC32(std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
-}
-
-ChunkHeader PrepareHeaderForWrite(const ChunkHeader& header) {
+ChunkHeader PrepareHeaderForWrite(const ChunkHeader& header, std::span<const uint8_t> key) {
   ChunkHeader prepared = header;
-  std::fill(prepared.reserved.begin(), prepared.reserved.end(), 0);
-  const uint32_t crc = ComputeHeaderCRC(prepared);
-  uint32_t stored = qv::ToLittleEndian(crc);
-  std::memcpy(prepared.reserved.data(), &stored, sizeof(stored));
+  prepared.integrity_version = qv::ToLittleEndian(kHeaderIntegrityVersion);
+  prepared.header_mac.fill(0);
+  const HeaderMac mac = ComputeHeaderMAC(prepared, key);
+  prepared.header_mac = mac;
   return prepared;
+}
+
+void VerifyHeaderMACOrThrow(ChunkHeader& header, std::span<const uint8_t> key) {
+  const uint32_t version = qv::FromLittleEndian32(header.integrity_version);
+  if (version != kHeaderIntegrityVersion) {
+    throw Error{ErrorDomain::Validation, 0,
+                "Chunk header integrity version unsupported"}; // TSK122_Weak_CRC32_for_Chunk_Headers
+  }
+  const HeaderMac stored_mac = header.header_mac;
+  ChunkHeader canonical = header;
+  canonical.header_mac.fill(0);
+  const HeaderMac computed = ComputeHeaderMAC(canonical, key);
+  if (!qv::crypto::ct::CompareEqual(stored_mac, computed)) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk header MAC mismatch"};
+  }
+  header = canonical;
+  header.header_mac = stored_mac;
 }
 
 class ResizeRollbackGuard { // TSK098_Exception_Safety_and_Resource_Leaks
@@ -119,16 +104,6 @@ class ResizeRollbackGuard { // TSK098_Exception_Safety_and_Resource_Leaks
   bool committed_{false};
 };
 
-void VerifyHeaderCRCOrThrow(ChunkHeader& header) {
-  const uint32_t stored = ExtractStoredCRC(header);
-  ChunkHeader sanitized = header;
-  std::fill(sanitized.reserved.begin(), sanitized.reserved.end(), 0);
-  const uint32_t computed = ComputeHeaderCRC(sanitized);
-  if (stored != computed) {
-    throw Error{ErrorDomain::Validation, 0, "Chunk header CRC mismatch"};
-  }
-  header = sanitized;
-}
 }  // namespace
 
 BlockDevice::BlockDevice(const std::filesystem::path& container_path,
@@ -247,7 +222,8 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
     file_.clear();
   }
 
-  ChunkHeader prepared_header = PrepareHeaderForWrite(header);  // TSK078_Chunk_Integrity_and_Bounds
+  ChunkHeader prepared_header = PrepareHeaderForWrite(
+      header, std::span<const uint8_t>(master_key_));  // TSK122_Weak_CRC32_for_Chunk_Headers
   std::vector<uint8_t> record(static_cast<size_t>(record_size_));
   std::memcpy(record.data(), &prepared_header, sizeof(prepared_header));
   std::memcpy(record.data() + sizeof(prepared_header), ciphertext.data(), ciphertext.size());
@@ -331,7 +307,7 @@ ChunkReadResult BlockDevice::ReadChunk(int64_t chunk_index) {
   if (file_.gcount() != static_cast<std::streamsize>(result.ciphertext.size())) {
     throw Error{ErrorDomain::IO, 0, "Failed to read chunk payload"};
   }
-  VerifyHeaderCRCOrThrow(result.header);  // TSK078_Chunk_Integrity_and_Bounds
+  VerifyHeaderMACOrThrow(result.header, std::span<const uint8_t>(master_key_));  // TSK122_Weak_CRC32_for_Chunk_Headers
   if (result.header.chunk_index != chunk_index) {
     throw Error{ErrorDomain::Validation, 0, "Chunk index mismatch"};  // TSK108_Data_Structure_Invariants
   }
