@@ -222,13 +222,13 @@ namespace {
 
   bool PasswordsEqual(std::string_view lhs,
                       std::string_view rhs) noexcept { // TSK132_Weak_Password_Handling constant-time compare
-    volatile uint8_t diff = static_cast<uint8_t>((lhs.size() ^ rhs.size()) & 0xFFu);
+    volatile size_t diff = lhs.size() ^ rhs.size();
     for (size_t i = 0; i < kMaxPasswordLen; ++i) {
       const uint8_t a = i < lhs.size() ? static_cast<uint8_t>(lhs[i]) : 0u;
       const uint8_t b = i < rhs.size() ? static_cast<uint8_t>(rhs[i]) : 0u;
-      diff |= static_cast<uint8_t>(a ^ b);
+      diff |= static_cast<size_t>(a ^ b);
     }
-    diff |= static_cast<uint8_t>((lhs.size() > kMaxPasswordLen) | (rhs.size() > kMaxPasswordLen));
+    diff |= static_cast<size_t>((lhs.size() > kMaxPasswordLen) | (rhs.size() > kMaxPasswordLen));
     std::atomic_signal_fence(std::memory_order_seq_cst);
     return diff == 0;
   }
