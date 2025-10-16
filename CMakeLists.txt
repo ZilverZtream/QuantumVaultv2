@@ -123,6 +123,7 @@ add_library(qv_core
     src/crypto/random.cpp
     src/crypto/provider.cpp
     src/crypto/sha256.cpp
+    src/crypto/keyfiles.cpp # TSK711_Keyfiles_and_PKCS11_FIDO2 keyfile hashing support
     src/security/zeroizer.cpp
 )
 target_include_directories(qv_core
@@ -167,6 +168,7 @@ add_library(qv_orchestrator
     src/orchestrator/password_policy.cpp
     src/orchestrator/io_util.cpp # TSK068_Atomic_Header_Writes durability helper
     src/orchestrator/event_bus.cpp
+    src/orchestrator/credentials.cpp # TSK711_Keyfiles_and_PKCS11_FIDO2 credential combiner
     src/tlv/parser.cpp # TSK111_Code_Duplication_and_Maintainability reusable TLV parser
 )
 target_include_directories(qv_orchestrator
