@@ -320,6 +320,8 @@ struct NonceLog::FileLock {                                             // TSK13
   NonceLogFileLock guard;
 };
 
+NonceLog::~NonceLog() = default;                                        // TSK133_Race_in_Nonce_Log_Recovery complete type
+
 namespace {
 
   class TempFileGuard { // TSK028_Secure_Deletion_and_Data_Remanence

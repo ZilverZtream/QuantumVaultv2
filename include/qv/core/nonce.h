@@ -39,6 +39,7 @@ namespace qv::core {
 
   public:
     NonceLog() = default;
+    ~NonceLog(); // TSK133_Race_in_Nonce_Log_Recovery ensure lock type complete
     explicit NonceLog(const std::filesystem::path& path);
     NonceLog(const std::filesystem::path& path, std::nothrow_t) noexcept; // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::array<uint8_t, 32> Append(uint64_t counter,
