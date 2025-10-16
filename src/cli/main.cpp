@@ -6,6 +6,8 @@
 #include <chrono>    // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <csignal>
 #include <cctype>   // TSK129_Unvalidated_User_Input_in_CLI lowercase system path guards
+#include <cstdint>  // TSK145_Signal_Handler_Race_Conditions fixed-width signal length
+#include <limits>   // TSK145_Signal_Handler_Race_Conditions clamp registration length
 #include <cstddef>   // TSK028_Secure_Deletion_and_Data_Remanence
 #include <cstring>   // TSK035_Platform_Specific_Security_Integration
 #include <ctime>     // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -75,6 +77,7 @@
 #include <cerrno>
 #include <fcntl.h>        // TSK028_Secure_Deletion_and_Data_Remanence
 #include <signal.h>       // TSK132_Weak_Password_Handling scoped signal handlers
+#include <pthread.h>      // TSK145_Signal_Handler_Race_Conditions pthread_sigmask for masking
 #include <sys/resource.h> // TSK139_Memory_Disclosure_And_Information_Leaks disable core dumps on POSIX
 #include <sys/stat.h>     // TSK028_Secure_Deletion_and_Data_Remanence
 #include <sys/types.h>
@@ -101,29 +104,89 @@
 namespace {
 
   constexpr size_t kMaxPasswordLen = 1024; // TSK132_Weak_Password_Handling enforce password size ceiling
+  static_assert(kMaxPasswordLen < std::numeric_limits<uint32_t>::max(),
+                "Password buffer must fit in signal length type"); // TSK145_Signal_Handler_Race_Conditions bound signal metadata
 
   std::atomic<uint8_t*> g_signal_buffer{nullptr};      // TSK132_Weak_Password_Handling signal wipe state
-  std::atomic<size_t> g_signal_length{0};              // TSK132_Weak_Password_Handling signal wipe state
+  std::atomic<uint32_t> g_signal_length{0};            // TSK132_Weak_Password_Handling signal wipe state
+  static_assert(std::atomic<uint8_t*>::is_always_lock_free,  // TSK145_Signal_Handler_Race_Conditions ensure async-signal-safe loads
+                "Pointer atomics must be lock-free for signal safety");
+  static_assert(std::atomic<uint32_t>::is_always_lock_free,  // TSK145_Signal_Handler_Race_Conditions ensure async-signal-safe loads
+                "Length atomics must be lock-free for signal safety");
 
-  class SensitiveDataRegistration { // TSK132_Weak_Password_Handling signal wipe integration
+#if !defined(_WIN32)
+  sigset_t MakeSensitiveSignalMask() noexcept {              // TSK145_Signal_Handler_Race_Conditions helper
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGTERM);
+#ifdef SIGPIPE
+    sigaddset(&mask, SIGPIPE);
+#endif
+    return mask;
+  }
+#endif
+
+  uint32_t ClampToSignalLength(size_t len) noexcept {        // TSK145_Signal_Handler_Race_Conditions bounds check
+    constexpr size_t kMaxSignalValue = std::numeric_limits<uint32_t>::max();
+    if (len > kMaxSignalValue) {
+      return static_cast<uint32_t>(kMaxSignalValue);
+    }
+    return static_cast<uint32_t>(len);
+  }
+
+  class ScopedSignalMask {                                   // TSK145_Signal_Handler_Race_Conditions block signals for critical sections
    public:
-    SensitiveDataRegistration(uint8_t* ptr, size_t len) noexcept
-        : previous_ptr_(g_signal_buffer.exchange(ptr, std::memory_order_acq_rel)),
-          previous_len_(g_signal_length.exchange(len, std::memory_order_acq_rel)) {}
-
-    ~SensitiveDataRegistration() {
-      g_signal_buffer.store(previous_ptr_, std::memory_order_release);
-      g_signal_length.store(previous_len_, std::memory_order_release);
+#if defined(_WIN32)
+    ScopedSignalMask() noexcept = default;
+    ~ScopedSignalMask() = default;
+#else
+    ScopedSignalMask() noexcept : mask_(MakeSensitiveSignalMask()) {
+      const int rc = pthread_sigmask(SIG_BLOCK, &mask_, &previous_);
+      (void)rc;
     }
 
-    void Update(uint8_t* ptr, size_t len) noexcept {
-      g_signal_buffer.store(ptr, std::memory_order_release);
-      g_signal_length.store(len, std::memory_order_release);
+    ~ScopedSignalMask() {
+      const int rc = pthread_sigmask(SIG_SETMASK, &previous_, nullptr);
+      (void)rc;
     }
 
    private:
+    sigset_t mask_{};
+    sigset_t previous_{};
+#endif
+
+    ScopedSignalMask(const ScopedSignalMask&) = delete;
+    ScopedSignalMask& operator=(const ScopedSignalMask&) = delete;
+  };
+
+  class SensitiveDataRegistration { // TSK132_Weak_Password_Handling signal wipe integration
+   public:
+    SensitiveDataRegistration(uint8_t* ptr, size_t len) noexcept {
+      const uint32_t narrow_len = ClampToSignalLength(len);
+      ScopedSignalMask lock; // TSK145_Signal_Handler_Race_Conditions prevent partial updates
+      previous_ptr_ = g_signal_buffer.load(std::memory_order_relaxed);
+      previous_len_ = g_signal_length.load(std::memory_order_relaxed);
+      g_signal_buffer.store(ptr, std::memory_order_relaxed);
+      g_signal_length.store(narrow_len, std::memory_order_relaxed);
+    }
+
+    ~SensitiveDataRegistration() {
+      ScopedSignalMask lock; // TSK145_Signal_Handler_Race_Conditions restore atomically
+      g_signal_buffer.store(previous_ptr_, std::memory_order_relaxed);
+      g_signal_length.store(previous_len_, std::memory_order_relaxed);
+    }
+
+    void Update(uint8_t* ptr, size_t len) noexcept {
+      const uint32_t narrow_len = ClampToSignalLength(len);
+      ScopedSignalMask lock; // TSK145_Signal_Handler_Race_Conditions update atomically
+      g_signal_buffer.store(ptr, std::memory_order_relaxed);
+      g_signal_length.store(narrow_len, std::memory_order_relaxed);
+    }
+
+  private:
     uint8_t* previous_ptr_;
-    size_t previous_len_;
+    uint32_t previous_len_;
   };
 
   constexpr const char kGenericAuthFailureMessage[] =
@@ -1386,15 +1449,13 @@ namespace {
       case CTRL_C_EVENT:
       case CTRL_BREAK_EVENT:
       case CTRL_CLOSE_EVENT: {
-        auto* buffer = g_signal_buffer.load(std::memory_order_acquire);
-        const size_t len = g_signal_length.load(std::memory_order_acquire);
-        if (buffer && len > 0) {
+        auto* buffer = g_signal_buffer.load(std::memory_order_relaxed);
+        const uint32_t len = g_signal_length.load(std::memory_order_relaxed);
+        if (buffer && len > 0U) {
           volatile uint8_t* wipe = buffer;
-          for (size_t i = 0; i < len; ++i) {
+          for (uint32_t i = 0; i < len; ++i) {
             wipe[i] = 0;
           }
-          g_signal_buffer.store(nullptr, std::memory_order_release);
-          g_signal_length.store(0, std::memory_order_release);
         }
         break;
       }
@@ -1438,8 +1499,9 @@ namespace {
     PasswordSignalGuard signal_guard; // TSK132_Weak_Password_Handling scope handler
 
     std::array<wchar_t, kMaxPasswordLen + 1> buffer{}; // TSK132_Weak_Password_Handling fixed buffer
-    qv::security::Zeroizer::ScopeWiper<wchar_t> buf_guard(buffer.data(), buffer.size());
     SensitiveDataRegistration registration(reinterpret_cast<uint8_t*>(buffer.data()), 0);
+    qv::security::Zeroizer::ScopeWiper<wchar_t> buf_guard( // TSK145_Signal_Handler_Race_Conditions keep registration active
+        buffer.data(), buffer.size());
 
     size_t pos = 0;
     bool overflow = false;
@@ -1534,16 +1596,14 @@ namespace {
     bool restored_;
   };
 
-  void PasswordSignalHandler(int sig) { // TSK132_Weak_Password_Handling wipe on interrupt
-    auto* buffer = g_signal_buffer.load(std::memory_order_acquire);
-    const size_t len = g_signal_length.load(std::memory_order_acquire);
-    if (buffer && len > 0) {
+  void PasswordSignalHandler(int sig) noexcept { // TSK132_Weak_Password_Handling wipe on interrupt
+    auto* buffer = g_signal_buffer.load(std::memory_order_relaxed);
+    const uint32_t len = g_signal_length.load(std::memory_order_relaxed);
+    if (buffer && len > 0U) {
       volatile uint8_t* wipe = buffer;
-      for (size_t i = 0; i < len; ++i) {
+      for (uint32_t i = 0; i < len; ++i) {
         wipe[i] = 0;
       }
-      g_signal_buffer.store(nullptr, std::memory_order_release);
-      g_signal_length.store(0, std::memory_order_release);
     }
     _exit(128 + sig);
   }
@@ -1553,19 +1613,32 @@ namespace {
     PasswordSignalGuard() {
       struct sigaction sa {};
       sa.sa_handler = PasswordSignalHandler;
-      sigemptyset(&sa.sa_mask);
+      sa.sa_mask = MakeSensitiveSignalMask();
       sa.sa_flags = 0;
       sigaction(SIGINT, &sa, &old_int_);
       sigaction(SIGTERM, &sa, &old_term_);
+#ifdef SIGPIPE
+      struct sigaction ignore_pipe {};
+      ignore_pipe.sa_handler = SIG_IGN;             // TSK145_Signal_Handler_Race_Conditions ignore SIGPIPE for network ops
+      sigemptyset(&ignore_pipe.sa_mask);
+      ignore_pipe.sa_flags = 0;
+      sigaction(SIGPIPE, &ignore_pipe, &old_pipe_);
+#endif
     }
     ~PasswordSignalGuard() {
       sigaction(SIGINT, &old_int_, nullptr);
       sigaction(SIGTERM, &old_term_, nullptr);
+#ifdef SIGPIPE
+      sigaction(SIGPIPE, &old_pipe_, nullptr);
+#endif
     }
 
    private:
     struct sigaction old_int_ {};
     struct sigaction old_term_ {};
+#ifdef SIGPIPE
+    struct sigaction old_pipe_ {};
+#endif
   };
 
   std::string ReadPassword(const std::string& prompt) {
@@ -1596,8 +1669,9 @@ namespace {
     PasswordSignalGuard signal_guard; // TSK132_Weak_Password_Handling scope handler
 
     std::array<char, kMaxPasswordLen + 1> buffer{}; // TSK132_Weak_Password_Handling fixed buffer
-    qv::security::Zeroizer::ScopeWiper<char> buf_guard(buffer.data(), buffer.size());
     SensitiveDataRegistration registration(reinterpret_cast<uint8_t*>(buffer.data()), 0);
+    qv::security::Zeroizer::ScopeWiper<char> buf_guard( // TSK145_Signal_Handler_Race_Conditions keep registration active
+        buffer.data(), buffer.size());
 
     size_t pos = 0;
     bool overflow = false;
