@@ -60,6 +60,7 @@ class ChunkCache {
   struct EraseResult {
     std::shared_ptr<CachedChunk> chunk;
     uint64_t generation{0};
+    uint64_t previous_generation{0};  // TSK115_Memory_Leaks_and_Resource_Management rollback support
   };
 
   void TouchLocked(int64_t chunk_idx, const std::shared_ptr<CachedChunk>& chunk);
