@@ -94,6 +94,43 @@ constexpr size_t kSyslogThrottleBurst = 256;                         // TSK138_R
 constexpr size_t kSyslogThrottleRatePerSecond = 64;                  // TSK138_Rate_Limiting_And_DoS_Vulnerabilities steady refill rate
 constexpr uint64_t kNanosecondsPerSecond = 1'000'000'000ull;         // TSK138_Rate_Limiting_And_DoS_Vulnerabilities integral refill math
 
+std::string HashTag(std::string_view value) { // TSK139_Memory_Disclosure_And_Information_Leaks
+  auto digest = HashForTelemetry(value);
+  if (digest.empty()) {
+    return std::string{"hash:"};
+  }
+  return std::string{"hash:"} + digest;
+}
+
+bool LooksLikeFilesystemPath(std::string_view value) { // TSK139_Memory_Disclosure_And_Information_Leaks
+  return value.find('/') != std::string_view::npos || value.find('\\') != std::string_view::npos;
+}
+
+bool FieldKeyImpliesSensitive(std::string_view key) { // TSK139_Memory_Disclosure_And_Information_Leaks
+  std::string lowered;
+  lowered.reserve(key.size());
+  for (char ch : key) {
+    lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return lowered.find("path") != std::string::npos || lowered.find("container") != std::string::npos ||
+         lowered.find("mount") != std::string::npos || lowered.find("detail") != std::string::npos ||
+         lowered.find("secret") != std::string::npos;
+}
+
+std::string SanitizeEventMessage(const Event& event) { // TSK139_Memory_Disclosure_And_Information_Leaks
+  if (event.message.empty()) {
+    return {};
+  }
+  if (event.severity >= EventSeverity::kError || LooksLikeFilesystemPath(event.message)) {
+    auto tagged = HashTag(event.message);
+    if (!tagged.empty()) {
+      return tagged;
+    }
+    return "hash:"; // indicates suppressed detail even if input empty
+  }
+  return event.message;
+}
+
 uint32_t ToBigEndian32(uint32_t value) { // TSK079_Audit_Log_Integrity_Chain portable state encoding
   if (qv::kIsLittleEndian) {
     return qv::detail::ByteSwap32(value);
@@ -568,8 +605,9 @@ std::optional<std::string> BuildEventJson(const Event& event, const std::string&
     }
   }
   if (!event.message.empty()) {
-    if (!AppendWithLimit(payload, ",\"message\":\"", max_bytes) ||
-        !AppendEscapedWithLimit(payload, event.message, max_bytes) ||
+    auto sanitized_message = SanitizeEventMessage(event);
+    if (!sanitized_message.empty() && (!AppendWithLimit(payload, ",\"message\":\"", max_bytes) ||
+                                       !AppendEscapedWithLimit(payload, sanitized_message, max_bytes) ||
         !AppendWithLimit(payload, "\"", max_bytes)) {
       return std::nullopt;
     }
@@ -593,9 +631,13 @@ std::optional<std::string> BuildEventJson(const Event& event, const std::string&
     if (privacy == FieldPrivacy::kRedact) {
       sanitized = "[REDACTED]"; // TSK029 ensure sensitive data is masked
     } else if (privacy == FieldPrivacy::kHash) {
-      sanitized = HashForTelemetry(sanitized);
+      sanitized = HashTag(field.value);
+    } else if (privacy == FieldPrivacy::kPublic &&
+               (FieldKeyImpliesSensitive(field.key) || LooksLikeFilesystemPath(field.value))) {
+      sanitized = HashTag(field.value); // TSK139_Memory_Disclosure_And_Information_Leaks hash inferred sensitive values
     }
-    if (field.numeric && privacy == FieldPrivacy::kPublic) {
+    const bool sanitized_changed = sanitized != field.value;
+    if (field.numeric && privacy == FieldPrivacy::kPublic && !sanitized_changed) {
       if (!AppendWithLimit(payload, sanitized, max_bytes)) {
         return std::nullopt;
       }

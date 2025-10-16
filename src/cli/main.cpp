@@ -72,12 +72,16 @@
 #include "qv/platform/winfsp_adapter.h"  // TSK063_WinFsp_Windows_Driver_Integration
 #else // _WIN32
 #include <cerrno>
-#include <fcntl.h>    // TSK028_Secure_Deletion_and_Data_Remanence
-#include <signal.h>   // TSK132_Weak_Password_Handling scoped signal handlers
-#include <sys/stat.h> // TSK028_Secure_Deletion_and_Data_Remanence
+#include <fcntl.h>        // TSK028_Secure_Deletion_and_Data_Remanence
+#include <signal.h>       // TSK132_Weak_Password_Handling scoped signal handlers
+#include <sys/resource.h> // TSK139_Memory_Disclosure_And_Information_Leaks disable core dumps on POSIX
+#include <sys/stat.h>     // TSK028_Secure_Deletion_and_Data_Remanence
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h> // TSK139_Memory_Disclosure_And_Information_Leaks disable dumpability on Linux
+#endif
 #endif // _WIN32
 
 #if defined(__APPLE__)
@@ -180,7 +184,6 @@ namespace {
                           const SecurityIntegrationFlags& flags); // TSK035_Platform_Specific_Security_Integration
 
   std::string SanitizePath(const std::filesystem::path& path) { // TSK027
-#ifdef NDEBUG
     auto normalized = path;
     if (normalized.empty()) {
       return std::string{"[path]"};
@@ -189,13 +192,39 @@ namespace {
       normalized = normalized.lexically_normal();
     }
     if (normalized.has_filename()) {
-      return normalized.filename().string();
+      auto filename = normalized.filename().string();
+      if (!filename.empty() && filename != std::string{"."}) {
+        return filename;
+      }
     }
     auto fallback = normalized.string();
-    return fallback.empty() ? std::string{"[path]"} : fallback;
+    if (fallback.empty() || fallback == "." || fallback == ".." || fallback == std::string{std::filesystem::path::preferred_separator}) {
+      return std::string{"[path]"};
+    }
+    return fallback;
+  }
+
+  void DisableCoreDumps() { // TSK139_Memory_Disclosure_And_Information_Leaks
+#if defined(_WIN32)
+    UINT previous = ::SetErrorMode(0);
+    ::SetErrorMode(previous | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 #else
-    return path.string();
+    struct rlimit core_limit {
+      0, 0
+    };
+    (void)::setrlimit(RLIMIT_CORE, &core_limit);
+#if defined(__linux__)
+    (void)::prctl(PR_SET_DUMPABLE, 0);
 #endif
+#endif
+  }
+
+  std::string HashTelemetryDetail(std::string_view detail) { // TSK139_Memory_Disclosure_And_Information_Leaks
+    auto digest = qv::orchestrator::HashForTelemetry(detail);
+    if (digest.empty()) {
+      return std::string{"hash:"};
+    }
+    return std::string{"hash:"} + digest;
   }
 
   bool ValidateNoEmbeddedNull(std::string_view value,
@@ -1614,43 +1643,67 @@ namespace {
   }
 
   std::string UserFacingMessage(const qv::Error& err) { // TSK027
-#ifdef NDEBUG
-    return std::string(GenericDomainMessage(err.domain));
-#else
-    return DescribeError(err);
-#endif
+    return DescribeErrorRedacted(err); // TSK139_Memory_Disclosure_And_Information_Leaks ensure sanitized detail
+  }
+
+  void PublishTelemetryEvent(const qv::orchestrator::Event& event) { // TSK139_Memory_Disclosure_And_Information_Leaks
+    try {
+      qv::orchestrator::EventBus::Instance().Publish(event);
+    } catch (const std::exception& publish_error) {
+      std::clog << "{\"event\":\"eventbus_error\",\"message\":\"error report publish failed\",\"detail\":\""
+                << HashTelemetryDetail(publish_error.what())
+                << "\"}" << std::endl; // TSK116_Incorrect_Error_Propagation do not terminate on diagnostics
+    } catch (...) {
+      std::clog << "{\"event\":\"eventbus_error\",\"message\":\"error report publish failed\",\"detail\":\"unknown\"}"
+                << std::endl; // TSK116_Incorrect_Error_Propagation suppress unexpected exceptions
+    }
   }
 
   void ReportError(const qv::Error& err) {
     const std::string detail = DescribeError(err);
-#ifdef NDEBUG
     const std::string user = UserFacingMessage(err);
-#else
-    const std::string user = detail;
-#endif
     std::cerr << DomainPrefix(err.domain) << ": " << user << '\n';
 
     qv::orchestrator::Event event; // TSK027
     event.category = qv::orchestrator::EventCategory::kDiagnostics;
     event.severity = qv::orchestrator::EventSeverity::kError;
     event.event_id = "cli_error";
-    event.message = detail;
+    event.message = user; // TSK139_Memory_Disclosure_And_Information_Leaks avoid leaking raw detail
     event.fields.emplace_back("domain", std::string(DomainPrefix(err.domain)));
     event.fields.emplace_back("code", std::to_string(err.code),
                               qv::orchestrator::FieldPrivacy::kPublic, true);
+    if (!detail.empty()) {
+      event.fields.emplace_back("detail", detail, qv::orchestrator::FieldPrivacy::kHash); // TSK139_Memory_Disclosure_And_Information_Leaks
+    }
     if (err.native_code.has_value()) {
       event.fields.emplace_back("native_code", std::to_string(*err.native_code),
                                 qv::orchestrator::FieldPrivacy::kHash, true);
     }
-    try {
-      qv::orchestrator::EventBus::Instance().Publish(event);
-    } catch (const std::exception& publish_error) {
-      std::clog << "{\"event\":\"eventbus_error\",\"message\":\"error report publish failed\",\"detail\":\""
-                << publish_error.what() << "\"}" << std::endl; // TSK116_Incorrect_Error_Propagation do not terminate on diagnostics
-    } catch (...) {
-      std::clog << "{\"event\":\"eventbus_error\",\"message\":\"error report publish failed\",\"detail\":\"unknown\"}"
-                << std::endl; // TSK116_Incorrect_Error_Propagation suppress unexpected exceptions
+    if (!err.context.empty()) { // TSK139_Memory_Disclosure_And_Information_Leaks
+      std::string joined;
+      for (const auto& ctx : err.context) {
+        if (!joined.empty()) {
+          joined.push_back('|');
+        }
+        joined.append(ctx);
+      }
+      event.fields.emplace_back("context", joined, qv::orchestrator::FieldPrivacy::kHash);
     }
+    PublishTelemetryEvent(event);
+  }
+
+  void ReportUnhandledException(const std::exception& err) { // TSK139_Memory_Disclosure_And_Information_Leaks
+    std::cerr << "I/O error: Operation failed." << std::endl;
+    qv::orchestrator::Event event;
+    event.category = qv::orchestrator::EventCategory::kDiagnostics;
+    event.severity = qv::orchestrator::EventSeverity::kCritical;
+    event.event_id = "cli_unhandled_exception";
+    event.message = "Unhandled exception";
+    std::string detail = err.what();
+    if (!detail.empty()) {
+      event.fields.emplace_back("detail", std::move(detail), qv::orchestrator::FieldPrivacy::kHash);
+    }
+    PublishTelemetryEvent(event);
   }
 
   int ExitCodeFor(const qv::Error& err) {
@@ -2385,7 +2438,7 @@ namespace {
     destroyed.event_id = "volume_destroyed";
     destroyed.message = "Encrypted volume destroyed";
     destroyed.fields.emplace_back("container", qv::PathToUtf8String(container),
-                                  qv::orchestrator::FieldPrivacy::kRedact);
+                                  qv::orchestrator::FieldPrivacy::kHash); // TSK139_Memory_Disclosure_And_Information_Leaks hash container identifiers
     qv::orchestrator::EventBus::Instance().Publish(destroyed);
 #if defined(__linux__)
     std::cout << "NOTE: Complete secure deletion requires SSD TRIM support and running blkdiscard "
@@ -2402,6 +2455,7 @@ namespace {
 } // namespace
 
 int main(int argc, char** argv) {
+  DisableCoreDumps(); // TSK139_Memory_Disclosure_And_Information_Leaks minimize crash artifact leakage
   try {
     if (argc < 2) {
       PrintUsage();
@@ -2716,11 +2770,7 @@ int main(int argc, char** argv) {
     ReportError(err);
     return ExitCodeFor(err);
   } catch (const std::exception& err) {
-#ifdef NDEBUG
-    std::cerr << "I/O error: Operation failed." << std::endl;
-#else
-    std::cerr << "I/O error: " << err.what() << std::endl;
-#endif
+    ReportUnhandledException(err);
     return kExitIO;
   }
 }
