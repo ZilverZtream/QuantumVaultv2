@@ -9,10 +9,12 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stringapiset.h>  // TSK120_Incorrect_Path_Normalization Unicode normalization helper
 
 #include <winfsp/winfsp.h>
 
 #include <algorithm>
+#include <cwctype>   // TSK120_Incorrect_Path_Normalization printable-path validation helpers
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +22,8 @@
 #include <span>
 #include <string>
 #include <vector>
+
+#pragma comment(lib, "Normaliz.lib")  // TSK120_Incorrect_Path_Normalization ensure NFC support linkage
 
 namespace qv::platform {
 
@@ -223,66 +227,98 @@ std::string WinFspAdapter::Impl::WideToUtf8(const std::wstring& value) {
 
 std::string WinFspAdapter::Impl::NormalizePath(const std::wstring& value) {
   // TSK084_WinFSP_Normalization_and_Traversal enforce canonical paths inside volume root
+  // TSK120_Incorrect_Path_Normalization tighten wide-path normalization and validation
   constexpr size_t kMaxPathDepth = 128;
   constexpr size_t kMaxPathLength = 4096;
+  constexpr size_t kMaxPathSegmentLength = 255;
 
-  std::wstring cleaned = value;
-  std::replace(cleaned.begin(), cleaned.end(), L'\\', L'/');
-
-  if (!cleaned.empty()) {
-    if (cleaned.size() >= 2 && cleaned[0] == L'/' && cleaned[1] == L'/') {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "UNC paths are not supported"};
-    }
-    if (cleaned.find(L':') != std::wstring::npos) {
-      throw qv::Error{qv::ErrorDomain::Validation, 0, "Drive-qualified paths are not supported"};
+  if (value.find(L' ') != std::wstring::npos) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Embedded null in path"};
+  }
+  for (wchar_t ch : value) {
+    if (ch < 0x20 || !std::iswprint(static_cast<wint_t>(ch))) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Non-printable character in path"};
     }
   }
 
-  std::filesystem::path fs_path(cleaned);
+  std::wstring normalized_input = value;
+  if (!normalized_input.empty()) {
+    int required = NormalizeString(NormalizationC, normalized_input.c_str(),
+                                   static_cast<int>(normalized_input.size()), nullptr, 0);
+    if (required <= 0) {
+      DWORD error = GetLastError();
+      throw qv::Error{qv::ErrorDomain::Validation, static_cast<int>(error),
+                      "Unicode normalization failed"};
+    }
+    std::wstring buffer(static_cast<size_t>(required), L' ');
+    int written = NormalizeString(NormalizationC, normalized_input.c_str(),
+                                  static_cast<int>(normalized_input.size()), buffer.data(), required);
+    if (written <= 0) {
+      DWORD error = GetLastError();
+      throw qv::Error{qv::ErrorDomain::Validation, static_cast<int>(error),
+                      "Unicode normalization failed"};
+    }
+    buffer.resize(static_cast<size_t>(written));
+    normalized_input = std::move(buffer);
+  }
+
+  std::replace(normalized_input.begin(), normalized_input.end(), L'\', L'/');
+
+  if (normalized_input.find(L':') != std::wstring::npos) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Drive-qualified paths are not supported"};
+  }
+  if (normalized_input.size() >= 2 && normalized_input[0] == L'/' && normalized_input[1] == L'/') {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "UNC paths are not supported"};
+  }
+  if (normalized_input.find(L"//") != std::wstring::npos) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Adjacent path separators are not supported"};
+  }
+
+  std::filesystem::path fs_path(normalized_input);
   if (fs_path.has_root_name()) {
     throw qv::Error{qv::ErrorDomain::Validation, 0, "Root-qualified paths are not supported"};
   }
 
   auto normalized = fs_path.lexically_normal();
-  std::wstring generic = normalized.generic_wstring();
+  const bool is_root_only = normalized.empty() || normalized == std::filesystem::path(L"/") ||
+                            normalized == std::filesystem::path(L".");
+  if ((normalized.has_root_name() || normalized.has_root_directory()) && !is_root_only) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Absolute paths are not supported"};
+  }
 
-  std::wstring result;
-  if (generic.empty() || generic == L"." || generic == L"/") {
-    result = L"/";
-  } else {
-    result = std::move(generic);
-    if (!normalized.has_root_directory() || result.front() != L'/') {
-      result.insert(result.begin(), L'/');
+  std::vector<std::wstring> segments;
+  segments.reserve(kMaxPathDepth);
+  for (const auto& part : normalized) {
+    auto name = part.generic_wstring();
+    if (name.empty() || name == L"/") {
+      continue;
     }
-    while (result.size() > 1 && result.back() == L'/') {
-      result.pop_back();
+    if (name == L".") {
+      continue;
+    }
+    if (name == L"..") {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path traversal outside root is not allowed"};
+    }
+    if (name.size() > kMaxPathSegmentLength) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path segment length exceeds maximum"};
+    }
+    for (wchar_t ch : name) {
+      if (ch < 0x20 || !std::iswprint(static_cast<wint_t>(ch))) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Non-printable character in path segment"};
+      }
+    }
+    segments.emplace_back(std::move(name));
+    if (segments.size() > kMaxPathDepth) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path depth exceeds maximum"};
     }
   }
 
-  if (result.empty()) {
-    result = L"/";
-  }
-
-  size_t depth = 0;
-  for (size_t pos = 1; pos < result.size();) {
-    auto next = result.find(L'/', pos);
-    size_t len = (next == std::wstring::npos) ? result.size() - pos : next - pos;
-    if (len > 0) {
-      auto segment = result.substr(pos, len);
-      if (segment == L"..") {
-        throw qv::Error{qv::ErrorDomain::Validation, 0, "Path traversal outside root is not allowed"};
-      }
-      if (segment != L".") {
-        ++depth;
-        if (depth > kMaxPathDepth) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0, "Path depth exceeds maximum"};
-        }
-      }
+  std::wstring result = L"/";
+  for (size_t i = 0; i < segments.size(); ++i) {
+    if (i > 0) {
+      result.push_back(L'/');
     }
-    if (next == std::wstring::npos) {
-      break;
-    }
-    pos = next + 1;
+    result.append(segments[i]);
   }
 
   if (result.size() > kMaxPathLength) {

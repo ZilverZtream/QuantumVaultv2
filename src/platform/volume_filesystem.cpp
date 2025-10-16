@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cerrno>   // TSK116_Incorrect_Error_Propagation propagate validation errno details
 #include <chrono>
+#include <cctype>   // TSK120_Incorrect_Path_Normalization printable-path validation helpers
 #include <cstring>
 #include <filesystem>
 #include <exception>
@@ -28,6 +29,10 @@ using mode_t = unsigned int;
 
 namespace qv::platform {
 namespace {
+// TSK120_Incorrect_Path_Normalization centralized path policy limits for volume filesystem
+constexpr size_t kMaxPathDepth = 128;
+constexpr size_t kMaxPathLength = 4096;
+constexpr size_t kMaxPathSegmentLength = 255;
 // TSK073_FS_Races_and_Drain ensure consistent lock ordering for filesystem mutex.
 class FilesystemMutexGuard {
  public:
@@ -81,19 +86,29 @@ int FuseErrorFrom(const qv::Error& error) {
 
 std::string NormalizePath(const std::string& raw_path) {
   // TSK084_WinFSP_Normalization_and_Traversal hardened normalization for shared backends
-  constexpr size_t kMaxPathDepth = 128;
-  constexpr size_t kMaxPathLength = 4096;
+  // TSK120_Incorrect_Path_Normalization reject malformed input prior to normalization
+  if (raw_path.find('\0') != std::string::npos) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Embedded null in path", EINVAL};
+  }
+  for (unsigned char ch : raw_path) {
+    if (ch < 0x20 || !std::isprint(ch)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Non-printable character in path", EINVAL};
+    }
+  }
 
   std::string cleaned = raw_path;
-  std::replace(cleaned.begin(), cleaned.end(), '\\', '/');
+  std::replace(cleaned.begin(), cleaned.end(), '\', '/');
 
   if (cleaned.find(':') != std::string::npos) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    "Drive-qualified paths are not allowed", EINVAL}; // TSK116_Incorrect_Error_Propagation propagate errno for validation
+                    "Drive-qualified paths are not allowed", EINVAL};  // TSK116_Incorrect_Error_Propagation propagate validation errno details
   }
   if (cleaned.size() >= 2 && cleaned[0] == '/' && cleaned[1] == '/') {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
                     "UNC paths are not allowed", EINVAL};
+  }
+  if (cleaned.find("//") != std::string::npos) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0, "Adjacent path separators are not allowed", EINVAL};
   }
 
   std::filesystem::path fs_path(cleaned);
@@ -103,47 +118,50 @@ std::string NormalizePath(const std::string& raw_path) {
   }
 
   auto normalized = fs_path.lexically_normal();
-  std::string generic = normalized.generic_string();
-
-  std::string result;
-  if (generic.empty() || generic == "." || generic == "/") {
-    result = "/";
-  } else {
-    result = std::move(generic);
-    if (!normalized.has_root_directory() || result.front() != '/') {
-      result.insert(result.begin(), '/');
-    }
-    while (result.size() > 1 && result.back() == '/') {
-      result.pop_back();
-    }
+  const bool is_root_only = normalized.empty() || normalized == std::filesystem::path("/") ||
+                            normalized == std::filesystem::path(".");
+  if ((normalized.has_root_name() || normalized.has_root_directory()) && !is_root_only) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Absolute paths are not allowed", EINVAL};
   }
 
-  if (result.empty()) {
-    result = "/";
-  }
-
-  size_t depth = 0;
-  for (size_t pos = 1; pos < result.size();) {
-    auto next = result.find('/', pos);
-    size_t len = (next == std::string::npos) ? result.size() - pos : next - pos;
-    if (len > 0) {
-      auto segment = result.substr(pos, len);
-      if (segment == "..") {
+  std::vector<std::string> segments;
+  segments.reserve(kMaxPathDepth);
+  for (const auto& part : normalized) {
+    auto name = part.generic_string();
+    if (name.empty() || name == "/") {
+      continue;
+    }
+    if (name == ".") {
+      continue;
+    }
+    if (name == "..") {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Path traversal outside root is not allowed", EINVAL};
+    }
+    if (name.size() > kMaxPathSegmentLength) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Path segment length exceeds maximum", EINVAL};
+    }
+    for (unsigned char ch : name) {
+      if (ch < 0x20 || !std::isprint(ch)) {
         throw qv::Error{qv::ErrorDomain::Validation, 0,
-                        "Path traversal outside root is not allowed", EINVAL};
-      }
-      if (segment != ".") {
-        ++depth;
-        if (depth > kMaxPathDepth) {
-          throw qv::Error{qv::ErrorDomain::Validation, 0,
-                          "Path depth exceeds maximum", EINVAL};
-        }
+                        "Non-printable character in path segment", EINVAL};
       }
     }
-    if (next == std::string::npos) {
-      break;
+    segments.emplace_back(std::move(name));
+    if (segments.size() > kMaxPathDepth) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      "Path depth exceeds maximum", EINVAL};
     }
-    pos = next + 1;
+  }
+
+  std::string result = "/";
+  for (size_t i = 0; i < segments.size(); ++i) {
+    if (i > 0) {
+      result.push_back('/');
+    }
+    result.append(segments[i]);
   }
 
   if (result.size() > kMaxPathLength) {
@@ -258,10 +276,26 @@ DirectoryEntry* VolumeFilesystem::EnsureDirectory(const std::string& path) {
     return current;
   }
   std::filesystem::path fs_path(normalized);
+  size_t depth = 0;
   for (const auto& part : fs_path) {
     auto name = part.string();
     if (name.empty() || name == "/") {
       continue;
+    }
+    // TSK120_Incorrect_Path_Normalization re-validate normalized directory segments before trust
+    if (name == "." || name == "..") {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Relative segments are not allowed", EINVAL};
+    }
+    if (++depth > kMaxPathDepth) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path depth exceeds maximum", EINVAL};
+    }
+    if (name.size() > kMaxPathSegmentLength) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0, "Path segment length exceeds maximum", EINVAL};
+    }
+    for (unsigned char ch : name) {
+      if (ch < 0x20 || !std::isprint(ch)) {
+        throw qv::Error{qv::ErrorDomain::Validation, 0, "Non-printable character in path segment", EINVAL};
+      }
     }
     auto it = std::find_if(current->subdirs.begin(), current->subdirs.end(),
                            [&](const std::shared_ptr<DirectoryEntry>& child) { return child->name == name; });
