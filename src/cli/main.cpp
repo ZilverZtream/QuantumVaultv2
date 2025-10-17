@@ -64,6 +64,7 @@
 #include "qv/orchestrator/event_bus.h"           // TSK027
 #include "qv/orchestrator/io_util.h"             // TSK143_Missing_Fsync_And_Durability_Issues durable manifest writes
 #include "qv/orchestrator/sealed_key.h"          // TSK713_TPM_SecureEnclave_Key_Sealing hardware sealing interface
+#include "qv/orchestrator/session.h"             // TSK718_AutoLock_and_MemoryLocking idle auto-lock session
 #include "qv/orchestrator/volume_manager.h"
 #include "qv/security/zeroizer.h" // TSK125_Missing_Secure_Deletion_for_Keys scoped wiping
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
@@ -72,6 +73,7 @@
 #if defined(__linux__)
 #include "qv/platform/fuse_adapter.h" // TSK062_FUSE_Filesystem_Integration_Linux
 #endif
+#include "qv/platform/memory_lock.h"            // TSK718_AutoLock_and_MemoryLocking mlock abstractions
 #include "qv/platform/sealed_key_registration.h" // TSK713_TPM_SecureEnclave_Key_Sealing provider wiring
 
 #ifdef _WIN32
@@ -169,7 +171,9 @@ namespace {
 
   class SensitiveDataRegistration { // TSK132_Weak_Password_Handling signal wipe integration
    public:
-    SensitiveDataRegistration(uint8_t* ptr, size_t len) noexcept {
+    SensitiveDataRegistration(uint8_t* ptr, size_t len) noexcept
+        : previous_ptr_(nullptr), previous_len_(0) {
+      lock_guard_.Reset(ptr, len);                                  // TSK718_AutoLock_and_MemoryLocking
       const uint32_t narrow_len = ClampToSignalLength(len);
       ScopedSignalMask lock; // TSK145_Signal_Handler_Race_Conditions prevent partial updates
       previous_ptr_ = g_signal_buffer.load(std::memory_order_relaxed);
@@ -179,12 +183,14 @@ namespace {
     }
 
     ~SensitiveDataRegistration() {
+      lock_guard_.Release();
       ScopedSignalMask lock; // TSK145_Signal_Handler_Race_Conditions restore atomically
       g_signal_buffer.store(previous_ptr_, std::memory_order_relaxed);
       g_signal_length.store(previous_len_, std::memory_order_relaxed);
     }
 
     void Update(uint8_t* ptr, size_t len) noexcept {
+      lock_guard_.Reset(ptr, len); // TSK718_AutoLock_and_MemoryLocking refresh lock
       const uint32_t narrow_len = ClampToSignalLength(len);
       ScopedSignalMask lock; // TSK145_Signal_Handler_Race_Conditions update atomically
       g_signal_buffer.store(ptr, std::memory_order_relaxed);
@@ -192,6 +198,7 @@ namespace {
     }
 
   private:
+    qv::platform::MemoryLockGuard lock_guard_; // TSK718_AutoLock_and_MemoryLocking
     uint8_t* previous_ptr_;
     uint32_t previous_len_;
   };
@@ -918,6 +925,7 @@ namespace {
     std::cerr << "  qv destroy <container>\n"; // TSK028_Secure_Deletion_and_Data_Remanence
     std::cerr << "\nGlobal flags:\n"; // TSK035_Platform_Specific_Security_Integration
     std::cerr << "  --syslog=host:port   Forward audit logs to syslog collector\n";
+    std::cerr << "  --idle-lock=<sec>    Auto-unmount after idle seconds (0 disables)\n"; // TSK718_AutoLock_and_MemoryLocking
     std::cerr << "  --keychain           Persist credentials in OS key store\n"; // TSK035_Platform_Specific_Security_Integration
     std::cerr << "  --seal=<provider>   Seal credentials with hardware-backed provider\n"; // TSK713_TPM_SecureEnclave_Key_Sealing
     std::cerr << "  --kdf-iterations=N   Override PBKDF2 iteration count for new headers\n"; // TSK036_PBKDF2_Argon2_Migration_Path
@@ -2537,7 +2545,8 @@ namespace {
                                         const std::filesystem::path& mountpoint,
                                         qv::orchestrator::VolumeManager& vm,
                                         const SecurityIntegrationFlags& security_flags,
-                                        const qv::orchestrator::MountParams& mount_params) {
+                                        const qv::orchestrator::MountParams& mount_params,
+                                        std::optional<std::chrono::seconds> idle_lock_timeout) {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing, // TSK020
@@ -2613,13 +2622,49 @@ namespace {
       std::signal(SIGINT, FuseSignalHandler);
       std::signal(SIGTERM, FuseSignalHandler);
 
+      qv::orchestrator::Session session; // TSK718_AutoLock_and_MemoryLocking
+      session.SetLockAction([&]() {
+        std::cout << "\nIdle timeout reached; unmounting volume..." << std::endl;
+        qv::orchestrator::Event event; // TSK718_AutoLock_and_MemoryLocking telemetry
+        event.category = qv::orchestrator::EventCategory::kLifecycle;
+        event.severity = qv::orchestrator::EventSeverity::kInfo;
+        event.event_id = "idle_lock_timeout";
+        event.message = "Idle timeout reached; unmounting volume";
+        PublishTelemetryEvent(event);
+        g_fuse_running.store(false);
+        adapter.RequestUnmount();
+      });
+
+      struct ActivityReset { // TSK718_AutoLock_and_MemoryLocking ensure callback cleanup
+        qv::platform::FUSEAdapter& adapter;
+        bool active{false};
+        ~ActivityReset() {
+          if (active) {
+            adapter.SetActivityCallback(nullptr, nullptr);
+          }
+        }
+      } activity_reset{adapter};
+
+      if (idle_lock_timeout && *idle_lock_timeout > std::chrono::seconds::zero()) {
+        session.ConfigureIdleTimeout(*idle_lock_timeout);
+        adapter.SetActivityCallback(&qv::orchestrator::Session::ActivityThunk, &session);
+        activity_reset.active = true;
+      } else {
+        session.DisableIdleTimeout();
+      }
+
       std::cout << "Mounted " << SanitizePath(container) << " at " << SanitizePath(mountpoint) << std::endl;
       std::cout << "Press Ctrl+C to unmount..." << std::endl;
 
       while (g_fuse_running.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        session.Tick();
       }
 
+      if (activity_reset.active) {
+        adapter.SetActivityCallback(nullptr, nullptr);
+        activity_reset.active = false;
+      }
       g_active_fuse_adapter = nullptr;
       adapter.Unmount();
       return kExitOk;
@@ -2635,7 +2680,8 @@ namespace {
                                         const std::filesystem::path& mountpoint,
                                         qv::orchestrator::VolumeManager& vm,
                                         const SecurityIntegrationFlags& security_flags,
-                                        const qv::orchestrator::MountParams& mount_params) {
+                                        const qv::orchestrator::MountParams& mount_params,
+                                        std::optional<std::chrono::seconds> idle_lock_timeout) {
     if (!std::filesystem::exists(container)) {
       throw qv::Error{qv::ErrorDomain::IO,
                       qv::errors::io::kContainerMissing,  // TSK020
@@ -2690,13 +2736,48 @@ namespace {
       g_winfsp_running.store(true);
       SetConsoleCtrlHandler(WinFspSignalHandler, TRUE);
 
+      qv::orchestrator::Session session; // TSK718_AutoLock_and_MemoryLocking
+      session.SetLockAction([&]() {
+        std::wcout << L"\nIdle timeout reached; unmounting volume..." << std::endl;
+        qv::orchestrator::Event event;
+        event.category = qv::orchestrator::EventCategory::kLifecycle;
+        event.severity = qv::orchestrator::EventSeverity::kInfo;
+        event.event_id = "idle_lock_timeout";
+        event.message = "Idle timeout reached; unmounting volume";
+        PublishTelemetryEvent(event);
+        g_winfsp_running.store(false);
+      });
+
+      struct ActivityReset {
+        qv::platform::WinFspAdapter& adapter;
+        bool active{false};
+        ~ActivityReset() {
+          if (active) {
+            adapter.SetActivityCallback(nullptr, nullptr);
+          }
+        }
+      } activity_reset{adapter};
+
+      if (idle_lock_timeout && *idle_lock_timeout > std::chrono::seconds::zero()) {
+        session.ConfigureIdleTimeout(*idle_lock_timeout);
+        adapter.SetActivityCallback(&qv::orchestrator::Session::ActivityThunk, &session);
+        activity_reset.active = true;
+      } else {
+        session.DisableIdleTimeout();
+      }
+
       std::wcout << L"Mounted at " << mount_target << std::endl;
       std::wcout << L"Press Ctrl+C to unmount..." << std::endl;
 
       while (g_winfsp_running.load()) {
         Sleep(200);
+        session.Tick();
       }
 
+      if (activity_reset.active) {
+        adapter.SetActivityCallback(nullptr, nullptr);
+        activity_reset.active = false;
+      }
       SetConsoleCtrlHandler(WinFspSignalHandler, FALSE);
       adapter.Unmount();
       return kExitOk;
@@ -2710,12 +2791,14 @@ namespace {
   int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
                   qv::orchestrator::VolumeManager& vm,
                   const SecurityIntegrationFlags& security_flags,
-                  const qv::orchestrator::MountParams& mount_params) {
+                  const qv::orchestrator::MountParams& mount_params,
+                  std::optional<std::chrono::seconds> idle_lock_timeout) {
     (void)container;
     (void)mountpoint;
     (void)vm;
     (void)security_flags;
     (void)mount_params;
+    (void)idle_lock_timeout;
     std::cerr << "WinFsp integration not available in this build." << std::endl;
     return kExitUsage;
   }
@@ -2723,12 +2806,14 @@ namespace {
   int HandleMount(const std::filesystem::path& container, const std::filesystem::path& mountpoint,
                   qv::orchestrator::VolumeManager& vm,
                   const SecurityIntegrationFlags& security_flags,
-                  const qv::orchestrator::MountParams& mount_params) {
+                  const qv::orchestrator::MountParams& mount_params,
+                  std::optional<std::chrono::seconds> idle_lock_timeout) {
     (void)container;
     (void)mountpoint;
     (void)vm;
     (void)security_flags;
     (void)mount_params;
+    (void)idle_lock_timeout;
     std::cerr << "Mount is only supported on Linux builds." << std::endl;
     return kExitUsage;
   }
@@ -3339,6 +3424,7 @@ int main(int argc, char** argv) {
     }
 
     SecurityIntegrationFlags security_flags{}; // TSK035_Platform_Specific_Security_Integration
+    std::optional<std::chrono::seconds> idle_lock_timeout; // TSK718_AutoLock_and_MemoryLocking CLI idle lock
     qv::platform::RegisterPlatformSealedKeyProviders(qv::orchestrator::SealedKeyRegistry::Instance());
 #if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
     RegisterNativeTpmSealer();
@@ -3438,6 +3524,21 @@ int main(int argc, char** argv) {
           }
           return kExitUsage;
         }
+        continue;
+      }
+      if (arg.rfind("--idle-lock=", 0) == 0) { // TSK718_AutoLock_and_MemoryLocking parse idle timeout
+        auto value = arg.substr(std::string_view("--idle-lock=").size());
+        if (value.empty()) {
+          PrintUsage();
+          return kExitUsage;
+        }
+        unsigned long long parsed_seconds = 0;
+        auto [endptr, ec] = std::from_chars(value.data(), value.data() + value.size(), parsed_seconds);
+        if (ec != std::errc() || endptr != value.data() + value.size()) {
+          PrintUsage();
+          return kExitUsage;
+        }
+        idle_lock_timeout = std::chrono::seconds(parsed_seconds);
         continue;
       }
       if (arg.rfind("--kdf-iterations=", 0) == 0) { // TSK036_PBKDF2_Argon2_Migration_Path
@@ -3540,7 +3641,7 @@ int main(int argc, char** argv) {
         PrintUsage();
         return kExitUsage;
       }
-      return HandleMount(*container_path, *mount_path, vm, security_flags, mount_params);
+      return HandleMount(*container_path, *mount_path, vm, security_flags, mount_params, idle_lock_timeout);
     }
     if (cmd == "rekey") {
       if (argc - index < 1 || argc - index > 2) {
