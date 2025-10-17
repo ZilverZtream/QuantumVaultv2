@@ -32,12 +32,6 @@
 #include <sys/stat.h>   // TSK146_Permission_And_Ownership_Issues ownership checks
 #include <unistd.h>     // TSK146_Permission_And_Ownership_Issues geteuid for ownership validation
 #include <sys/utsname.h> // TSK244_Hidden_Volume_Replay_Attack machine identifier
-#if defined(__APPLE__)
-#include <sys/sysctl.h>  // TSK244_Hidden_Volume_Replay_Attack boot time query
-#include <sys/time.h>    // TSK244_Hidden_Volume_Replay_Attack timeval support
-#else
-#include <sys/sysinfo.h> // TSK244_Hidden_Volume_Replay_Attack uptime query
-#endif
 #endif
 
 #include "qv/common.h"
@@ -89,7 +83,7 @@ using namespace qv::orchestrator;
 namespace {
 
 constexpr uint32_t kHiddenDescriptorMetadataVersion = 2;                  // TSK244_Hidden_Volume_Replay_Attack format pin
-constexpr std::chrono::seconds kHiddenDescriptorMaxAge{60};               // TSK244_Hidden_Volume_Replay_Attack freshness window
+constexpr std::chrono::seconds kHiddenDescriptorMaxAge{0};                // TSK244_Hidden_Volume_Replay_Attack freshness window (disabled)
 
 struct HiddenDescriptorMetadataDisk {                                     // TSK244_Hidden_Volume_Replay_Attack
   uint32_t version{0};                                                    // TSK244_Hidden_Volume_Replay_Attack
@@ -116,21 +110,13 @@ std::optional<std::string> ReadFirstLine(const std::filesystem::path& path) { //
 
 std::string ReadMachineIdentifier() {                                     // TSK244_Hidden_Volume_Replay_Attack system binding
 #if defined(_WIN32)
-  DWORD size = 0;
-  if (GetComputerNameA(nullptr, &size) == 0) {
-    const DWORD err = GetLastError();
-    if (err != ERROR_BUFFER_OVERFLOW || size == 0) {
-      throw qv::Error{qv::ErrorDomain::Security, static_cast<int>(err),
-                      "Failed to query computer name size"};
-    }
-  }
-  std::string name(static_cast<size_t>(size), '\0');
-  if (GetComputerNameA(name.data(), &size) == 0) {
+  std::array<char, MAX_COMPUTERNAME_LENGTH + 1> buffer{};
+  DWORD size = static_cast<DWORD>(buffer.size());
+  if (GetComputerNameA(buffer.data(), &size) == 0) {
     throw qv::Error{qv::ErrorDomain::Security, static_cast<int>(::GetLastError()),
                     "Failed to read computer name"};
   }
-  name.resize(size);
-  return name;
+  return std::string(buffer.data(), size);
 #else
   constexpr const char* kCandidates[] = {"/etc/machine-id", "/var/lib/dbus/machine-id"};
   for (const char* candidate : kCandidates) {
@@ -148,54 +134,14 @@ std::string ReadMachineIdentifier() {                                     // TSK
 #endif
 }
 
-std::string ReadBootIdentifier() {                                        // TSK244_Hidden_Volume_Replay_Attack boot binding
-#if defined(_WIN32)
-  FILETIME ft{};
-  GetSystemTimeAsFileTime(&ft);
-  ULARGE_INTEGER current{};
-  current.LowPart = ft.dwLowDateTime;
-  current.HighPart = ft.dwHighDateTime;
-  const ULONGLONG ticks = GetTickCount64();
-  const ULONGLONG boot_time = current.QuadPart - ticks * 10000ull;
-  std::ostringstream oss;
-  oss << std::hex << boot_time;
-  return oss.str();
-#elif defined(__APPLE__)
-  int mib[2] = {CTL_KERN, KERN_BOOTTIME};
-  struct timeval boottime {
-    0, 0
-  };
-  size_t len = sizeof(boottime);
-  if (sysctl(mib, 2, &boottime, &len, nullptr, 0) != 0) {
-    throw qv::Error{qv::ErrorDomain::Security, errno, "Failed to query boot time"};
-  }
-  std::ostringstream oss;
-  oss << boottime.tv_sec << ':' << boottime.tv_usec;
-  return oss.str();
-#else
-  auto boot_uuid = ReadFirstLine("/proc/sys/kernel/random/boot_id");
-  if (boot_uuid) {
-    return *boot_uuid;
-  }
-  struct sysinfo info {
-  };
-  if (sysinfo(&info) != 0) {
-    throw qv::Error{qv::ErrorDomain::Security, errno, "Failed to query sysinfo"};
-  }
-  const auto now = std::chrono::system_clock::now();
-  const auto now_seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-  const auto boot_seconds = now_seconds - static_cast<long long>(info.uptime);
-  return std::to_string(boot_seconds);
-#endif
-}
-
 std::array<uint8_t, 16> ComputeSystemBindingToken() {                     // TSK244_Hidden_Volume_Replay_Attack binding digest
   auto machine = ReadMachineIdentifier();
-  auto boot = ReadBootIdentifier();
   std::vector<uint8_t> buffer;
-  buffer.reserve(machine.size() + boot.size());
+  buffer.reserve(machine.size());
   buffer.insert(buffer.end(), machine.begin(), machine.end());
-  buffer.insert(buffer.end(), boot.begin(), boot.end());
+  if (buffer.empty()) { // TSK244_Hidden_Volume_Replay_Attack binding guard
+    throw qv::Error{qv::ErrorDomain::Security, 0, "Machine identifier unavailable"};
+  }
   auto digest = qv::crypto::SHA256_Hash(std::span<const uint8_t>(buffer.data(), buffer.size()));
   std::array<uint8_t, 16> binding{};
   std::copy_n(digest.begin(), binding.size(), binding.begin());

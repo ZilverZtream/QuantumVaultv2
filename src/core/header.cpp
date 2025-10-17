@@ -60,13 +60,10 @@ bool VerifyHiddenVolumeDescriptor(
   if (descriptor.sequence_number != expected_sequence) {
     return false;
   }
-  if (max_age_seconds == 0) {
-    return false;
-  }
   if (descriptor.created_timestamp > now_seconds) {
     return false;
   }
-  if (now_seconds - descriptor.created_timestamp > max_age_seconds) {
+  if (max_age_seconds != 0 && now_seconds - descriptor.created_timestamp > max_age_seconds) { // TSK244_Hidden_Volume_Replay_Attack
     return false;
   }
   if (!std::equal(descriptor.system_binding.begin(), descriptor.system_binding.end(), expected_binding.begin(),
