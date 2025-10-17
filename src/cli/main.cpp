@@ -1511,7 +1511,8 @@ namespace {
     if (!flags.use_os_store && !flags.HasHardwareSeal()) {
       return;
     }
-    if (flags.HasHardwareSeal()) {
+#if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
+    if (flags.HasHardwareSeal()) { // TSK713_TPM_SecureEnclave_Key_Sealing TPM-enabled guard
       auto& registry = qv::orchestrator::SealedKeyRegistry::Instance();
       auto* provider = registry.FindProvider(flags.seal_provider);
       if (!provider || !provider->IsAvailable()) {
@@ -1525,6 +1526,12 @@ namespace {
       WriteSealedKeyFile(container, sealed);
       std::fill(key.begin(), key.end(), 0);
     }
+#else
+    if (flags.HasHardwareSeal()) {
+      throw qv::Error{qv::ErrorDomain::Config, kCredentialPersistFailed,
+                      "Hardware sealing requested but not enabled in this build"}; // TSK713_TPM_SecureEnclave_Key_Sealing TPM-disabled guard
+    }
+#endif
     if (flags.use_os_store) {
       if (!kSupportsOsCredentialStore) {
         throw qv::Error{qv::ErrorDomain::Config, kCredentialPersistFailed,
@@ -1557,7 +1564,8 @@ namespace {
   LoadPersistedCredential(const std::filesystem::path& container,
                           const SecurityIntegrationFlags& flags) { // TSK035_Platform_Specific_Security_Integration
     try {
-      if (flags.HasHardwareSeal()) {
+#if defined(QV_ENABLE_TPM_SEALING) && QV_ENABLE_TPM_SEALING
+      if (flags.HasHardwareSeal()) { // TSK713_TPM_SecureEnclave_Key_Sealing TPM-enabled load
         if (auto sealed = ReadSealedKeyFile(container)) {
           auto& registry = qv::orchestrator::SealedKeyRegistry::Instance();
           auto* provider = registry.FindProvider(sealed->provider_id);
@@ -1571,6 +1579,12 @@ namespace {
           return password;
         }
       }
+#else
+      if (flags.HasHardwareSeal()) {
+        throw qv::Error{qv::ErrorDomain::Config, kCredentialLoadFailed,
+                        "Hardware sealing requested but not enabled in this build"}; // TSK713_TPM_SecureEnclave_Key_Sealing TPM-disabled load
+      }
+#endif
       if (flags.use_os_store && kSupportsOsCredentialStore) {
         auto account = CredentialAccountName(container);
         constexpr std::string_view kService{"QuantumVault"};

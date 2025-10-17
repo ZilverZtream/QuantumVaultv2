@@ -106,12 +106,4 @@ void RegisterPlatformSealedKeyProviders(qv::orchestrator::SealedKeyRegistry& reg
 
 }  // namespace qv::platform
 
-#else
-
-namespace qv::platform {
-
-void RegisterPlatformSealedKeyProviders(qv::orchestrator::SealedKeyRegistry&) {}
-
-}  // namespace qv::platform
-
 #endif
