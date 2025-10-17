@@ -40,6 +40,7 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#include <sys/mman.h> // TSK237_Plugin_Syscall_Filter_Gaps
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #endif
@@ -355,7 +356,7 @@ namespace {
     }
 
     std::vector<sock_filter> filter;
-    filter.reserve(48); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    filter.reserve(96); // TSK142_Plugin_Security_Bypass_Vulnerabilities
     filter.push_back({static_cast<uint16_t>(BPF_LD | BPF_W | BPF_ABS), 0, 0,
                      static_cast<uint32_t>(offsetof(struct seccomp_data, arch))}); // TSK142_Plugin_Security_Bypass_Vulnerabilities
 #if defined(__x86_64__)
@@ -374,11 +375,110 @@ namespace {
     filter.push_back({static_cast<uint16_t>(BPF_LD | BPF_W | BPF_ABS), 0, 0,
                      static_cast<uint32_t>(offsetof(struct seccomp_data, nr))}); // TSK142_Plugin_Security_Bypass_Vulnerabilities
 
+    constexpr uint32_t kRetErrnoEPERM =
+        SECCOMP_RET_ERRNO | (static_cast<uint32_t>(EPERM) & SECCOMP_RET_DATA); // TSK237_Plugin_Syscall_Filter_Gaps
+
     auto allow_syscall = [&filter](int syscall_number) {
-      filter.push_back({static_cast<uint16_t>(BPF_JMP | BPF_JEQ | BPF_K), 0, 1,
-                        static_cast<uint32_t>(syscall_number)});
-      filter.push_back({static_cast<uint16_t>(BPF_RET | BPF_K), 0, 0, SECCOMP_RET_ALLOW});
+      filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, syscall_number, 0, 1));
+      filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
     };
+
+    auto deny_syscall = [&filter](int syscall_number, uint32_t action) {
+      filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, syscall_number, 0, 1));
+      filter.push_back(BPF_STMT(BPF_RET | BPF_K, action));
+    };
+
+#if defined(__NR_clone)
+    deny_syscall(__NR_clone, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_clone3)
+    deny_syscall(__NR_clone3, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_fork)
+    deny_syscall(__NR_fork, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_vfork)
+    deny_syscall(__NR_vfork, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_execve)
+    deny_syscall(__NR_execve, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_execveat)
+    deny_syscall(__NR_execveat, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+
+#if defined(__NR_socket)
+    deny_syscall(__NR_socket, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_connect)
+    deny_syscall(__NR_connect, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_bind)
+    deny_syscall(__NR_bind, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_listen)
+    deny_syscall(__NR_listen, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_accept)
+    deny_syscall(__NR_accept, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_accept4)
+    deny_syscall(__NR_accept4, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_sendto)
+    deny_syscall(__NR_sendto, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_recvfrom)
+    deny_syscall(__NR_recvfrom, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_socketpair)
+    deny_syscall(__NR_socketpair, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_sendmsg)
+    deny_syscall(__NR_sendmsg, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_recvmsg)
+    deny_syscall(__NR_recvmsg, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_sendmmsg)
+    deny_syscall(__NR_sendmmsg, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_recvmmsg)
+    deny_syscall(__NR_recvmmsg, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+
+#if defined(__NR_kill)
+    deny_syscall(__NR_kill, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_tkill)
+    deny_syscall(__NR_tkill, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_tgkill)
+    deny_syscall(__NR_tgkill, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+#if defined(__NR_rt_tgsigqueueinfo)
+    deny_syscall(__NR_rt_tgsigqueueinfo, SECCOMP_RET_KILL_PROCESS); // TSK237_Plugin_Syscall_Filter_Gaps
+#endif
+
+#if defined(__NR_mmap)
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mmap, 0, 5)); // TSK237_Plugin_Syscall_Filter_Gaps
+    filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                              static_cast<uint32_t>(offsetof(struct seccomp_data, args[2]))));
+    filter.push_back(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<uint32_t>(PROT_EXEC)));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    filter.push_back(BPF_STMT(BPF_RET | BPF_K, kRetErrnoEPERM));
+    filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+#endif
+
+#if defined(__NR_mprotect)
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mprotect, 0, 5)); // TSK237_Plugin_Syscall_Filter_Gaps
+    filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                              static_cast<uint32_t>(offsetof(struct seccomp_data, args[2]))));
+    filter.push_back(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<uint32_t>(PROT_EXEC)));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    filter.push_back(BPF_STMT(BPF_RET | BPF_K, kRetErrnoEPERM));
+    filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+#endif
 
     allow_syscall(__NR_read);
     allow_syscall(__NR_write);
@@ -390,12 +490,19 @@ namespace {
     allow_syscall(__NR_nanosleep);
     allow_syscall(__NR_getrandom);
     allow_syscall(__NR_rt_sigreturn);
-    allow_syscall(__NR_rt_sigaction);
     allow_syscall(__NR_rt_sigprocmask);
-    allow_syscall(__NR_mmap);
     allow_syscall(__NR_munmap);
-    allow_syscall(__NR_mprotect);
     allow_syscall(__NR_brk);
+
+#if defined(__NR_rt_sigaction)
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigaction, 0, 5)); // TSK237_Plugin_Syscall_Filter_Gaps
+    filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                              static_cast<uint32_t>(offsetof(struct seccomp_data, args[0]))));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(SIGTERM), 2, 0));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>(SIGKILL), 1, 0));
+    filter.push_back(BPF_STMT(BPF_RET | BPF_K, kRetErrnoEPERM));
+    filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+#endif
 
     if (allow_filesystem) {
 #if defined(__NR_openat)
