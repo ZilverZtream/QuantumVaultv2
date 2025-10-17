@@ -19,7 +19,9 @@
 #include <string_view>
 #include <system_error> // TSK074_Migration_Rollback_and_Backup non-throwing filesystem ops
 #include <type_traits>  // TSK099_Input_Validation_and_Sanitization checked casts
+#include <unordered_map> // TSK242_Password_History_Timing_Oracle cached history store
 #include <vector>
+#include <mutex>        // TSK242_Password_History_Timing_Oracle cache synchronization
 #include <cstdlib>      // TSK099_Input_Validation_and_Sanitization container root policy
 #if defined(_WIN32)
 #include <io.h>        // TSK146_Permission_And_Ownership_Issues Windows chmod
@@ -49,6 +51,7 @@
 #include "qv/crypto/sha256.h"  // TSK128_Missing_AAD_Validation_in_Chunks payload binding
 #include "qv/crypto/random.h"  // TSK106_Cryptographic_Implementation_Weaknesses
 #include "qv/crypto/hmac_sha256.h"
+#include "qv/crypto/ct.h"       // TSK242_Password_History_Timing_Oracle constant-time history comparisons
 #include "qv/crypto/pbkdf2.h"  // TSK111_Code_Duplication_and_Maintainability shared PBKDF2
 #include "qv/error.h"
 #include "qv/errors.h"  // TSK111_Code_Duplication_and_Maintainability centralized messages
@@ -348,6 +351,53 @@ void ValidatePassword(const std::string& password) { // TSK135_Password_Complexi
 }
 
 constexpr std::size_t kPasswordHistoryDepth = 5; // TSK135_Password_Complexity_Enforcement rotation window
+constexpr std::size_t kPasswordHistoryHashLength =
+    64; // TSK242_Password_History_Timing_Oracle fixed hash comparison window
+
+struct PasswordHistoryCache { // TSK242_Password_History_Timing_Oracle cached history ledger
+  std::mutex mutex;
+  std::unordered_map<std::string, std::vector<std::string>> entries;
+};
+
+PasswordHistoryCache& GetPasswordHistoryCache() { // TSK242_Password_History_Timing_Oracle singleton accessor
+  static PasswordHistoryCache cache;
+  return cache;
+}
+
+struct PaddedHistoryHash { // TSK242_Password_History_Timing_Oracle constant length comparison view
+  std::array<char, kPasswordHistoryHashLength> buffer{};
+  bool truncated{false};
+};
+
+PaddedHistoryHash PadHistoryHash(std::string_view hash) { // TSK242_Password_History_Timing_Oracle pad for constant time
+  PaddedHistoryHash padded;
+  const auto copy = std::min(hash.size(), padded.buffer.size());
+  if (copy > 0) {
+    std::memcpy(padded.buffer.data(), hash.data(), copy);
+  }
+  padded.truncated = hash.size() > padded.buffer.size();
+  return padded;
+}
+
+std::string_view HashView(const PaddedHistoryHash& padded) { // TSK242_Password_History_Timing_Oracle span helper
+  return std::string_view(padded.buffer.data(), padded.buffer.size());
+}
+
+bool PasswordHistoryContains(const std::vector<std::string>& history,
+                             std::string_view candidate) { // TSK242_Password_History_Timing_Oracle constant-time search
+  const auto padded_candidate = PadHistoryHash(candidate);
+  const auto candidate_view = HashView(padded_candidate);
+  bool match_found = false;
+  for (const auto& entry : history) {
+    const auto padded_entry = PadHistoryHash(entry);
+    const auto entry_view = HashView(padded_entry);
+    const bool lengths_ok = static_cast<bool>((!padded_candidate.truncated) & (!padded_entry.truncated));
+    const bool equal = static_cast<bool>(lengths_ok &
+                                         qv::crypto::ct::StringCompare(candidate_view, entry_view));
+    match_found |= equal;
+  }
+  return match_found;
+}
 
 std::filesystem::path PasswordHistoryPath(const std::filesystem::path& container) { // TSK135_Password_Complexity_Enforcement
   auto history_path = container;
@@ -388,9 +438,9 @@ std::string HashPasswordForHistory(const std::filesystem::path& container,
   return BytesToHexLower(std::span<const uint8_t>(digest.data(), digest.size()));
 }
 
-std::vector<std::string> LoadPasswordHistory(const std::filesystem::path& container) { // TSK135_Password_Complexity_Enforcement
+std::vector<std::string> LoadPasswordHistoryFromDisk(
+    const std::filesystem::path& path) { // TSK242_Password_History_Timing_Oracle normalized IO
   std::vector<std::string> history;
-  const auto path = PasswordHistoryPath(container);
   std::error_code exists_ec;
   if (!std::filesystem::exists(path, exists_ec) || exists_ec) {
     return history;
@@ -427,10 +477,46 @@ std::vector<std::string> LoadPasswordHistory(const std::filesystem::path& contai
   return history;
 }
 
-void AppendHistoryEntry(std::vector<std::string>& history, const std::string& entry) { // TSK135_Password_Complexity_Enforcement
-  auto existing = std::find(history.begin(), history.end(), entry);
-  if (existing != history.end()) {
-    history.erase(existing);
+std::vector<std::string> LoadPasswordHistory(
+    const std::filesystem::path& container) { // TSK242_Password_History_Timing_Oracle cached load
+  const auto path = PasswordHistoryPath(container);
+  const auto key = qv::PathToUtf8String(path);
+  auto& cache = GetPasswordHistoryCache();
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (auto it = cache.entries.find(key); it != cache.entries.end()) {
+      return it->second;
+    }
+  }
+
+  auto history = LoadPasswordHistoryFromDisk(path);
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto [it, inserted] = cache.entries.emplace(key, history);
+    if (!inserted) {
+      it->second = history;
+    }
+    return it->second;
+  }
+}
+
+void AppendHistoryEntry(std::vector<std::string>& history,
+                        const std::string& entry) { // TSK242_Password_History_Timing_Oracle constant-time maintenance
+  const auto padded_entry = PadHistoryHash(entry);
+  const auto entry_view = HashView(padded_entry);
+  std::size_t match_index = history.size();
+  bool match_found = false;
+  for (std::size_t i = 0; i < history.size(); ++i) {
+    const auto padded_existing = PadHistoryHash(history[i]);
+    const auto existing_view = HashView(padded_existing);
+    const bool lengths_ok = static_cast<bool>((!padded_entry.truncated) & (!padded_existing.truncated));
+    const bool equal = static_cast<bool>(lengths_ok &
+                                         qv::crypto::ct::StringCompare(entry_view, existing_view));
+    match_index = qv::crypto::ct::Select<std::size_t>(match_index, i, equal);
+    match_found |= equal;
+  }
+  if (match_found) {
+    history.erase(history.begin() + static_cast<std::ptrdiff_t>(match_index));
   }
   history.push_back(entry);
   if (history.size() > kPasswordHistoryDepth) {
@@ -451,17 +537,20 @@ void PersistPasswordHistory(const std::filesystem::path& container,
   try {
     AtomicReplace(history_path, std::span<const uint8_t>(payload.data(), payload.size()));
     HardenPrivateFile(history_path); // TSK146_Permission_And_Ownership_Issues enforce 0600 history
-  } catch (const qv::Error&) {
+  } catch (const qv::Error& err) {
     throw qv::Error{err.domain(), err.code(),
                     std::string(qv::errors::msg::kPasswordHistoryPersistFailed) + ": " + err.what()};
   }
+  auto& cache = GetPasswordHistoryCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  cache.entries[qv::PathToUtf8String(history_path)] = history;
 }
 
 std::string EnsurePasswordNotReused(const std::filesystem::path& container,
                                     const std::vector<std::string>& history,
                                     const std::string& password) { // TSK135_Password_Complexity_Enforcement
   const auto hashed = HashPasswordForHistory(container, password);
-  if (std::find(history.begin(), history.end(), hashed) != history.end()) {
+  if (PasswordHistoryContains(history, hashed)) {
     throw qv::Error{qv::ErrorDomain::Validation, 0,
                     std::string(qv::errors::msg::kPasswordReused)};
   }

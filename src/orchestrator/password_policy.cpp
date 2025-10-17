@@ -1,6 +1,7 @@
 #include "qv/orchestrator/password_policy.h"
 
 #include <array>
+#include <span>          // TSK242_Password_History_Timing_Oracle random shuffle span helper
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 
 #include "qv/error.h"
 #include "qv/errors.h"
+#include "qv/crypto/random.h"  // TSK242_Password_History_Timing_Oracle shuffle entropy
 
 namespace qv::orchestrator {
 namespace {
@@ -25,6 +27,36 @@ constexpr double kMinEntropyPerChar = 2.0;       // TSK135_Password_Complexity_E
 constexpr double kMinTotalEntropyBits = 24.0;    // TSK135_Password_Complexity_Enforcement entropy guardrails
 constexpr std::string_view kDefaultCommonPasswordList =
     "contrib/passwords/pwdb_top100000.txt";      // TSK135_Password_Complexity_Enforcement vendored dictionary
+
+enum class ValidationCheck : std::size_t { // TSK242_Password_History_Timing_Oracle randomized order ids
+  kMinLength = 0,
+  kMaxLength,
+  kComplexity,
+  kEntropy,
+  kCommon,
+  kCount
+};
+
+constexpr std::array<ValidationCheck, static_cast<std::size_t>(ValidationCheck::kCount)>
+    kDeterministicValidationOrder = { // TSK242_Password_History_Timing_Oracle stable failure precedence
+        ValidationCheck::kMinLength,
+        ValidationCheck::kMaxLength,
+        ValidationCheck::kComplexity,
+        ValidationCheck::kEntropy,
+        ValidationCheck::kCommon,
+};
+
+const std::array<std::string, static_cast<std::size_t>(ValidationCheck::kCount)>&
+PasswordValidationMessages() { // TSK242_Password_History_Timing_Oracle pre-generated failures
+  static const std::array<std::string, static_cast<std::size_t>(ValidationCheck::kCount)> messages = {
+      std::string(qv::errors::msg::kPasswordTooShort),
+      std::string(qv::errors::msg::kPasswordTooLong),
+      std::string(qv::errors::msg::kPasswordComplexityMissing),
+      std::string(qv::errors::msg::kPasswordEntropyTooLow),
+      std::string(qv::errors::msg::kPasswordTooCommon),
+  };
+  return messages;
+}
 
 struct PasswordEntropy { // TSK135_Password_Complexity_Enforcement helper container
   double per_character{0.0};
@@ -161,31 +193,80 @@ bool IsCommonPassword(const std::string& password) { // TSK135_Password_Complexi
 
 }  // namespace
 
-void EnforcePasswordPolicy(const std::string& password) { // TSK135_Password_Complexity_Enforcement central policy
+void EnforcePasswordPolicy(const std::string& password) { // TSK242_Password_History_Timing_Oracle constant evaluation cadence
   const auto size = password.size();
-  if (size < kMinPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordTooShort)};
-  }
-  if (size > kMaxPasswordLen) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordTooLong)};
-  }
-
-  if (!HasRequiredComplexity(password)) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordComplexityMissing)};
+  std::array<ValidationCheck, static_cast<std::size_t>(ValidationCheck::kCount)> order =
+      kDeterministicValidationOrder;
+  std::array<uint8_t, static_cast<std::size_t>(ValidationCheck::kCount)> shuffle_bytes{};
+  qv::crypto::SystemRandomBytes(
+      std::span<uint8_t>(shuffle_bytes.data(), shuffle_bytes.size()));
+  for (std::size_t i = order.size(); i > 1; --i) {
+    const std::size_t j = static_cast<std::size_t>(shuffle_bytes[i - 1]) % i;
+    auto temp = order[i - 1];
+    order[i - 1] = order[j];
+    order[j] = temp;
   }
 
-  const auto entropy = ComputeEntropy(password);
-  if (entropy.per_character < kMinEntropyPerChar || entropy.total < kMinTotalEntropyBits) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordEntropyTooLow)};
+  struct CheckState { // TSK242_Password_History_Timing_Oracle memoized outcomes
+    bool evaluated{false};
+    bool failed{false};
+  };
+
+  std::array<CheckState, static_cast<std::size_t>(ValidationCheck::kCount)> states{};
+  PasswordEntropy entropy{};
+  bool entropy_computed = false;
+  bool common_password = false;
+  bool common_computed = false;
+
+  auto evaluate = [&](ValidationCheck check) -> bool {
+    const auto index = static_cast<std::size_t>(check);
+    auto& state = states[index];
+    if (state.evaluated) {
+      return state.failed;
+    }
+    state.evaluated = true;
+    switch (check) {
+      case ValidationCheck::kMinLength:
+        state.failed = size < kMinPasswordLen;
+        break;
+      case ValidationCheck::kMaxLength:
+        state.failed = size > kMaxPasswordLen;
+        break;
+      case ValidationCheck::kComplexity:
+        state.failed = !HasRequiredComplexity(password);
+        break;
+      case ValidationCheck::kEntropy:
+        if (!entropy_computed) {
+          entropy = ComputeEntropy(password);
+          entropy_computed = true;
+        }
+        state.failed = static_cast<bool>((entropy.per_character < kMinEntropyPerChar) |
+                                         (entropy.total < kMinTotalEntropyBits));
+        break;
+      case ValidationCheck::kCommon:
+        if (!common_computed) {
+          common_password = IsCommonPassword(password);
+          common_computed = true;
+        }
+        state.failed = common_password;
+        break;
+      case ValidationCheck::kCount:
+        state.failed = false;
+        break;
+    }
+    return state.failed;
+  };
+
+  for (auto check : order) {
+    (void)evaluate(check);
   }
 
-  if (IsCommonPassword(password)) {
-    throw qv::Error{qv::ErrorDomain::Validation, 0,
-                    std::string(qv::errors::msg::kPasswordTooCommon)};
+  const auto& messages = PasswordValidationMessages();
+  for (auto check : kDeterministicValidationOrder) {
+    if (evaluate(check)) {
+      throw qv::Error{qv::ErrorDomain::Validation, 0,
+                      messages[static_cast<std::size_t>(check)]};
+    }
   }
 }
 
