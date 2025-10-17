@@ -69,6 +69,7 @@ int qv_getattr(const char* path, struct stat* stbuf, struct fuse_file_info* fi) 
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on getattr
   return filesystem->GetAttr(path, stbuf);
 }
 
@@ -82,6 +83,7 @@ int qv_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on readdir
   return filesystem->ReadDir(path, buf, filler);
 }
 
@@ -91,6 +93,7 @@ int qv_open(const char* path, struct fuse_file_info* fi) {
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on open
   return filesystem->Open(path, fi);
 }
 
@@ -101,6 +104,7 @@ int qv_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on read
   return filesystem->Read(path, buf, size, offset);
 }
 
@@ -112,6 +116,7 @@ int qv_write(const char* path, const char* buf, size_t size, off_t offset,
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on write
   return filesystem->Write(path, buf, size, offset);
 }
 
@@ -121,6 +126,7 @@ int qv_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on create
   return filesystem->Create(path, mode, fi);
 }
 
@@ -130,6 +136,7 @@ int qv_unlink(const char* path) {
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on unlink
   return filesystem->Unlink(path);
 }
 
@@ -139,6 +146,7 @@ int qv_mkdir(const char* path, mode_t mode) {
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on mkdir
   return filesystem->Mkdir(path, mode);
 }
 
@@ -148,6 +156,7 @@ int qv_rmdir(const char* path) {
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on rmdir
   return filesystem->Rmdir(path);
 }
 
@@ -158,6 +167,7 @@ int qv_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on truncate
   return filesystem->Truncate(path, size);
 }
 
@@ -167,6 +177,7 @@ int qv_release(const char* path, struct fuse_file_info* fi) {
   if (!filesystem) {
     return -EIO;
   }
+  filesystem->NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking reset idle timer on release
   return filesystem->Release(path, fi);  // TSK131_Missing_Flush_on_Close propagate close-time flush
 }
 
@@ -202,6 +213,12 @@ FUSEAdapter::~FUSEAdapter() {
 void FUSEAdapter::ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents) {
   if (filesystem_) {
     filesystem_->SetProtectedExtents(extents); // TSK710_Implement_Hidden_Volumes propagate guard
+  }
+}
+
+void FUSEAdapter::SetActivityCallback(VolumeFilesystem::ActivityCallback cb, void* context) noexcept { // TSK718_AutoLock_and_MemoryLocking
+  if (filesystem_) {
+    filesystem_->SetActivityCallback(cb, context);
   }
 }
 

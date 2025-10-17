@@ -6,7 +6,8 @@
 #include <optional>
 #include <string>
 
-#include "qv/storage/chunk_layout.h" // TSK710_Implement_Hidden_Volumes extent wiring
+#include "qv/platform/volume_filesystem.h" // TSK718_AutoLock_and_MemoryLocking activity hooks
+#include "qv/storage/chunk_layout.h"      // TSK710_Implement_Hidden_Volumes extent wiring
 
 namespace qv {
 namespace storage {
@@ -24,6 +25,7 @@ class WinFspAdapter {
   void Mount(const std::wstring& mountpoint);
   void Unmount();
   void ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents); // TSK710_Implement_Hidden_Volumes guard wiring
+  void SetActivityCallback(VolumeFilesystem::ActivityCallback cb, void* context) noexcept; // TSK718_AutoLock_and_MemoryLocking
 
  private:
   class Impl;

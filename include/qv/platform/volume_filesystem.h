@@ -2,6 +2,7 @@
 
 // TSK062_FUSE_Filesystem_Integration_Linux in-memory metadata backed by chunk storage
 
+#include <atomic>    // TSK718_AutoLock_and_MemoryLocking idle reset wiring
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -95,6 +96,8 @@ class VolumeFilesystem {
   bool has_payload_limit_{false};                // TSK710_Implement_Hidden_Volumes enforce region capacity
   uint64_t payload_base_chunk_{0};               // TSK710_Implement_Hidden_Volumes base chunk index
   uint64_t payload_limit_chunk_{std::numeric_limits<uint64_t>::max()}; // TSK710_Implement_Hidden_Volumes end-exclusive limit
+  mutable std::atomic<ActivityCallback> activity_callback_{nullptr};     // TSK718_AutoLock_and_MemoryLocking
+  mutable std::atomic<void*> activity_context_{nullptr};                 // TSK718_AutoLock_and_MemoryLocking
 
 public:
   explicit VolumeFilesystem(std::shared_ptr<storage::BlockDevice> device,
@@ -137,6 +140,9 @@ public:
   std::shared_ptr<storage::BlockDevice> BlockDeviceHandle() const { return device_; }
   void FlushStorage();  // TSK131_Missing_Flush_on_Close ensure chunk persistence coordination
   void SetProtectedExtents(std::vector<qv::storage::Extent> exts); // TSK710_Implement_Hidden_Volumes guard configuration
+  using ActivityCallback = void (*)(void*);                         // TSK718_AutoLock_and_MemoryLocking hook signature
+  void SetActivityCallback(ActivityCallback cb, void* context) noexcept; // TSK718_AutoLock_and_MemoryLocking
+  void NotifyActivity() const noexcept;                                // TSK718_AutoLock_and_MemoryLocking
 
 private:
   class MetadataWritebackGuard;  // TSK117_Race_Conditions_in_Filesystem scoped metadata batching

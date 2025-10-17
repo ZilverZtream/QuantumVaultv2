@@ -28,6 +28,7 @@ public:
   void RequestUnmount();
   void Unmount();
   void ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents); // TSK710_Implement_Hidden_Volumes guard wiring
+  void SetActivityCallback(VolumeFilesystem::ActivityCallback cb, void* context) noexcept; // TSK718_AutoLock_and_MemoryLocking
 
 private:
   std::unique_ptr<VolumeFilesystem> filesystem_;

@@ -1,6 +1,7 @@
 #include "qv/security/zeroizer.h"
 
 #include "qv/orchestrator/event_bus.h" // TSK085
+#include "qv/platform/memory_lock.h"   // TSK718_AutoLock_and_MemoryLocking platform locks
 
 // TSK006
 #include <atomic>
@@ -21,7 +22,6 @@
 #define NOMINMAX
 #include <windows.h>
 #else
-#include <sys/mman.h>
 #include <sys/resource.h>
 #endif
 
@@ -167,11 +167,7 @@ namespace qv::security {
   }
 
   bool Zeroizer::MemoryLockingSupported() noexcept { // TSK006
-#if defined(_WIN32)
-    return true;
-#else
-    return kHasPosixLocking;
-#endif
+    return qv::platform::MemoryLockSupported();
   }
 
   Zeroizer::LockStatus Zeroizer::TryLockMemory(std::span<uint8_t> data) noexcept { // TSK006, TSK085
@@ -179,23 +175,19 @@ namespace qv::security {
       return LockStatus::Locked;
     }
 
-#if defined(_WIN32)
-    if (::VirtualLock(data.data(), data.size()) != 0) {
-      RegisterLock(data.data(), data.size());
-      return LockStatus::Locked;
-    }
-    return LockStatus::BestEffort;
-#elif kHasPosixLocking
+    qv::platform::MemoryLockStatus status = qv::platform::MemoryLockStatus::kUnsupported;
+#if kHasPosixLocking
     EnsurePosixLockingConfigured(); // TSK031
-    if (::mlock(data.data(), data.size()) == 0) {
+#endif
+    status = qv::platform::LockMemory(data.data(), data.size());
+    if (status == qv::platform::MemoryLockStatus::kLocked) {
       RegisterLock(data.data(), data.size());
       return LockStatus::Locked;
     }
-    return LockStatus::BestEffort;
-#else
-    (void)data;
+    if (status == qv::platform::MemoryLockStatus::kBestEffort) {
+      return LockStatus::BestEffort;
+    }
     return LockStatus::Unsupported;
-#endif
   }
 
   void Zeroizer::UnlockMemory(std::span<uint8_t> data) noexcept { // TSK006, TSK085
@@ -203,19 +195,10 @@ namespace qv::security {
       return;
     }
 
-#if defined(_WIN32)
     if (!UnregisterLock(data.data(), data.size())) {
       return;
     }
-    ::VirtualUnlock(data.data(), data.size());
-#elif kHasPosixLocking
-    if (!UnregisterLock(data.data(), data.size())) {
-      return;
-    }
-    ::munlock(data.data(), data.size());
-#else
-    (void)data;
-#endif
+    qv::platform::UnlockMemory(data.data(), data.size());
   }
 
 } // namespace qv::security

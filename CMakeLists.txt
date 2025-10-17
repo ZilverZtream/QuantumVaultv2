@@ -127,6 +127,7 @@ add_library(qv_core
     src/crypto/sha256.cpp
     src/crypto/keyfiles.cpp # TSK711_Keyfiles_and_PKCS11_FIDO2 keyfile hashing support
     src/security/zeroizer.cpp
+    src/platform/memory_lock.cpp # TSK718_AutoLock_and_MemoryLocking sensitive memory wrappers
 )
 target_include_directories(qv_core
     PUBLIC
@@ -172,6 +173,7 @@ add_library(qv_orchestrator
     src/orchestrator/event_bus.cpp
     src/orchestrator/credentials.cpp # TSK711_Keyfiles_and_PKCS11_FIDO2 credential combiner
     src/orchestrator/sealed_key.cpp # TSK713_TPM_SecureEnclave_Key_Sealing provider registry
+    src/orchestrator/session.cpp # TSK718_AutoLock_and_MemoryLocking idle auto-lock session wiring
     src/tlv/parser.cpp # TSK111_Code_Duplication_and_Maintainability reusable TLV parser
 )
 target_include_directories(qv_orchestrator
@@ -368,6 +370,18 @@ endfunction()
   endif()
   qv_apply_test_opts(qv_error_handling_test) # TSK034
   add_test(NAME qv_error_handling COMMAND qv_error_handling_test) # TSK034
+
+  add_executable(qv_session_test tests/test_session.cpp) # TSK718_AutoLock_and_MemoryLocking
+  target_include_directories(qv_session_test PUBLIC include)
+  target_link_libraries(qv_session_test PRIVATE qv_orchestrator)
+  qv_apply_test_opts(qv_session_test)
+  add_test(NAME qv_session_idle COMMAND qv_session_test)
+
+  add_executable(qv_memory_lock_test tests/test_memory_lock.cpp) # TSK718_AutoLock_and_MemoryLocking
+  target_include_directories(qv_memory_lock_test PUBLIC include)
+  target_link_libraries(qv_memory_lock_test PRIVATE qv_core)
+  qv_apply_test_opts(qv_memory_lock_test)
+  add_test(NAME qv_memory_lock COMMAND qv_memory_lock_test)
 
   add_executable(qv_header_io_test tests/test_header_io.cpp) # TSK712_Header_Backup_and_Restore_Tooling
   target_include_directories(qv_header_io_test PUBLIC include)

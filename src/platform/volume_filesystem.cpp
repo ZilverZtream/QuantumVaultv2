@@ -829,6 +829,20 @@ void VolumeFilesystem::SetProtectedExtents(std::vector<qv::storage::Extent> exts
   protected_extents_ = std::move(exts);
 }
 
+void VolumeFilesystem::SetActivityCallback(ActivityCallback cb, void* context) noexcept { // TSK718_AutoLock_and_MemoryLocking
+  activity_context_.store(context, std::memory_order_release);
+  activity_callback_.store(cb, std::memory_order_release);
+}
+
+void VolumeFilesystem::NotifyActivity() const noexcept { // TSK718_AutoLock_and_MemoryLocking
+  auto* callback = activity_callback_.load(std::memory_order_acquire);
+  if (!callback) {
+    return;
+  }
+  void* context = activity_context_.load(std::memory_order_acquire);
+  callback(context);
+}
+
 bool VolumeFilesystem::IsProtectedRange(uint64_t offset, uint64_t length, uint64_t* next_safe) const {
   std::lock_guard<std::mutex> guard(protected_mutex_);
   if (length == 0) {
@@ -1358,6 +1372,7 @@ int VolumeFilesystem::Create(const char* path, mode_t mode, struct fuse_file_inf
 
 // TSK063_WinFsp_Windows_Driver_Integration shared helpers for WinFsp bridge
 uint64_t VolumeFilesystem::TotalSizeBytes() const {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking account for metadata queries
   FilesystemMutexGuard lock(fs_mutex_);
   const uint64_t metadata_bytes = metadata_chunk_count_ * kChunkPayloadSize;
   const uint64_t allocated_chunks = next_chunk_index_ > data_start_chunk_
@@ -1372,6 +1387,7 @@ uint64_t VolumeFilesystem::TotalSizeBytes() const {
 }
 
 uint64_t VolumeFilesystem::FreeSpaceBytes() const {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking account for free space queries
   constexpr uint64_t kAssumedCapacity = 512ull * 1024ull * 1024ull * 1024ull;  // 512 GiB
   const uint64_t capacity = (has_payload_limit_ && layout_region_)
                                 ? layout_region_->length
@@ -1384,6 +1400,7 @@ uint64_t VolumeFilesystem::FreeSpaceBytes() const {
 }
 
 std::optional<NodeMetadata> VolumeFilesystem::StatPath(const std::string& path) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   auto normalized = NormalizePath(path);
   NodeMetadata metadata{};
@@ -1419,6 +1436,7 @@ std::optional<NodeMetadata> VolumeFilesystem::StatPath(const std::string& path) 
 
 std::vector<DirectoryListingEntry> VolumeFilesystem::ListDirectoryEntries(
     const std::string& path) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   auto* dir = FindDirectory(path);
   if (!dir) {
@@ -1456,6 +1474,7 @@ std::vector<DirectoryListingEntry> VolumeFilesystem::ListDirectoryEntries(
 
 std::vector<uint8_t> VolumeFilesystem::ReadFileRange(const std::string& path, uint64_t offset,
                                                      size_t length) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   auto* file = FindFile(path);
   if (!file) {
@@ -1473,6 +1492,7 @@ std::vector<uint8_t> VolumeFilesystem::ReadFileRange(const std::string& path, ui
 
 size_t VolumeFilesystem::WriteFileRange(const std::string& path, uint64_t offset,
                                         std::span<const uint8_t> data) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto* file = FindFile(path);
@@ -1497,6 +1517,7 @@ size_t VolumeFilesystem::WriteFileRange(const std::string& path, uint64_t offset
 
 void VolumeFilesystem::CreateFileNode(const std::string& path, uint32_t mode, uint32_t uid,
                                       uint32_t gid) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
@@ -1535,6 +1556,7 @@ void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mod
   (void)mode;
   (void)uid;
   (void)gid;
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
@@ -1561,6 +1583,7 @@ void VolumeFilesystem::CreateDirectoryNode(const std::string& path, uint32_t mod
 }
 
 void VolumeFilesystem::RemoveFileNode(const std::string& path) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
@@ -1587,6 +1610,7 @@ void VolumeFilesystem::RemoveFileNode(const std::string& path) {
 }
 
 void VolumeFilesystem::RemoveDirectoryNode(const std::string& path) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
@@ -1618,6 +1642,7 @@ void VolumeFilesystem::RemoveDirectoryNode(const std::string& path) {
 }
 
 void VolumeFilesystem::TruncateFileNode(const std::string& path, uint64_t size) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto* file = FindFile(path);
@@ -1639,6 +1664,7 @@ void VolumeFilesystem::TruncateFileNode(const std::string& path, uint64_t size) 
 
 void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to,
                                   bool replace_existing) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto from_norm = NormalizePath(from);
@@ -1752,6 +1778,7 @@ void VolumeFilesystem::RenameNode(const std::string& from, const std::string& to
 
 void VolumeFilesystem::UpdateTimestamps(const std::string& path, std::optional<timespec> modification,
                                         std::optional<timespec> change) {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   MetadataWritebackGuard metadata_guard(*this);
   auto normalized = NormalizePath(path);
@@ -1964,6 +1991,7 @@ void VolumeFilesystem::SaveMetadata() {
 }
 
 void VolumeFilesystem::FlushStorage() {
+  NotifyActivity(); // TSK718_AutoLock_and_MemoryLocking
   FilesystemMutexGuard lock(fs_mutex_);
   device_->Flush();  // TSK131_Missing_Flush_on_Close coordinate chunk persistence with metadata updates
 }

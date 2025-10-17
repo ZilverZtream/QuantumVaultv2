@@ -38,6 +38,7 @@ class WinFspAdapter::Impl {
   void Mount(const std::wstring& mountpoint);
   void Unmount();
   void ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents);
+  void SetActivityCallback(VolumeFilesystem::ActivityCallback cb, void* context) noexcept;
 
  private:
   struct NodeContext {
@@ -99,6 +100,12 @@ class WinFspAdapter::Impl {
 void WinFspAdapter::Impl::ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents) {
   if (volume_fs_) {
     volume_fs_->SetProtectedExtents(extents); // TSK710_Implement_Hidden_Volumes propagate guard
+  }
+}
+
+void WinFspAdapter::Impl::SetActivityCallback(VolumeFilesystem::ActivityCallback cb, void* context) noexcept {
+  if (volume_fs_) {
+    volume_fs_->SetActivityCallback(cb, context); // TSK718_AutoLock_and_MemoryLocking propagate hook
   }
 }
 
@@ -887,6 +894,12 @@ void WinFspAdapter::ConfigureProtectedExtents(const std::vector<qv::storage::Ext
   }
 }
 
+void WinFspAdapter::SetActivityCallback(VolumeFilesystem::ActivityCallback cb, void* context) noexcept { // TSK718_AutoLock_and_MemoryLocking
+  if (impl_) {
+    impl_->SetActivityCallback(cb, context);
+  }
+}
+
 }  // namespace qv::platform
 
 #else  // defined(_WIN32) && defined(QV_HAVE_WINFSP)
@@ -902,6 +915,7 @@ class WinFspAdapter::Impl {
   }
   void Unmount() {}
   void ConfigureProtectedExtents(const std::vector<qv::storage::Extent>&) {}
+  void SetActivityCallback(VolumeFilesystem::ActivityCallback, void*) noexcept {}
 };
 
 WinFspAdapter::WinFspAdapter(std::shared_ptr<storage::BlockDevice> device,
@@ -916,6 +930,12 @@ void WinFspAdapter::Unmount() { impl_->Unmount(); }
 void WinFspAdapter::ConfigureProtectedExtents(const std::vector<qv::storage::Extent>& extents) {
   if (impl_) {
     impl_->ConfigureProtectedExtents(extents);
+  }
+}
+
+void WinFspAdapter::SetActivityCallback(VolumeFilesystem::ActivityCallback cb, void* context) noexcept {
+  if (impl_) {
+    impl_->SetActivityCallback(cb, context);
   }
 }
 }  // namespace qv::platform
