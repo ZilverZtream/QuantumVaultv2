@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "qv/crypto/ct.h"               // TSK235_Credential_Derivation_Weak_Combining constant-time helpers
 #include "qv/crypto/hkdf.h"             // TSK235_Credential_Derivation_Weak_Combining HKDF combiner
 #include "qv/crypto/hmac_sha256.h"      // TSK235_Credential_Derivation_Weak_Combining keyfile authenticator
 #include "qv/crypto/sha256.h"           // TSK711_Keyfiles_and_PKCS11_FIDO2 digest primitive
@@ -25,6 +26,26 @@ constexpr std::string_view kPkcs11Label = "QV-CRED-PKCS11/v1";                  
 constexpr std::string_view kFido2Label = "QV-CRED-FIDO2/v1";                         // TSK235_Credential_Derivation_Weak_Combining label separation
 constexpr std::array<uint8_t, 11> kKeyfileMagic{
     'Q', 'V', 'K', 'E', 'Y', 'F', 'I', 'L', 'E', 'V', '1'};                           // TSK235_Credential_Derivation_Weak_Combining keyfile format tag
+
+class VectorScopeWiper { // TSK235_Credential_Derivation_Weak_Combining scoped vector wipe
+ public:
+  explicit VectorScopeWiper(std::vector<uint8_t>& vec) noexcept : vec_(&vec) {}
+
+  VectorScopeWiper(const VectorScopeWiper&) = delete;
+  VectorScopeWiper& operator=(const VectorScopeWiper&) = delete;
+
+  ~VectorScopeWiper() noexcept {
+    if (!vec_) {
+      return;
+    }
+    qv::security::Zeroizer::WipeVector(*vec_);
+  }
+
+  void Release() noexcept { vec_ = nullptr; }
+
+ private:
+  std::vector<uint8_t>* vec_;
+};
 
 std::span<const uint8_t> AsBytes(std::string_view view) {
   return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};                // TSK235_Credential_Derivation_Weak_Combining span helper
@@ -70,8 +91,13 @@ std::array<uint8_t, 32> AuthenticateKeyfile(std::span<const uint8_t> keyfile,
   }
 
   auto provided_mac = keyfile.subspan(keyfile.size() - kHmacSize);                     // TSK235_Credential_Derivation_Weak_Combining provided MAC
+  std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> provided_mac_buffer{};        // TSK235_Credential_Derivation_Weak_Combining MAC copy for constant-time compare
+  std::copy(provided_mac.begin(), provided_mac.end(), provided_mac_buffer.begin());
+  qv::security::Zeroizer::ScopeWiper<uint8_t> provided_mac_guard(provided_mac_buffer.data(),
+                                                                 provided_mac_buffer.size());
+
   auto computed_mac = qv::crypto::HMAC_SHA256::Compute(password_digest, payload);      // TSK235_Credential_Derivation_Weak_Combining HMAC verification
-  const bool mac_ok = std::equal(computed_mac.begin(), computed_mac.end(), provided_mac.begin());
+  const bool mac_ok = qv::crypto::ct::CompareEqual(computed_mac, provided_mac_buffer); // TSK235_Credential_Derivation_Weak_Combining constant-time verification
   if (!mac_ok) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(computed_mac.data(), computed_mac.size()));
     throw qv::Error{qv::ErrorDomain::Validation, 0,
@@ -101,7 +127,10 @@ qv::security::SecureBuffer<uint8_t> DerivePreKey(const DerivationInputs& inputs)
   }
 
   auto password_digest = HashSpan(inputs.password);                                   // TSK235_Credential_Derivation_Weak_Combining password binding
+  qv::security::Zeroizer::ScopeWiper<uint8_t> password_digest_guard(
+      password_digest.data(), password_digest.size());                                // TSK235_Credential_Derivation_Weak_Combining scoped password wipe
   std::vector<uint8_t> ikm_buffer;                                                    // TSK235_Credential_Derivation_Weak_Combining HKDF material
+  VectorScopeWiper ikm_guard(ikm_buffer);                                             // TSK235_Credential_Derivation_Weak_Combining scoped HKDF buffer wipe
   ikm_buffer.reserve(128);
 
   AppendContribution(ikm_buffer, kPasswordLabel,
@@ -144,6 +173,9 @@ qv::security::SecureBuffer<uint8_t> DerivePreKey(const DerivationInputs& inputs)
   if (!ikm_buffer.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(ikm_buffer.data(), ikm_buffer.size()));
   }
+
+  password_digest_guard.Release();
+  ikm_guard.Release();
 
   return accumulator;
 }
