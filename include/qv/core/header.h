@@ -5,6 +5,7 @@
 #include <array>
 #include <span>
 #include <vector>
+#include <cstdint>
 
 #include "qv/common.h"
 #include "qv/crypto/aes_gcm.h"
@@ -28,6 +29,17 @@ bool VerifyHiddenVolumeDescriptor( // TSK710_Implement_Hidden_Volumes authentica
     std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> key,
     uint32_t expected_epoch,
     std::span<const uint8_t, 16> container_uuid);
+
+struct IntegrityRoot { // TSK715_Header_Integrity_Chain_and_qv-fsck Merkle binding for metadata
+  std::array<uint8_t, 32> merkle_root{};
+  uint64_t generation{0};
+  std::array<uint8_t, 32> parity{};
+  bool parity_valid{false};
+};
+
+IntegrityRoot ParseIntegrityRoot(std::span<const uint8_t> payload); // TSK715_Header_Integrity_Chain_and_qv-fsck decode TLV payload
+std::vector<uint8_t> SerializeIntegrityRoot(const IntegrityRoot& root); // TSK715_Header_Integrity_Chain_and_qv-fsck encode TLV payload
+bool WriteIntegrityRoot(std::span<uint8_t> payload, const IntegrityRoot& root); // TSK715_Header_Integrity_Chain_and_qv-fsck fixed-buffer encode
 
 }  // namespace qv::core
 
