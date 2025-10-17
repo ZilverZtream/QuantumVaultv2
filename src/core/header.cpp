@@ -75,5 +75,61 @@ bool VerifyHiddenVolumeDescriptor(
   }
 }
 
+IntegrityRoot ParseIntegrityRoot(std::span<const uint8_t> payload) { // TSK715_Header_Integrity_Chain_and_qv-fsck decode helper
+  IntegrityRoot root{};
+  if (payload.size() < root.merkle_root.size()) {
+    return root;
+  }
+  std::copy_n(payload.begin(), root.merkle_root.size(), root.merkle_root.begin());
+
+  if (payload.size() >= root.merkle_root.size() + sizeof(uint64_t)) {
+    uint64_t gen_le = 0;
+    std::memcpy(&gen_le, payload.data() + root.merkle_root.size(), sizeof(uint64_t));
+    root.generation = qv::FromLittleEndian64(gen_le);
+  }
+
+  const size_t parity_flag_offset = root.merkle_root.size() + sizeof(uint64_t);
+  if (payload.size() > parity_flag_offset) {
+    const bool parity_present = payload[parity_flag_offset] != 0;
+    const size_t parity_offset = parity_flag_offset + 1;
+    if (parity_present && payload.size() >= parity_offset + root.parity.size()) {
+      std::copy_n(payload.begin() + parity_offset, root.parity.size(), root.parity.begin());
+      root.parity_valid = true;
+    }
+  }
+
+  return root;
+}
+
+std::vector<uint8_t> SerializeIntegrityRoot(const IntegrityRoot& root) { // TSK715_Header_Integrity_Chain_and_qv-fsck encode helper
+  const size_t base_size = root.merkle_root.size() + sizeof(uint64_t) + 1;
+  const size_t total_size = base_size + (root.parity_valid ? root.parity.size() : 0);
+  std::vector<uint8_t> buffer(total_size, 0);
+  std::copy(root.merkle_root.begin(), root.merkle_root.end(), buffer.begin());
+  const uint64_t gen_le = qv::ToLittleEndian64(root.generation);
+  std::memcpy(buffer.data() + root.merkle_root.size(), &gen_le, sizeof(gen_le));
+  buffer[root.merkle_root.size() + sizeof(uint64_t)] = root.parity_valid ? 1 : 0;
+  if (root.parity_valid) {
+    std::copy(root.parity.begin(), root.parity.end(),
+              buffer.begin() + base_size);
+  }
+  return buffer;
+}
+
+bool WriteIntegrityRoot(std::span<uint8_t> payload,
+                        const IntegrityRoot& root) { // TSK715_Header_Integrity_Chain_and_qv-fsck fixed-buffer encode
+  const size_t required = root.merkle_root.size() + sizeof(uint64_t) + 1 +
+                          (root.parity_valid ? root.parity.size() : 0);
+  if (payload.size() < required) {
+    return false;
+  }
+  const auto encoded = SerializeIntegrityRoot(root);
+  std::copy(encoded.begin(), encoded.end(), payload.begin());
+  if (payload.size() > encoded.size()) {
+    std::fill(payload.begin() + encoded.size(), payload.end(), 0);
+  }
+  return true;
+}
+
 }  // namespace qv::core
 

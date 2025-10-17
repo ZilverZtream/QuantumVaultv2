@@ -116,6 +116,7 @@ add_library(qv_core
     src/core/nonce_log.cpp
     src/core/pqc_hybrid_kdf.cpp
     src/core/header.cpp # TSK710_Implement_Hidden_Volumes hidden descriptor verification
+    src/core/integrity.cpp # TSK715_Header_Integrity_Chain_and_qv-fsck metadata Merkle chain
     src/crypto/aegis.cpp
     src/crypto/aes_gcm.cpp
     src/crypto/hkdf.cpp
@@ -255,6 +256,14 @@ target_include_directories(qv-header
 )
 target_link_libraries(qv-header PRIVATE qv_core ${ARGON2_LIBRARY})
 target_include_directories(qv-header PRIVATE ${ARGON2_INCLUDE_DIR})
+
+add_executable(qv-fsck tools/qv-fsck.cpp) # TSK715_Header_Integrity_Chain_and_qv-fsck metadata audit CLI
+target_include_directories(qv-fsck
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(qv-fsck PRIVATE qv_core)
 
 # TSK062_FUSE_Filesystem_Integration_Linux build the Linux FUSE bridge when dependencies are present
 if (UNIX)
