@@ -64,12 +64,29 @@ QvFltInstanceSetup(
     PQVFLT_VOLUME_CONTEXT context = NULL;
 
     status = QvFltCreateVolumeContext(FltObjects, &context);
-    if (NT_SUCCESS(status)) {
-        FltSetVolumeContext(FltObjects->Volume, FLT_SET_CONTEXT_KEEP_IF_EXISTS, context, NULL);
-        QvFltCleanupVolumeContext(context);
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
 
-    return status;
+    PFLT_CONTEXT oldContext = NULL;
+    NTSTATUS setStatus = FltSetVolumeContext(
+        FltObjects->Volume,
+        FLT_SET_CONTEXT_KEEP_IF_EXISTS,
+        context,
+        &oldContext);
+
+    if (setStatus == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
+        setStatus = STATUS_SUCCESS;
+    }
+
+    if (oldContext != NULL) {
+        FltReleaseContext(oldContext);
+        oldContext = NULL;
+    }
+
+    FltReleaseContext(context);
+
+    return setStatus;
 }
 
 NTSTATUS
