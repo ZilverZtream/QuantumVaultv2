@@ -494,7 +494,9 @@ std::vector<std::string> LoadPasswordHistory(
     std::lock_guard<std::mutex> lock(cache.mutex);
     auto [it, inserted] = cache.entries.emplace(key, history);
     if (!inserted) {
-      it->second = history;
+      // Preserve the existing cached history to avoid overwriting newer data.
+      // TSK242_Password_History_Timing_Oracle stale overwrite guard
+      return it->second;
     }
     return it->second;
   }
