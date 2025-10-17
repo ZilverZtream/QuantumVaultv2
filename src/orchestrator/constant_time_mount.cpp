@@ -1786,8 +1786,10 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     return std::nullopt;
   }
 
-  std::array<uint8_t, 32> classical_key{}; // TSK070
-  bool classical_ok = true;               // TSK070
+  std::array<uint8_t, 32> classical_key{};                                              // TSK070
+  qv::security::Zeroizer::ScopeWiper<uint8_t> classical_key_guard(                     // TSK236_Mount_Timeout_Bypass_Vulnerability
+      classical_key.data(), classical_key.size());                                      // TSK236_Mount_Timeout_Bypass_Vulnerability
+  bool classical_ok = true;                                                             // TSK070
   try {
     classical_key = DerivePasswordKey(password, parsed); // TSK070
   } catch (const std::exception&) {                      // TSK070
@@ -1835,8 +1837,10 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     return std::nullopt;
   }
 
-  std::array<uint8_t, 32> hybrid_key{}; // TSK070
-  bool pqc_ok = false;                  // TSK070
+  std::array<uint8_t, 32> hybrid_key{};                                              // TSK070
+  qv::security::Zeroizer::ScopeWiper<uint8_t> hybrid_key_guard(                     // TSK236_Mount_Timeout_Bypass_Vulnerability
+      hybrid_key.data(), hybrid_key.size());                                        // TSK236_Mount_Timeout_Bypass_Vulnerability
+  bool pqc_ok = false;                                                              // TSK070
   auto status = hybrid_future.wait_until(attempt_deadline.Deadline()); // TSK236_Mount_Timeout_Bypass_Vulnerability
   if (status == std::future_status::ready) {                           // TSK038_Resource_Limits_and_DoS_Prevention
     auto hybrid_result = hybrid_future.get();                          // TSK070
@@ -1861,6 +1865,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   }
 
   auto mac_key = DeriveHeaderMacKey(hybrid_key, parsed);
+  qv::security::Zeroizer::ScopeWiper<uint8_t> mac_key_guard(                        // TSK236_Mount_Timeout_Bypass_Vulnerability
+      mac_key.data(), mac_key.size());                                              // TSK236_Mount_Timeout_Bypass_Vulnerability
   auto computed_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(mac_key.data(), mac_key.size()),
       std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
