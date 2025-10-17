@@ -465,7 +465,7 @@ namespace {
     filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                               static_cast<uint32_t>(offsetof(struct seccomp_data, args[2]))));
     filter.push_back(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<uint32_t>(PROT_EXEC)));
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, kRetErrnoEPERM));
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 #endif
@@ -475,7 +475,7 @@ namespace {
     filter.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                               static_cast<uint32_t>(offsetof(struct seccomp_data, args[2]))));
     filter.push_back(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<uint32_t>(PROT_EXEC)));
-    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    filter.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0));
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, kRetErrnoEPERM));
     filter.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 #endif
