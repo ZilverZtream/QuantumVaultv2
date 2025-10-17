@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future> // TSK038_Resource_Limits_and_DoS_Prevention crypto timeout
+#include <semaphore> // TSK236_Mount_Timeout_Bypass_Vulnerability global concurrency guard
 #include <iostream>
 #include <limits>   // TSK099_Input_Validation_and_Sanitization checked casts
 #include <mutex>
@@ -24,6 +25,17 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdlib> // TSK099_Input_Validation_and_Sanitization container root policy
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX // TSK236_Mount_Timeout_Bypass_Vulnerability prevent macro collisions
+#endif
+#include <psapi.h>    // TSK236_Mount_Timeout_Bypass_Vulnerability process memory query
+#include <windows.h>  // TSK236_Mount_Timeout_Bypass_Vulnerability process timing query
+#else
+#include <sys/resource.h> // TSK236_Mount_Timeout_Bypass_Vulnerability process usage query
+#include <sys/time.h>     // TSK236_Mount_Timeout_Bypass_Vulnerability timeval helpers
+#endif
 
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
@@ -238,6 +250,288 @@ std::shared_ptr<qv::storage::BlockDevice> MakeBlockDevice(
   std::array<uint8_t, 32> master_key{};
   return std::make_shared<qv::storage::BlockDevice>(
       container, master_key, 0, 0, qv::crypto::CipherType::AES_256_GCM);
+}
+
+class WallClockDeadline { // TSK236_Mount_Timeout_Bypass_Vulnerability suspend-aware timeout
+public:
+  explicit WallClockDeadline(std::chrono::nanoseconds duration)
+      : duration_(duration),
+        steady_start_(std::chrono::steady_clock::now()),
+        system_start_(std::chrono::system_clock::now()),
+        first_steady_start_(steady_start_),
+        first_system_start_(system_start_),
+        deadline_(steady_start_ + duration_) {}
+
+  std::chrono::steady_clock::time_point Deadline() {
+    auto steady_now = std::chrono::steady_clock::now();
+    auto system_now = std::chrono::system_clock::now();
+    AdjustBaseline(steady_now, system_now);
+    return deadline_;
+  }
+
+  bool Expired() {
+    auto steady_now = std::chrono::steady_clock::now();
+    auto system_now = std::chrono::system_clock::now();
+    AdjustBaseline(steady_now, system_now);
+    return steady_now >= deadline_;
+  }
+
+  std::chrono::nanoseconds ActiveElapsed() const {
+    return std::chrono::steady_clock::now() - steady_start_;
+  }
+
+  std::chrono::nanoseconds TotalWallElapsed() const {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now() - first_system_start_);
+  }
+
+  std::chrono::steady_clock::time_point Start() const { return first_steady_start_; }
+
+  bool ConsumeSuspendEvent() {
+    if (!suspend_detected_) {
+      return false;
+    }
+    suspend_detected_ = false;
+    return true;
+  }
+
+  std::chrono::nanoseconds LastSuspendGap() const { return last_suspend_gap_; }
+
+private:
+  void AdjustBaseline(std::chrono::steady_clock::time_point steady_now,
+                      std::chrono::system_clock::time_point system_now) {
+    if (system_now < system_start_) {
+      Reset(steady_now, system_now, std::chrono::nanoseconds::zero());
+      return;
+    }
+    auto steady_elapsed = steady_now - steady_start_;
+    auto system_elapsed = system_now - system_start_;
+    if (system_elapsed - steady_elapsed > kSuspendThreshold) {
+      Reset(steady_now, system_now, system_elapsed - steady_elapsed);
+    }
+  }
+
+  void Reset(std::chrono::steady_clock::time_point steady_now,
+             std::chrono::system_clock::time_point system_now,
+             std::chrono::nanoseconds gap) {
+    steady_start_ = steady_now;
+    system_start_ = system_now;
+    deadline_ = steady_now + duration_;
+    suspend_detected_ = gap > std::chrono::nanoseconds::zero();
+    last_suspend_gap_ = gap;
+  }
+
+  static constexpr std::chrono::nanoseconds kSuspendThreshold{std::chrono::seconds(1)};
+
+  const std::chrono::nanoseconds duration_;
+  std::chrono::steady_clock::time_point steady_start_;
+  std::chrono::system_clock::time_point system_start_;
+  const std::chrono::steady_clock::time_point first_steady_start_;
+  const std::chrono::system_clock::time_point first_system_start_;
+  std::chrono::steady_clock::time_point deadline_;
+  bool suspend_detected_{false};
+  std::chrono::nanoseconds last_suspend_gap_{std::chrono::nanoseconds::zero()};
+};
+
+constexpr ptrdiff_t kMountConcurrencyLimit = 4; // TSK236_Mount_Timeout_Bypass_Vulnerability global limit
+
+std::counting_semaphore<kMountConcurrencyLimit>& MountConcurrencySemaphore() { // TSK236_Mount_Timeout_Bypass_Vulnerability
+  static std::counting_semaphore<kMountConcurrencyLimit> semaphore(kMountConcurrencyLimit);
+  return semaphore;
+}
+
+class MountConcurrencyGuard { // TSK236_Mount_Timeout_Bypass_Vulnerability enforce concurrency
+public:
+  explicit MountConcurrencyGuard(WallClockDeadline& deadline) { Acquire(deadline); }
+
+  MountConcurrencyGuard(const MountConcurrencyGuard&) = delete;
+  MountConcurrencyGuard& operator=(const MountConcurrencyGuard&) = delete;
+
+  ~MountConcurrencyGuard() {
+    if (acquired_) {
+      MountConcurrencySemaphore().release();
+    }
+  }
+
+  bool acquired() const { return acquired_; }
+
+private:
+  void Acquire(WallClockDeadline& deadline) {
+    auto& semaphore = MountConcurrencySemaphore();
+    while (true) {
+      auto until = deadline.Deadline();
+      if (semaphore.try_acquire_until(until)) {
+        acquired_ = true;
+        return;
+      }
+      if (deadline.Expired()) {
+        return;
+      }
+    }
+  }
+
+  bool acquired_{false};
+};
+
+struct ProcessUsage { // TSK236_Mount_Timeout_Bypass_Vulnerability process resource snapshot
+  std::chrono::nanoseconds cpu_time{std::chrono::nanoseconds::zero()};
+  uint64_t rss_bytes{0};
+};
+
+std::optional<ProcessUsage> QueryProcessUsage() { // TSK236_Mount_Timeout_Bypass_Vulnerability resource monitoring
+#if defined(_WIN32)
+  FILETIME creation{}, exit{}, kernel{}, user{};
+  if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+    return std::nullopt;
+  }
+  ULARGE_INTEGER kernel_ticks{};
+  kernel_ticks.LowPart = kernel.dwLowDateTime;
+  kernel_ticks.HighPart = kernel.dwHighDateTime;
+  ULARGE_INTEGER user_ticks{};
+  user_ticks.LowPart = user.dwLowDateTime;
+  user_ticks.HighPart = user.dwHighDateTime;
+  auto cpu_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<long long, std::ratio<1, 10000000>>(kernel_ticks.QuadPart + user_ticks.QuadPart));
+  ProcessUsage usage{};
+  usage.cpu_time = cpu_duration;
+  PROCESS_MEMORY_COUNTERS_EX counters{};
+  if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                           sizeof(counters))) {
+    usage.rss_bytes = static_cast<uint64_t>(counters.WorkingSetSize);
+  }
+  return usage;
+#else
+  struct rusage usage {};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) {
+    return std::nullopt;
+  }
+  auto user = std::chrono::seconds(usage.ru_utime.tv_sec) +
+              std::chrono::microseconds(usage.ru_utime.tv_usec);
+  auto system = std::chrono::seconds(usage.ru_stime.tv_sec) +
+                std::chrono::microseconds(usage.ru_stime.tv_usec);
+  ProcessUsage result{};
+  result.cpu_time = std::chrono::duration_cast<std::chrono::nanoseconds>(user + system);
+#if defined(__APPLE__)
+  result.rss_bytes = static_cast<uint64_t>(usage.ru_maxrss);
+#else
+  result.rss_bytes = static_cast<uint64_t>(usage.ru_maxrss) * 1024ull;
+#endif
+  return result;
+#endif
+}
+
+class MountResourceMonitor { // TSK236_Mount_Timeout_Bypass_Vulnerability CPU/memory guard
+public:
+  MountResourceMonitor() : baseline_(QueryProcessUsage()) {
+    if (baseline_) {
+      last_snapshot_ = *baseline_;
+    }
+  }
+
+  bool CheckBudget() {
+    if (!baseline_) {
+      return true;
+    }
+    auto usage = QueryProcessUsage();
+    if (!usage) {
+      return true;
+    }
+    last_snapshot_ = *usage;
+    auto cpu_delta = last_snapshot_.cpu_time - baseline_->cpu_time;
+    uint64_t memory_delta = 0;
+    if (last_snapshot_.rss_bytes > baseline_->rss_bytes) {
+      memory_delta = last_snapshot_.rss_bytes - baseline_->rss_bytes;
+    }
+    cpu_delta_ = cpu_delta;
+    memory_delta_ = memory_delta;
+    exceeded_ = (cpu_delta_ > kMaxCpuBudget) || (memory_delta_ > kMaxMemoryBudgetBytes);
+    return !exceeded_;
+  }
+
+  bool exceeded() const { return exceeded_; }
+  std::chrono::nanoseconds cpu_delta() const { return cpu_delta_; }
+  uint64_t memory_delta() const { return memory_delta_; }
+  bool available() const { return baseline_.has_value(); }
+  const ProcessUsage& snapshot() const { return last_snapshot_; }
+
+private:
+  static constexpr std::chrono::nanoseconds kMaxCpuBudget{std::chrono::seconds(3)};
+  static constexpr uint64_t kMaxMemoryBudgetBytes = 64ull * 1024ull * 1024ull;
+
+  std::optional<ProcessUsage> baseline_{};
+  ProcessUsage last_snapshot_{};
+  bool exceeded_{false};
+  std::chrono::nanoseconds cpu_delta_{std::chrono::nanoseconds::zero()};
+  uint64_t memory_delta_{0};
+};
+
+void PublishMountTimeoutEvent(const std::filesystem::path& container, // TSK236_Mount_Timeout_Bypass_Vulnerability timeout log
+                              const WallClockDeadline& deadline,
+                              std::string_view stage) {
+  qv::orchestrator::Event timeout_event{};
+  timeout_event.category = qv::orchestrator::EventCategory::kSecurity;
+  timeout_event.severity = qv::orchestrator::EventSeverity::kWarning;
+  timeout_event.event_id = "mount_timeout_exceeded";
+  timeout_event.message = std::string(qv::errors::msg::kMountAttemptTimeout);
+  timeout_event.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                    qv::orchestrator::FieldPrivacy::kHash);
+  timeout_event.fields.emplace_back("stage", std::string(stage),
+                                    qv::orchestrator::FieldPrivacy::kPublic, true);
+  timeout_event.fields.emplace_back("active_ns", std::to_string(deadline.ActiveElapsed().count()),
+                                    qv::orchestrator::FieldPrivacy::kPublic, true);
+  timeout_event.fields.emplace_back("wall_ns", std::to_string(deadline.TotalWallElapsed().count()),
+                                    qv::orchestrator::FieldPrivacy::kPublic, true);
+  qv::orchestrator::EventBus::Instance().Publish(timeout_event);
+}
+
+void PublishSuspendEvent(const std::filesystem::path& container, // TSK236_Mount_Timeout_Bypass_Vulnerability suspend log
+                         std::chrono::nanoseconds gap) {
+  qv::orchestrator::Event suspend_event{};
+  suspend_event.category = qv::orchestrator::EventCategory::kTelemetry;
+  suspend_event.severity = qv::orchestrator::EventSeverity::kInfo;
+  suspend_event.event_id = "mount_timer_reset";
+  suspend_event.message = "Mount timeout baseline reset after suspend";
+  suspend_event.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                    qv::orchestrator::FieldPrivacy::kHash);
+  suspend_event.fields.emplace_back("suspend_gap_ns", std::to_string(gap.count()),
+                                    qv::orchestrator::FieldPrivacy::kPublic, true);
+  qv::orchestrator::EventBus::Instance().Publish(suspend_event);
+}
+
+void PublishResourceBudgetEvent(const std::filesystem::path& container, // TSK236_Mount_Timeout_Bypass_Vulnerability resource log
+                                const MountResourceMonitor& monitor,
+                                std::string_view stage) {
+  qv::orchestrator::Event resource_event{};
+  resource_event.category = qv::orchestrator::EventCategory::kSecurity;
+  resource_event.severity = qv::orchestrator::EventSeverity::kWarning;
+  resource_event.event_id = "mount_resource_budget_exceeded";
+  resource_event.message = "Mount attempt exceeded resource budget";
+  resource_event.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                     qv::orchestrator::FieldPrivacy::kHash);
+  resource_event.fields.emplace_back("stage", std::string(stage),
+                                     qv::orchestrator::FieldPrivacy::kPublic, true);
+  resource_event.fields.emplace_back("cpu_delta_ns", std::to_string(monitor.cpu_delta().count()),
+                                     qv::orchestrator::FieldPrivacy::kPublic, true);
+  resource_event.fields.emplace_back("memory_delta_bytes", std::to_string(monitor.memory_delta()),
+                                     qv::orchestrator::FieldPrivacy::kPublic, true);
+  if (monitor.available()) {
+    resource_event.fields.emplace_back("rss_bytes", std::to_string(monitor.snapshot().rss_bytes),
+                                       qv::orchestrator::FieldPrivacy::kPublic, true);
+  }
+  qv::orchestrator::EventBus::Instance().Publish(resource_event);
+}
+
+void PublishConcurrencyThrottleEvent(const std::filesystem::path& container) { // TSK236_Mount_Timeout_Bypass_Vulnerability concurrency log
+  qv::orchestrator::Event throttle_event{};
+  throttle_event.category = qv::orchestrator::EventCategory::kSecurity;
+  throttle_event.severity = qv::orchestrator::EventSeverity::kWarning;
+  throttle_event.event_id = "mount_concurrency_throttled";
+  throttle_event.message = "Mount attempt throttled due to concurrency limit";
+  throttle_event.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                     qv::orchestrator::FieldPrivacy::kHash);
+  throttle_event.fields.emplace_back("limit", std::to_string(kMountConcurrencyLimit),
+                                     qv::orchestrator::FieldPrivacy::kPublic, true);
+  qv::orchestrator::EventBus::Instance().Publish(throttle_event);
 }
 
 using VolumeUuid = std::array<uint8_t, 16>;                                     // TSK075_Lockout_Persistence_and_IPC
@@ -1419,11 +1713,46 @@ void ConstantTimeMount::ConstantTimePadding(std::chrono::nanoseconds duration) {
 std::optional<ConstantTimeMount::VolumeHandle>
 ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
                                 const std::string& password) {
-  auto attempt_start = std::chrono::steady_clock::now(); // TSK038_Resource_Limits_and_DoS_Prevention
   constexpr auto kMaxAttemptDuration = std::chrono::seconds(5); // TSK038_Resource_Limits_and_DoS_Prevention
   constexpr uintmax_t kMaxContainerSize = 100ull * 1024ull * 1024ull; // TSK038_Resource_Limits_and_DoS_Prevention
   constexpr uintmax_t kHeaderBytesRequired =                           // TSK141_Integer_Overflow_And_Wraparound_Issues
       static_cast<uintmax_t>(kTotalHeaderBytes);                        // TSK141_Integer_Overflow_And_Wraparound_Issues
+
+  WallClockDeadline attempt_deadline(kMaxAttemptDuration);             // TSK236_Mount_Timeout_Bypass_Vulnerability
+  MountConcurrencyGuard concurrency_guard(attempt_deadline);           // TSK236_Mount_Timeout_Bypass_Vulnerability
+  if (attempt_deadline.ConsumeSuspendEvent()) {                        // TSK236_Mount_Timeout_Bypass_Vulnerability
+    PublishSuspendEvent(container, attempt_deadline.LastSuspendGap()); // TSK236_Mount_Timeout_Bypass_Vulnerability
+  }
+  if (!concurrency_guard.acquired()) {                                 // TSK236_Mount_Timeout_Bypass_Vulnerability
+    PublishConcurrencyThrottleEvent(container);                        // TSK236_Mount_Timeout_Bypass_Vulnerability
+    PublishMountTimeoutEvent(container, attempt_deadline, "concurrency_wait");
+    return std::nullopt;
+  }
+
+  MountResourceMonitor resource_monitor; // TSK236_Mount_Timeout_Bypass_Vulnerability
+
+  auto check_deadline = [&](std::string_view stage) -> bool { // TSK236_Mount_Timeout_Bypass_Vulnerability
+    if (attempt_deadline.Expired()) {
+      PublishMountTimeoutEvent(container, attempt_deadline, stage);
+      return false;
+    }
+    if (attempt_deadline.ConsumeSuspendEvent()) {
+      PublishSuspendEvent(container, attempt_deadline.LastSuspendGap());
+    }
+    return true;
+  };
+
+  auto check_resource = [&](std::string_view stage) -> bool { // TSK236_Mount_Timeout_Bypass_Vulnerability
+    if (!resource_monitor.CheckBudget()) {
+      PublishResourceBudgetEvent(container, resource_monitor, stage);
+      return false;
+    }
+    return true;
+  };
+
+  if (!check_deadline("initial") || !check_resource("initial")) {
+    return std::nullopt;
+  }
 
   std::error_code size_ec; // TSK038_Resource_Limits_and_DoS_Prevention
   auto container_size = std::filesystem::file_size(container, size_ec); // TSK038_Resource_Limits_and_DoS_Prevention
@@ -1441,6 +1770,10 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     }
   }
 
+  if (!check_deadline("header_read") || !check_resource("header_read")) {
+    return std::nullopt;
+  }
+
   std::array<uint8_t, kSerializedHeaderBytes> header_bytes{};
   std::copy_n(buf.begin(), header_bytes.size(), header_bytes.begin());
 
@@ -1449,12 +1782,20 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
 
   auto parsed = ParseHeader(std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
 
+  if (!check_deadline("header_parse") || !check_resource("header_parse")) {
+    return std::nullopt;
+  }
+
   std::array<uint8_t, 32> classical_key{}; // TSK070
   bool classical_ok = true;               // TSK070
   try {
     classical_key = DerivePasswordKey(password, parsed); // TSK070
   } catch (const std::exception&) {                      // TSK070
     classical_ok = false;                                 // TSK070
+  }
+
+  if (!check_deadline("password_kdf") || !check_resource("password_kdf")) {
+    return std::nullopt;
   }
 
   auto parsed_for_kdf = parsed;      // TSK038_Resource_Limits_and_DoS_Prevention
@@ -1490,23 +1831,33 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   auto hybrid_future = kdf_task.get_future(); // TSK038_Resource_Limits_and_DoS_Prevention
   std::thread(std::move(kdf_task)).detach();  // TSK038_Resource_Limits_and_DoS_Prevention
 
+  if (!check_resource("hybrid_kdf_launch")) {
+    return std::nullopt;
+  }
+
   std::array<uint8_t, 32> hybrid_key{}; // TSK070
   bool pqc_ok = false;                  // TSK070
-  auto status = hybrid_future.wait_for(std::chrono::seconds(30)); // TSK038_Resource_Limits_and_DoS_Prevention
-  if (status == std::future_status::ready) {                      // TSK038_Resource_Limits_and_DoS_Prevention
-    auto hybrid_result = hybrid_future.get();                     // TSK070
-    hybrid_key = hybrid_result.key;                               // TSK070
-    pqc_ok = hybrid_result.success;                               // TSK070
+  auto status = hybrid_future.wait_until(attempt_deadline.Deadline()); // TSK236_Mount_Timeout_Bypass_Vulnerability
+  if (status == std::future_status::ready) {                           // TSK038_Resource_Limits_and_DoS_Prevention
+    auto hybrid_result = hybrid_future.get();                          // TSK070
+    hybrid_key = hybrid_result.key;                                    // TSK070
+    pqc_ok = hybrid_result.success;                                    // TSK070
   } else {
-    pqc_ok = false; // TSK038_Resource_Limits_and_DoS_Prevention
-    qv::orchestrator::Event kdf_timeout{}; // TSK038_Resource_Limits_and_DoS_Prevention
+    pqc_ok = false;                                                    // TSK038_Resource_Limits_and_DoS_Prevention
+    PublishMountTimeoutEvent(container, attempt_deadline, "hybrid_kdf_wait");
+    qv::orchestrator::Event kdf_timeout{};                             // TSK038_Resource_Limits_and_DoS_Prevention
     kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
-    kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
-    kdf_timeout.event_id = "mount_key_timeout"; // TSK080_Error_Info_Redaction_in_Release
+    kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning;  // TSK038_Resource_Limits_and_DoS_Prevention
+    kdf_timeout.event_id = "mount_key_timeout";                       // TSK080_Error_Info_Redaction_in_Release
     kdf_timeout.message = std::string(qv::errors::msg::kKeyAgreementTimeout); // TSK080_Error_Info_Redaction_in_Release
     kdf_timeout.fields.emplace_back("container_path", qv::PathToUtf8String(container),
                                     qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention, TSK103_Logging_and_Information_Disclosure
-    qv::orchestrator::EventBus::Instance().Publish(kdf_timeout); // TSK038_Resource_Limits_and_DoS_Prevention
+    qv::orchestrator::EventBus::Instance().Publish(kdf_timeout);       // TSK038_Resource_Limits_and_DoS_Prevention
+    return std::nullopt;
+  }
+
+  if (!check_deadline("hybrid_kdf_result") || !check_resource("hybrid_kdf_result")) {
+    return std::nullopt;
   }
 
   auto mac_key = DeriveHeaderMacKey(hybrid_key, parsed);
@@ -1514,6 +1865,10 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
       std::span<const uint8_t>(mac_key.data(), mac_key.size()),
       std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
   bool mac_ok = qv::crypto::ct::CompareEqual(stored_mac, computed_mac);
+
+  if (!check_deadline("mac_verify") || !check_resource("mac_verify")) {
+    return std::nullopt;
+  }
 
   uint32_t integrity_mask = 1u; // TSK102_Timing_Side_Channels
   integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, size_known);
@@ -1534,19 +1889,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
 
-  auto elapsed = std::chrono::steady_clock::now() - attempt_start; // TSK038_Resource_Limits_and_DoS_Prevention
-  if (elapsed > kMaxAttemptDuration) { // TSK038_Resource_Limits_and_DoS_Prevention
-    qv::orchestrator::Event timeout_event{}; // TSK038_Resource_Limits_and_DoS_Prevention
-    timeout_event.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
-    timeout_event.severity = qv::orchestrator::EventSeverity::kWarning; // TSK038_Resource_Limits_and_DoS_Prevention
-    timeout_event.event_id = "mount_timeout_exceeded"; // TSK038_Resource_Limits_and_DoS_Prevention
-    timeout_event.message = std::string(qv::errors::msg::kMountAttemptTimeout); // TSK038_Resource_Limits_and_DoS_Prevention
-    timeout_event.fields.emplace_back("container_path", qv::PathToUtf8String(container),
-                                      qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention, TSK103_Logging_and_Information_Disclosure
-    timeout_event.fields.emplace_back("duration_ns", std::to_string(elapsed.count()),
-                                      qv::orchestrator::FieldPrivacy::kPublic, true); // TSK038_Resource_Limits_and_DoS_Prevention
-    qv::orchestrator::EventBus::Instance().Publish(timeout_event); // TSK038_Resource_Limits_and_DoS_Prevention
-    return std::nullopt; // TSK038_Resource_Limits_and_DoS_Prevention
+  if (!check_deadline("finalize") || !check_resource("finalize")) {
+    return std::nullopt;
   }
 
   if (mask != 0u) {
@@ -1558,6 +1902,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   }
   return std::nullopt;
 }
+
+
 
 void ConstantTimeMount::LogTiming(const Attempt& a, const Attempt& b) {
   auto now_ns = static_cast<uint64_t>(
