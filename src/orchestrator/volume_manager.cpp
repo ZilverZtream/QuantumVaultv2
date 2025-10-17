@@ -24,9 +24,20 @@
 #if defined(_WIN32)
 #include <io.h>        // TSK146_Permission_And_Ownership_Issues Windows chmod
 #include <sys/stat.h>  // TSK146_Permission_And_Ownership_Issues permission macros
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>   // TSK244_Hidden_Volume_Replay_Attack system binding helpers
 #else
 #include <sys/stat.h>   // TSK146_Permission_And_Ownership_Issues ownership checks
 #include <unistd.h>     // TSK146_Permission_And_Ownership_Issues geteuid for ownership validation
+#include <sys/utsname.h> // TSK244_Hidden_Volume_Replay_Attack machine identifier
+#if defined(__APPLE__)
+#include <sys/sysctl.h>  // TSK244_Hidden_Volume_Replay_Attack boot time query
+#include <sys/time.h>    // TSK244_Hidden_Volume_Replay_Attack timeval support
+#else
+#include <sys/sysinfo.h> // TSK244_Hidden_Volume_Replay_Attack uptime query
+#endif
 #endif
 
 #include "qv/common.h"
@@ -76,6 +87,120 @@
 using namespace qv::orchestrator;
 
 namespace {
+
+constexpr uint32_t kHiddenDescriptorMetadataVersion = 2;                  // TSK244_Hidden_Volume_Replay_Attack format pin
+constexpr std::chrono::seconds kHiddenDescriptorMaxAge{60};               // TSK244_Hidden_Volume_Replay_Attack freshness window
+
+struct HiddenDescriptorMetadataDisk {                                     // TSK244_Hidden_Volume_Replay_Attack
+  uint32_t version{0};                                                    // TSK244_Hidden_Volume_Replay_Attack
+  uint32_t epoch{0};                                                      // TSK244_Hidden_Volume_Replay_Attack
+  uint64_t sequence{0};                                                   // TSK244_Hidden_Volume_Replay_Attack
+  std::array<uint8_t, 16> binding{};                                      // TSK244_Hidden_Volume_Replay_Attack
+};
+
+static_assert(sizeof(HiddenDescriptorMetadataDisk) == 32,                 // TSK244_Hidden_Volume_Replay_Attack layout guard
+              "Hidden descriptor metadata must remain 32 bytes");
+
+std::optional<std::string> ReadFirstLine(const std::filesystem::path& path) { // TSK244_Hidden_Volume_Replay_Attack helper
+  std::ifstream in(path);
+  if (!in) {
+    return std::nullopt;
+  }
+  std::string line;
+  std::getline(in, line);
+  if (line.empty()) {
+    return std::nullopt;
+  }
+  return line;
+}
+
+std::string ReadMachineIdentifier() {                                     // TSK244_Hidden_Volume_Replay_Attack system binding
+#if defined(_WIN32)
+  DWORD size = 0;
+  if (GetComputerNameA(nullptr, &size) == 0) {
+    const DWORD err = GetLastError();
+    if (err != ERROR_BUFFER_OVERFLOW || size == 0) {
+      throw qv::Error{qv::ErrorDomain::Security, static_cast<int>(err),
+                      "Failed to query computer name size"};
+    }
+  }
+  std::string name(static_cast<size_t>(size), '\0');
+  if (GetComputerNameA(name.data(), &size) == 0) {
+    throw qv::Error{qv::ErrorDomain::Security, static_cast<int>(::GetLastError()),
+                    "Failed to read computer name"};
+  }
+  name.resize(size);
+  return name;
+#else
+  constexpr const char* kCandidates[] = {"/etc/machine-id", "/var/lib/dbus/machine-id"};
+  for (const char* candidate : kCandidates) {
+    auto value = ReadFirstLine(candidate);
+    if (value) {
+      return *value;
+    }
+  }
+  struct utsname info {
+  };
+  if (uname(&info) != 0) {
+    throw qv::Error{qv::ErrorDomain::Security, errno, "Failed to query uname"};
+  }
+  return std::string(info.nodename);
+#endif
+}
+
+std::string ReadBootIdentifier() {                                        // TSK244_Hidden_Volume_Replay_Attack boot binding
+#if defined(_WIN32)
+  FILETIME ft{};
+  GetSystemTimeAsFileTime(&ft);
+  ULARGE_INTEGER current{};
+  current.LowPart = ft.dwLowDateTime;
+  current.HighPart = ft.dwHighDateTime;
+  const ULONGLONG ticks = GetTickCount64();
+  const ULONGLONG boot_time = current.QuadPart - ticks * 10000ull;
+  std::ostringstream oss;
+  oss << std::hex << boot_time;
+  return oss.str();
+#elif defined(__APPLE__)
+  int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+  struct timeval boottime {
+    0, 0
+  };
+  size_t len = sizeof(boottime);
+  if (sysctl(mib, 2, &boottime, &len, nullptr, 0) != 0) {
+    throw qv::Error{qv::ErrorDomain::Security, errno, "Failed to query boot time"};
+  }
+  std::ostringstream oss;
+  oss << boottime.tv_sec << ':' << boottime.tv_usec;
+  return oss.str();
+#else
+  auto boot_uuid = ReadFirstLine("/proc/sys/kernel/random/boot_id");
+  if (boot_uuid) {
+    return *boot_uuid;
+  }
+  struct sysinfo info {
+  };
+  if (sysinfo(&info) != 0) {
+    throw qv::Error{qv::ErrorDomain::Security, errno, "Failed to query sysinfo"};
+  }
+  const auto now = std::chrono::system_clock::now();
+  const auto now_seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+  const auto boot_seconds = now_seconds - static_cast<long long>(info.uptime);
+  return std::to_string(boot_seconds);
+#endif
+}
+
+std::array<uint8_t, 16> ComputeSystemBindingToken() {                     // TSK244_Hidden_Volume_Replay_Attack binding digest
+  auto machine = ReadMachineIdentifier();
+  auto boot = ReadBootIdentifier();
+  std::vector<uint8_t> buffer;
+  buffer.reserve(machine.size() + boot.size());
+  buffer.insert(buffer.end(), machine.begin(), machine.end());
+  buffer.insert(buffer.end(), boot.begin(), boot.end());
+  auto digest = qv::crypto::SHA256_Hash(std::span<const uint8_t>(buffer.data(), buffer.size()));
+  std::array<uint8_t, 16> binding{};
+  std::copy_n(digest.begin(), binding.size(), binding.begin());
+  return binding;
+}
 
 #if !defined(_WIN32)
 void RequireOwnedDirectory(const std::filesystem::path& dir) { // TSK146_Permission_And_Ownership_Issues ensure trusted parents
@@ -1066,6 +1191,8 @@ std::filesystem::path SanitizeContainerPath(
           descriptor.start_offset = qv::FromLittleEndian64(descriptor.start_offset);
           descriptor.length = qv::FromLittleEndian64(descriptor.length);
           descriptor.epoch = qv::FromLittleEndian(descriptor.epoch);
+          descriptor.sequence_number = qv::FromLittleEndian64(descriptor.sequence_number); // TSK244_Hidden_Volume_Replay_Attack
+          descriptor.created_timestamp = qv::FromLittleEndian64(descriptor.created_timestamp); // TSK244_Hidden_Volume_Replay_Attack
           parsed.hidden_descriptor = descriptor;
           parsed.have_hidden_descriptor = true;
           break;
@@ -1633,6 +1760,32 @@ std::vector<qv::storage::Extent> VolumeManager::LoadHiddenDescriptor(
   }
 
   qv::core::HiddenVolumeDescriptor descriptor = *parsed.hidden_descriptor;
+  if (!parsed.reserved_v2_present || parsed.reserved_v2.length < sizeof(HiddenDescriptorMetadataDisk)) {
+    throw qv::Error{qv::ErrorDomain::Security, 0,
+                    "Hidden descriptor metadata missing"}; // TSK244_Hidden_Volume_Replay_Attack
+  }
+  HiddenDescriptorMetadataDisk metadata_disk{}; // TSK244_Hidden_Volume_Replay_Attack parse envelope
+  std::memcpy(&metadata_disk, parsed.reserved_v2.payload.data(), sizeof(metadata_disk));
+  const uint32_t metadata_version = qv::FromLittleEndian(metadata_disk.version);
+  if (metadata_version != kHiddenDescriptorMetadataVersion) {
+    throw qv::Error{qv::ErrorDomain::Validation, 0,
+                    "Hidden descriptor metadata version mismatch"}; // TSK244_Hidden_Volume_Replay_Attack
+  }
+  const uint32_t metadata_epoch = qv::FromLittleEndian(metadata_disk.epoch);
+  if (metadata_epoch != descriptor.epoch || metadata_epoch != parsed.epoch_value) {
+    throw qv::Error{qv::ErrorDomain::Security, 0,
+                    "Hidden descriptor epoch mismatch"}; // TSK244_Hidden_Volume_Replay_Attack
+  }
+  const uint64_t metadata_sequence = qv::FromLittleEndian64(metadata_disk.sequence);
+  if (metadata_sequence != descriptor.sequence_number) {
+    throw qv::Error{qv::ErrorDomain::Security, 0,
+                    "Hidden descriptor sequence mismatch"}; // TSK244_Hidden_Volume_Replay_Attack
+  }
+  if (!std::equal(descriptor.system_binding.begin(), descriptor.system_binding.end(),
+                  metadata_disk.binding.begin(), metadata_disk.binding.end())) {
+    throw qv::Error{qv::ErrorDomain::Security, 0,
+                    "Hidden descriptor binding mismatch"}; // TSK244_Hidden_Volume_Replay_Attack
+  }
   if (descriptor.length == 0) {
     throw qv::Error{qv::ErrorDomain::Validation, 0, "Hidden descriptor length invalid"};
   }
@@ -1663,9 +1816,14 @@ std::vector<qv::storage::Extent> VolumeManager::LoadHiddenDescriptor(
   qv::security::Zeroizer::ScopeWiper<uint8_t> pass_guard(password_copy.AsSpan());
   std::span<const uint8_t> pass_span(password_copy.AsSpan());
   auto key = qv::core::DeriveHiddenVolumeKey(pass_span, std::span<const uint8_t, 16>(parsed.header.uuid));
+  auto binding = ComputeSystemBindingToken(); // TSK244_Hidden_Volume_Replay_Attack
+  const auto now = std::chrono::system_clock::now();
+  const uint64_t now_seconds = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count()); // TSK244_Hidden_Volume_Replay_Attack
   bool verified = qv::core::VerifyHiddenVolumeDescriptor(
-      descriptor, std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE>(key), parsed.epoch_value,
-      std::span<const uint8_t, 16>(parsed.header.uuid));
+      descriptor, std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE>(key), parsed.epoch_value, metadata_sequence,
+      now_seconds, static_cast<uint64_t>(kHiddenDescriptorMaxAge.count()),
+      std::span<const uint8_t, 16>(parsed.header.uuid), std::span<const uint8_t, 16>(binding));
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(key.data(), key.size()));
   if (!verified) {
     throw qv::AuthenticationFailureError("Hidden volume descriptor authentication failed");
