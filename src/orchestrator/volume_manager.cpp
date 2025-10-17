@@ -20,6 +20,7 @@
 #include <system_error> // TSK074_Migration_Rollback_and_Backup non-throwing filesystem ops
 #include <type_traits>  // TSK099_Input_Validation_and_Sanitization checked casts
 #include <unordered_map> // TSK242_Password_History_Timing_Oracle cached history store
+#include <tuple>         // TSK243_Volume_Header_MAC_Domain_Confusion uuid span metadata
 #include <vector>
 #include <mutex>        // TSK242_Password_History_Timing_Oracle cache synchronization
 #include <cstdlib>      // TSK099_Input_Validation_and_Sanitization container root policy
@@ -943,21 +944,56 @@ std::filesystem::path SanitizeContainerPath(
 #endif
   }
 
+  std::array<uint8_t, 32> DeriveContextMac(
+      std::span<const uint8_t> base_key, std::string_view operation,
+      std::string_view access_domain,
+      uint32_t header_version) { // TSK243_Volume_Header_MAC_Domain_Confusion context separation
+    std::string context = "QV-MAC-" + std::string(operation) + '-' +
+                          std::string(access_domain) + "-v" +
+                          std::to_string(header_version); // TSK243_Volume_Header_MAC_Domain_Confusion
+    return qv::crypto::HKDF_SHA256(
+        base_key, {},
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(context.data()),
+                                 context.size()));
+  }
+
   std::array<uint8_t, 32> DeriveHeaderMacKey(
       std::span<const uint8_t, 32> hybrid_key,
-      const std::array<uint8_t, 16>& uuid) { // TSK024_Key_Rotation_and_Lifecycle_Management
+      const std::array<uint8_t, 16>& uuid, uint32_t header_version,
+      uint32_t epoch, std::string_view operation,
+      std::string_view
+          access_domain) { // TSK024_Key_Rotation_and_Lifecycle_Management
     auto metadata_root =
         qv::core::DeriveMetadataKey(hybrid_key); // TSK024_Key_Rotation_and_Lifecycle_Management
-    static constexpr std::string_view kInfo{"QV-HEADER-MAC/v1"};
-    const std::span<const uint8_t> info_span(
-        reinterpret_cast<const uint8_t*>(kInfo.data()), kInfo.size());
-    auto okm = qv::crypto::HKDF_SHA256(
+    auto domain_key = DeriveContextMac(
         std::span<const uint8_t>(metadata_root.data(), metadata_root.size()),
-        std::span<const uint8_t>(uuid.data(), uuid.size()), info_span); // TSK106_Cryptographic_Implementation_Weaknesses
+        operation, access_domain, header_version); // TSK243_Volume_Header_MAC_Domain_Confusion
     qv::security::Zeroizer::Wipe(
-        std::span<uint8_t>(metadata_root.data(),
-                           metadata_root.size())); // TSK024_Key_Rotation_and_Lifecycle_Management
-    return okm;
+        std::span<uint8_t>(metadata_root.data(), metadata_root.size()));
+    std::array<uint8_t, 32> epoch_key{}; // TSK243_Volume_Header_MAC_Domain_Confusion epoch binding
+    static constexpr std::string_view kMacInfo{"QV-HEADER-MAC/v2"};
+    std::array<uint8_t, sizeof(uint32_t)> epoch_le{};
+    const uint32_t epoch_encoded = qv::ToLittleEndian(epoch);
+    std::memcpy(epoch_le.data(), &epoch_encoded, sizeof(epoch_encoded));
+    using UuidArray = std::decay_t<decltype(uuid)>;
+    static_assert(std::tuple_size_v<UuidArray> == 16,
+                  "Header UUID size unexpected"); // TSK243_Volume_Header_MAC_Domain_Confusion
+    std::array<uint8_t, std::tuple_size_v<UuidArray> + sizeof(uint32_t)>
+        salt{}; // TSK243_Volume_Header_MAC_Domain_Confusion uuid+epoch salt
+    std::memcpy(salt.data(), uuid.data(), uuid.size());
+    std::memcpy(salt.data() + uuid.size(), epoch_le.data(), epoch_le.size());
+    epoch_key = qv::crypto::HKDF_SHA256(
+        std::span<const uint8_t>(domain_key.data(), domain_key.size()),
+        std::span<const uint8_t>(salt.data(), salt.size()),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kMacInfo.data()),
+                                 kMacInfo.size()));
+    qv::security::Zeroizer::Wipe(
+        std::span<uint8_t>(salt.data(), salt.size())); // TSK243_Volume_Header_MAC_Domain_Confusion scrub salt
+    qv::security::Zeroizer::Wipe(
+        std::span<uint8_t>(epoch_le.data(), epoch_le.size())); // TSK243_Volume_Header_MAC_Domain_Confusion scrub epoch buffer
+    qv::security::Zeroizer::Wipe(
+        std::span<uint8_t>(domain_key.data(), domain_key.size()));
+    return epoch_key;
   }
 
   class VectorWipeGuard { // TSK028_Secure_Deletion_and_Data_Remanence
@@ -1007,6 +1043,7 @@ std::filesystem::path SanitizeContainerPath(
     std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE>
         mac{};                        // TSK024_Key_Rotation_and_Lifecycle_Management
     std::vector<uint8_t> payload;     // TSK024_Key_Rotation_and_Lifecycle_Management
+    std::vector<uint16_t> tlv_types;  // TSK243_Volume_Header_MAC_Domain_Confusion ordering binding
   };
 
   struct DerivedKeyset {                // TSK024_Key_Rotation_and_Lifecycle_Management
@@ -1025,7 +1062,12 @@ std::filesystem::path SanitizeContainerPath(
     return keys;                                   // TSK024_Key_Rotation_and_Lifecycle_Management
   }
 
-  std::vector<uint8_t> SerializeHeaderPayload(
+  struct SerializedHeaderPayload { // TSK243_Volume_Header_MAC_Domain_Confusion metadata capture
+    std::vector<uint8_t> bytes;
+    std::vector<uint16_t> tlv_types;
+  };
+
+  SerializedHeaderPayload SerializeHeaderPayload(
       const VolumeHeader& header, PasswordKdf algorithm, uint32_t pbkdf_iterations,
       const std::array<uint8_t, kPbkdfSaltSize>& password_salt,
       const std::optional<Argon2Config>& argon2,
@@ -1034,12 +1076,15 @@ std::filesystem::path SanitizeContainerPath(
       const ReservedV2Tlv& reserved) { // TSK111_Code_Duplication_and_Maintainability
     qv::orchestrator::HeaderSerializer serializer;
     serializer.AddHeader(header);
+    SerializedHeaderPayload serialized{}; // TSK243_Volume_Header_MAC_Domain_Confusion include TLV metadata
+    serialized.tlv_types.reserve(8);
 
     if (algorithm == PasswordKdf::kPbkdf2) {
       std::array<uint8_t, sizeof(uint32_t) + kPbkdfSaltSize> pbkdf_payload{};
       const uint32_t iter_le = qv::ToLittleEndian(pbkdf_iterations);
       std::memcpy(pbkdf_payload.data(), &iter_le, sizeof(iter_le));
       std::copy(password_salt.begin(), password_salt.end(), pbkdf_payload.begin() + sizeof(uint32_t));
+      serialized.tlv_types.push_back(kTlvTypePbkdf2); // TSK243_Volume_Header_MAC_Domain_Confusion
       serializer.AddTLV(kTlvTypePbkdf2, std::span<const uint8_t>(pbkdf_payload.data(), pbkdf_payload.size()));
     } else if (algorithm == PasswordKdf::kArgon2id) {
       if (!argon2) {
@@ -1058,10 +1103,13 @@ std::filesystem::path SanitizeContainerPath(
       write_field(5, argon2->target_ms);
       std::copy(argon2->salt.begin(), argon2->salt.end(),
                 argon_payload.begin() + sizeof(uint32_t) * 6);
+      serialized.tlv_types.push_back(kTlvTypeArgon2); // TSK243_Volume_Header_MAC_Domain_Confusion
       serializer.AddTLV(kTlvTypeArgon2, std::span<const uint8_t>(argon_payload.data(), argon_payload.size()));
     }
 
+    serialized.tlv_types.push_back(kTlvTypeHybridSalt); // TSK243_Volume_Header_MAC_Domain_Confusion
     serializer.AddTLV(kTlvTypeHybridSalt, std::span<const uint8_t>(hybrid_salt.data(), hybrid_salt.size()));
+    serialized.tlv_types.push_back(kTlvTypeEpoch); // TSK243_Volume_Header_MAC_Domain_Confusion
     serializer.AddStruct(epoch);
 
     auto pqc_copy = kem_blob;
@@ -1070,6 +1118,7 @@ std::filesystem::path SanitizeContainerPath(
         CheckedCast<uint16_t>(sizeof(qv::core::PQC_KEM_TLV) - sizeof(uint16_t) * 2));
     pqc_copy.version = qv::ToLittleEndian16(pqc_copy.version);
     pqc_copy.kem_id = qv::ToLittleEndian16(pqc_copy.kem_id);
+    serialized.tlv_types.push_back(kTlvTypePqcKem); // TSK243_Volume_Header_MAC_Domain_Confusion
     serializer.AddStruct(pqc_copy);
 
     if (reserved.length > 0) {
@@ -1084,10 +1133,42 @@ std::filesystem::path SanitizeContainerPath(
       if (reserved_length > 0) {
         std::copy_n(reserved.payload.begin(), reserved_length, reserved_copy.payload.begin());
       }
+      serialized.tlv_types.push_back(kTlvTypeReservedV2); // TSK243_Volume_Header_MAC_Domain_Confusion
       serializer.AddStruct(reserved_copy);
     }
 
-    return serializer.Finalize();
+    serialized.bytes = serializer.Finalize();
+    return serialized;
+  }
+
+  std::vector<uint8_t> BuildHeaderMacMaterial(
+      const VolumeHeader& header, uint32_t header_version,
+      std::span<const uint16_t> tlv_types,
+      std::span<const uint8_t> serialized_payload) { // TSK243_Volume_Header_MAC_Domain_Confusion metadata binding
+    static constexpr std::string_view kFormatMarker{"QV-HDR-META/v1"};
+    const uint16_t tlv_count = CheckedCast<uint16_t>(tlv_types.size());
+    const uint32_t header_size_le = qv::ToLittleEndian(static_cast<uint32_t>(sizeof(VolumeHeader)));
+    const uint32_t version_le = qv::ToLittleEndian(header_version);
+    const uint16_t tlv_count_le = qv::ToLittleEndian16(tlv_count);
+    std::vector<uint8_t> material;
+    material.reserve(kFormatMarker.size() + header.magic.size() + sizeof(header_size_le) +
+                     sizeof(version_le) + sizeof(tlv_count_le) + tlv_types.size() * sizeof(uint16_t) +
+                     serialized_payload.size());
+    material.insert(material.end(), kFormatMarker.begin(), kFormatMarker.end());
+    material.insert(material.end(), header.magic.begin(), header.magic.end());
+    auto version_bytes = qv::AsBytesConst(version_le);
+    material.insert(material.end(), version_bytes.begin(), version_bytes.end());
+    auto size_bytes = qv::AsBytesConst(header_size_le);
+    material.insert(material.end(), size_bytes.begin(), size_bytes.end());
+    auto count_bytes = qv::AsBytesConst(tlv_count_le);
+    material.insert(material.end(), count_bytes.begin(), count_bytes.end());
+    for (uint16_t type : tlv_types) {
+      const uint16_t type_le = qv::ToLittleEndian16(type);
+      auto type_bytes = qv::AsBytesConst(type_le);
+      material.insert(material.end(), type_bytes.begin(), type_bytes.end());
+    }
+    material.insert(material.end(), serialized_payload.begin(), serialized_payload.end());
+    return material;
   }
 
   uint32_t DeterminePbkdfIterations(std::span<const uint8_t> password,
@@ -1170,7 +1251,9 @@ std::filesystem::path SanitizeContainerPath(
     bool have_epoch = false;
     bool have_pqc = false;
 
+    parsed.tlv_types.reserve(std::distance(parser.begin(), parser.end()));
     for (const auto& record : parser) {
+      parsed.tlv_types.push_back(record.type); // TSK243_Volume_Header_MAC_Domain_Confusion capture order
       switch (record.type) {
         case kTlvTypePbkdf2: {
           const size_t expected = sizeof(uint32_t) + kPbkdfSaltSize;
@@ -1665,7 +1748,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
 
   auto mac_key = DeriveHeaderMacKey(
       std::span<const uint8_t, 32>(creation.hybrid_key.data(), creation.hybrid_key.size()),
-      header.uuid); // TSK024_Key_Rotation_and_Lifecycle_Management
+      header.uuid, kHeaderVersion, initial_epoch, "CREATE", "WRITE");
   qv::security::Zeroizer::ScopeWiper mac_guard(
       mac_key.data(), mac_key.size()); // TSK028_Secure_Deletion_and_Data_Remanence
 
@@ -1674,11 +1757,13 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
       header, kdf_policy_.algorithm, pbkdf_iterations, password_salt, argon2_config, hybrid_salt,
       epoch, creation.kem_blob,
       reserved_v2); // TSK024_Key_Rotation_and_Lifecycle_Management
-
+  auto payload_span =
+      std::span<const uint8_t>(payload.bytes.data(), payload.bytes.size());
+  auto mac_material = BuildHeaderMacMaterial(header, kHeaderVersion, payload.tlv_types, payload_span);
   auto mac =
       qv::crypto::HMAC_SHA256::Compute(std::span<const uint8_t>(mac_key.data(), mac_key.size()),
-                                       std::span<const uint8_t>(payload.data(), payload.size()));
-  payload.insert(payload.end(), mac.begin(), mac.end());
+                                       std::span<const uint8_t>(mac_material.data(), mac_material.size()));
+  payload.bytes.insert(payload.bytes.end(), mac.begin(), mac.end());
 
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
   qv::security::Zeroizer::Wipe(
@@ -1686,7 +1771,7 @@ VolumeManager::Create(const std::filesystem::path& container, const std::string&
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
 
   try {
-    AtomicReplace(sanitized_container, std::span<const uint8_t>(payload.data(), payload.size()));
+    AtomicReplace(sanitized_container, std::span<const uint8_t>(payload.bytes.data(), payload.bytes.size()));
   } catch (const qv::Error& err) {
     throw qv::Error{err.domain(), err.code(),
                     "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
@@ -1980,12 +2065,17 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size())); // TSK097_Cryptographic_Key_Management wipe after PQC mount
 
   auto mac_key = DeriveHeaderMacKey(
-      std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid);
+      std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid,
+      parsed.header_version, parsed.epoch_value, "REKEY", "READ");
   qv::security::Zeroizer::ScopeWiper mac_guard(mac_key.data(), mac_key.size());
 
+  auto parsed_payload_span =
+      std::span<const uint8_t>(parsed.payload.data(), parsed.payload.size());
+  auto parsed_mac_material =
+      BuildHeaderMacMaterial(parsed.header, parsed.header_version, parsed.tlv_types, parsed_payload_span);
   auto expected_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(mac_key.data(), mac_key.size()),
-      std::span<const uint8_t>(parsed.payload.data(), parsed.payload.size()));
+      std::span<const uint8_t>(parsed_mac_material.data(), parsed_mac_material.size()));
 
   if (expected_mac != parsed.mac) { // TSK024_Key_Rotation_and_Lifecycle_Management
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
@@ -2086,7 +2176,7 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
 
   auto new_mac_key = DeriveHeaderMacKey(
       std::span<const uint8_t, 32>(creation.hybrid_key.data(), creation.hybrid_key.size()),
-      parsed.header.uuid);
+      parsed.header.uuid, parsed.header_version, new_epoch, "REKEY", "WRITE");
   qv::security::Zeroizer::ScopeWiper new_mac_guard(new_mac_key.data(), new_mac_key.size());
 
   auto derived_keys = MakeDerivedKeyset(
@@ -2103,18 +2193,23 @@ VolumeManager::Rekey(const std::filesystem::path& container, const std::string& 
                                         new_epoch_tlv, creation.kem_blob,
                                         parsed.reserved_v2); // TSK024_Key_Rotation_and_Lifecycle_Management
 
+  auto new_payload_span =
+      std::span<const uint8_t>(payload.bytes.data(), payload.bytes.size());
+  auto new_mac_material = BuildHeaderMacMaterial(parsed.header, parsed.header_version, payload.tlv_types,
+                                                 new_payload_span);
   auto new_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(new_mac_key.data(), new_mac_key.size()),
-      std::span<const uint8_t>(payload.data(), payload.size()));
-  payload.insert(payload.end(), new_mac.begin(), new_mac.end());
+      std::span<const uint8_t>(new_mac_material.data(), new_mac_material.size()));
+  payload.bytes.insert(payload.bytes.end(), new_mac.begin(), new_mac.end());
 
-  if (payload.size() !=
+  if (payload.bytes.size() !=
       parsed.payload.size() + parsed.mac.size()) { // TSK024_Key_Rotation_and_Lifecycle_Management
     throw qv::Error{qv::ErrorDomain::Internal, 0, "Header size changed unexpectedly"};
   }
 
   try {
-    AtomicReplace(sanitized_container, std::span<const uint8_t>(payload.data(), payload.size()));
+    AtomicReplace(sanitized_container,
+                  std::span<const uint8_t>(payload.bytes.data(), payload.bytes.size()));
   } catch (const qv::Error& err) {
     throw qv::Error{err.domain(), err.code(),
                     "Failed to finalize container header update"}; // TSK068_Atomic_Header_Writes uniform messaging
@@ -2223,12 +2318,17 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size())); // TSK097_Cryptographic_Key_Management wipe after PQC mount
 
   auto mac_key = DeriveHeaderMacKey(
-      std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid); // TSK033
+      std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid,
+      parsed.header_version, parsed.epoch_value, "MIGRATE", "READ");
   qv::security::Zeroizer::ScopeWiper mac_guard(mac_key.data(), mac_key.size());
 
+  auto parsed_payload_span =
+      std::span<const uint8_t>(parsed.payload.data(), parsed.payload.size());
+  auto parsed_mac_material =
+      BuildHeaderMacMaterial(parsed.header, parsed.header_version, parsed.tlv_types, parsed_payload_span);
   auto expected_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(mac_key.data(), mac_key.size()),
-      std::span<const uint8_t>(parsed.payload.data(), parsed.payload.size()));
+      std::span<const uint8_t>(parsed_mac_material.data(), parsed_mac_material.size()));
   if (expected_mac != parsed.mac) { // TSK033 enforce password correctness
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
@@ -2266,6 +2366,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
   }
 
   parsed.header.version = qv::ToLittleEndian(target_version); // TSK033 bump version field
+  parsed.header_version = target_version;                    // TSK243_Volume_Header_MAC_Domain_Confusion
   std::optional<Argon2Config> existing_argon2;
   if (parsed.have_argon2) {
     existing_argon2 = parsed.argon2;
@@ -2274,13 +2375,19 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
                                         parsed.pbkdf_salt, existing_argon2, parsed.hybrid_salt,
                                         parsed.epoch_tlv, parsed.kem_blob,
                                         reserved); // TSK033 rebuild header TLVs
+  mac_key = DeriveHeaderMacKey(
+      std::span<const uint8_t, 32>(hybrid_key.data(), hybrid_key.size()), parsed.header.uuid,
+      parsed.header_version, parsed.epoch_value, "MIGRATE", "WRITE");
+  auto migration_mac_material = BuildHeaderMacMaterial(parsed.header, parsed.header_version, payload.tlv_types,
+                                                       std::span<const uint8_t>(payload.bytes.data(),
+                                                                                payload.bytes.size()));
   auto new_mac = qv::crypto::HMAC_SHA256::Compute(
       std::span<const uint8_t>(mac_key.data(), mac_key.size()),
-      std::span<const uint8_t>(payload.data(), payload.size()));
-  payload.insert(payload.end(), new_mac.begin(), new_mac.end());
+      std::span<const uint8_t>(migration_mac_material.data(), migration_mac_material.size()));
+  payload.bytes.insert(payload.bytes.end(), new_mac.begin(), new_mac.end());
 
-  auto payload_span =
-      std::span<const uint8_t>(payload.data(), payload.size()); // TSK074_Migration_Rollback_and_Backup reuse views
+  auto payload_span = std::span<const uint8_t>(payload.bytes.data(),
+                                               payload.bytes.size()); // TSK074_Migration_Rollback_and_Backup reuse views
 
   auto migration_temp = MakeMigrationTempPath(sanitized_container); // TSK140_Temporary_File_Security_Vulnerabilities staged header checkpoint
   std::error_code temp_ec;
@@ -2320,7 +2427,7 @@ VolumeManager::Migrate(const std::filesystem::path& container, uint32_t target_v
                       "Failed to read staged migration header"}; // TSK074_Migration_Rollback_and_Backup
     }
   }
-  if (staged_blob != payload) {
+  if (staged_blob != payload.bytes) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
