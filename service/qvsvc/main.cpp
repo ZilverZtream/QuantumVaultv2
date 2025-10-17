@@ -22,6 +22,33 @@ static const wchar_t kRecoveryKeyPath[] = L"C:\\ProgramData\\QuantumVault\\recov
 
 #define QV_EFI_VARIABLE_BOOTSERVICE_ACCESS 0x00000002
 
+static BOOL QvEnableFirmwareVariablePrivilege()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return FALSE;
+    }
+
+    TOKEN_PRIVILEGES privileges = {};
+    LUID luid = {};
+    BOOL result = FALSE;
+
+    if (LookupPrivilegeValueW(nullptr, SE_SYSTEM_ENVIRONMENT_NAME, &luid)) {
+        privileges.PrivilegeCount = 1;
+        privileges.Privileges[0].Luid = luid;
+        privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        BOOL adjusted = AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
+        DWORD error = GetLastError();
+        if (adjusted && error == ERROR_SUCCESS) {
+            result = TRUE;
+        }
+    }
+
+    CloseHandle(token);
+    return result;
+}
+
 static VOID WINAPI QvServiceMain(DWORD argc, LPWSTR *argv);
 static DWORD WINAPI QvServiceCtrlHandlerEx(DWORD control, DWORD eventType, LPVOID eventData, LPVOID context);
 static DWORD WINAPI QvServiceWorker(LPVOID context);
@@ -129,7 +156,7 @@ static VOID QvHandlePowerEvent(DWORD eventType)
     case PBT_APMRESUMEAUTOMATIC:
     {
         QVDISK_SESSION_KEY session = {};
-        if (QvLoadFirmwareSessionKey(session)) {
+        if (QvEnableFirmwareVariablePrivilege() && QvLoadFirmwareSessionKey(session)) {
             QvSendDiskSessionKey(g_DeviceHandle, session, FALSE);
             QvClearFirmwareSessionKey();
         }
@@ -230,7 +257,7 @@ static DWORD WINAPI QvServiceWorker(LPVOID context)
 
     if (g_UsingDiskDriver) {
         QVDISK_SESSION_KEY session = {};
-        if (QvLoadFirmwareSessionKey(session)) {
+        if (QvEnableFirmwareVariablePrivilege() && QvLoadFirmwareSessionKey(session)) {
             QvSendDiskSessionKey(device, session, FALSE);
             QvClearFirmwareSessionKey();
         }
