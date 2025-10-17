@@ -68,7 +68,7 @@ void RegisterPlatformSealedKeyProviders(qv::orchestrator::SealedKeyRegistry& reg
 
 }  // namespace qv::platform
 
-#else
+#elif !defined(__APPLE__)
 
 namespace qv::platform {
 
