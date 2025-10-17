@@ -29,9 +29,38 @@ namespace qv::security {
   namespace {
 
     inline void PortableZero(std::span<uint8_t> data) noexcept { // TSK006
-      volatile uint8_t* ptr = reinterpret_cast<volatile uint8_t*>(data.data());
-      for (std::size_t i = 0; i < data.size(); ++i) {
-        ptr[i] = 0;
+      if (data.empty()) { // TSK300
+        return;
+      }
+
+#if defined(_WIN32)
+      ::SecureZeroMemory(data.data(), static_cast<SIZE_T>(data.size())); // TSK300
+      std::atomic_thread_fence(std::memory_order_seq_cst);               // TSK300
+      volatile uint8_t verification = 0;                                  // TSK300
+      const volatile uint8_t* verify_ptr =                                // TSK300
+          reinterpret_cast<const volatile uint8_t*>(data.data());        // TSK300
+      for (std::size_t i = 0; i < data.size(); ++i) {                     // TSK300
+        verification |= verify_ptr[i];                                    // TSK300
+      }
+#else
+      volatile uint8_t* ptr = reinterpret_cast<volatile uint8_t*>(data.data()); // TSK006
+      for (std::size_t i = 0; i < data.size(); ++i) {                             // TSK006
+        ptr[i] = 0;                                                              // TSK006
+      }
+#if defined(__GNUC__) || defined(__clang__)
+      __asm__ __volatile__("" ::: "memory"); // TSK300
+#endif
+      std::atomic_thread_fence(std::memory_order_seq_cst); // TSK300
+      volatile uint8_t verification = 0;                    // TSK300
+      const volatile uint8_t* verify_ptr =                  // TSK300
+          reinterpret_cast<const volatile uint8_t*>(data.data()); // TSK300
+      for (std::size_t i = 0; i < data.size(); ++i) {              // TSK300
+        verification |= verify_ptr[i];                             // TSK300
+      }
+#endif
+
+      if (verification != 0) {                                                  // TSK300
+        std::clog << "SecureBuffer warning: zeroization verification failed.\n"; // TSK300
       }
     }
 
