@@ -40,26 +40,55 @@ bool VerifyHiddenVolumeDescriptor(
     const HiddenVolumeDescriptor& descriptor,
     std::span<const uint8_t, qv::crypto::AES256_GCM::KEY_SIZE> key,
     uint32_t expected_epoch,
-    std::span<const uint8_t, 16> container_uuid) {
+    uint64_t expected_sequence,
+    uint64_t now_seconds,
+    uint64_t max_age_seconds,
+    std::span<const uint8_t, 16> container_uuid,
+    std::span<const uint8_t, 16> expected_binding) {
   if (descriptor.length == 0) {
     return false;
   }
   if (!container_uuid.data()) {
     return false;
   }
+  if (!expected_binding.data()) {
+    return false;
+  }
   if (descriptor.epoch != expected_epoch) {
     return false;
   }
+  if (descriptor.sequence_number != expected_sequence) {
+    return false;
+  }
+  if (max_age_seconds == 0) {
+    return false;
+  }
+  if (descriptor.created_timestamp > now_seconds) {
+    return false;
+  }
+  if (now_seconds - descriptor.created_timestamp > max_age_seconds) {
+    return false;
+  }
+  if (!std::equal(descriptor.system_binding.begin(), descriptor.system_binding.end(), expected_binding.begin(),
+                  expected_binding.end())) {
+    return false;
+  }
 
-  std::array<uint8_t, sizeof(uint64_t) * 2 + sizeof(uint32_t) + container_uuid.size()> aad{};
+  std::array<uint8_t, sizeof(uint64_t) * 4 + sizeof(uint32_t) + container_uuid.size() + expected_binding.size()> aad{};
   uint64_t start_le = qv::ToLittleEndian64(descriptor.start_offset);
   uint64_t length_le = qv::ToLittleEndian64(descriptor.length);
   uint32_t epoch_le = qv::ToLittleEndian(descriptor.epoch);
+  uint64_t seq_le = qv::ToLittleEndian64(descriptor.sequence_number);
+  uint64_t ts_le = qv::ToLittleEndian64(descriptor.created_timestamp);
   std::memcpy(aad.data(), &start_le, sizeof(start_le));
   std::memcpy(aad.data() + sizeof(start_le), &length_le, sizeof(length_le));
   std::memcpy(aad.data() + sizeof(start_le) + sizeof(length_le), &epoch_le, sizeof(epoch_le));
-  std::memcpy(aad.data() + sizeof(start_le) + sizeof(length_le) + sizeof(epoch_le), container_uuid.data(),
-              container_uuid.size());
+  std::memcpy(aad.data() + sizeof(start_le) + sizeof(length_le) + sizeof(epoch_le), &seq_le, sizeof(seq_le));
+  std::memcpy(aad.data() + sizeof(start_le) + sizeof(length_le) + sizeof(epoch_le) + sizeof(seq_le), &ts_le,
+              sizeof(ts_le));
+  const size_t binding_offset = sizeof(start_le) + sizeof(length_le) + sizeof(epoch_le) + sizeof(seq_le) + sizeof(ts_le);
+  std::memcpy(aad.data() + binding_offset, expected_binding.data(), expected_binding.size());
+  std::memcpy(aad.data() + binding_offset + expected_binding.size(), container_uuid.data(), container_uuid.size());
 
   try {
     auto nonce = descriptor.nonce;
