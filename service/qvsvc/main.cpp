@@ -16,12 +16,8 @@ static BOOL g_UsingDiskDriver = FALSE;
 
 static const wchar_t kFilterDevicePath[] = L"\\\\.\\QvFlt";
 static const wchar_t kDiskDevicePath[] = L"\\\\.\\QvDisk";
-static const wchar_t kFirmwareVariableName[] = L"QVKey";
-static const wchar_t kFirmwareVariableGuid[] = L"{d16a4c54-0f07-4a28-9a5e-5de41a3b928c}";
 // TSK_CRIT_20: Default path - configurable via registry HKLM\Software\QuantumVault\RecoveryKeyPath
 static const wchar_t kDefaultRecoveryKeyPath[] = L"C:\\ProgramData\\QuantumVault\\recovery.qvkey";
-
-#define QV_EFI_VARIABLE_BOOTSERVICE_ACCESS 0x00000002
 
 static VOID WINAPI QvServiceMain(DWORD argc, LPWSTR *argv);
 static DWORD WINAPI QvServiceCtrlHandlerEx(DWORD control, DWORD eventType, LPVOID eventData, LPVOID context);
@@ -45,35 +41,11 @@ static VOID QvSecureZero(void *buffer, size_t length)
     }
 }
 
-static BOOL QvSendDiskSessionKey(HANDLE device, const QVDISK_SESSION_KEY &session, BOOL usingRecovery)
+// TSK_CRIT_05: user-mode never manipulates the disk session key bytes
+static BOOL QvRequestDiskFirmwareKey(HANDLE device)
 {
-    QVDISK_IMPORT_SESSION_KEY_REQUEST request = {};
-    request.sessionKey = session;
-    if (usingRecovery) {
-        request.sessionKey.flags |= QVDISK_IMPORT_FLAG_RECOVERY_KEY;
-    }
-    request.nonce = GetTickCount();
-
     DWORD bytesReturned = 0;
-    BOOL result = DeviceIoControl(device, IOCTL_QVDISK_IMPORT_SESSION_KEY, &request, sizeof(request), nullptr, 0, &bytesReturned, nullptr);
-    QvSecureZero(&request, sizeof(request));
-    return result;
-}
-
-static BOOL QvClearFirmwareSessionKey()
-{
-    return SetFirmwareEnvironmentVariableExW(kFirmwareVariableName, kFirmwareVariableGuid, nullptr, 0, QV_EFI_VARIABLE_BOOTSERVICE_ACCESS);
-}
-
-static BOOL QvLoadFirmwareSessionKey(QVDISK_SESSION_KEY &session)
-{
-    DWORD attributes = 0;
-    DWORD bytesRead = GetFirmwareEnvironmentVariableExW(kFirmwareVariableName, kFirmwareVariableGuid, &session, sizeof(session), &attributes);
-    if (bytesRead != sizeof(session)) {
-        QvSecureZero(&session, sizeof(session));
-        return FALSE;
-    }
-    return TRUE;
+    return DeviceIoControl(device, IOCTL_QVDISK_IMPORT_SESSION_KEY, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
 }
 
 // TSK_CRIT_20: Query configurable recovery key path from registry
@@ -152,15 +124,8 @@ static VOID QvHandlePowerEvent(DWORD eventType)
         DeviceIoControl(g_DeviceHandle, IOCTL_QVDISK_LOCK, nullptr, 0, nullptr, 0, nullptr, nullptr);
         break;
     case PBT_APMRESUMEAUTOMATIC:
-    {
-        QVDISK_SESSION_KEY session = {};
-        if (QvLoadFirmwareSessionKey(session)) {
-            QvSendDiskSessionKey(g_DeviceHandle, session, FALSE);
-            QvClearFirmwareSessionKey();
-        }
-        QvSecureZero(&session, sizeof(session));
+        QvRequestDiskFirmwareKey(g_DeviceHandle);
         break;
-    }
     default:
         break;
     }
@@ -254,13 +219,8 @@ static DWORD WINAPI QvServiceWorker(LPVOID context)
     g_DeviceHandle = device;
 
     if (g_UsingDiskDriver) {
-        QVDISK_SESSION_KEY session = {};
-        if (QvLoadFirmwareSessionKey(session)) {
-            QvSendDiskSessionKey(device, session, FALSE);
-            QvClearFirmwareSessionKey();
-        }
+        QvRequestDiskFirmwareKey(device);
         QvEnrollRecoveryKey(device);
-        QvSecureZero(&session, sizeof(session));
     } else {
         QVFLT_KEY_REQUEST keyRequest = {};
         keyRequest.algorithm = QVFLT_ALGO_AES_XTS_256;

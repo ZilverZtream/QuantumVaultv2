@@ -34,6 +34,12 @@
 #define QVDISK_IMPORT_FLAG_NONE         0x00000000u
 #define QVDISK_IMPORT_FLAG_RECOVERY_KEY 0x00000001u
 
+// TSK_CRIT_05: Firmware-backed session key handoff metadata
+#define QVDISK_FIRMWARE_VARIABLE_NAME        L"QVKey"
+#define QVDISK_FIRMWARE_VARIABLE_ATTRIBUTES  0x00000002u
+#define QVDISK_FIRMWARE_VARIABLE_GUID                                          \
+    { 0xd16a4c54, 0x0f07, 0x4a28, { 0x9a, 0x5e, 0x5d, 0xe4, 0x1a, 0x3b, 0x92, 0x8c } }
+
 #define IOCTL_QVDISK_IMPORT_SESSION_KEY CTL_CODE(FILE_DEVICE_DISK, 0x900, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define IOCTL_QVDISK_LOCK               CTL_CODE(FILE_DEVICE_DISK, 0x901, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define IOCTL_QVDISK_STATUS             CTL_CODE(FILE_DEVICE_DISK, 0x902, METHOD_BUFFERED, FILE_READ_ACCESS)
@@ -45,12 +51,6 @@ typedef struct _QVDISK_SESSION_KEY {
     uint32_t algorithm; /* AES-XTS-512 default */
     uint32_t flags;
 } QVDISK_SESSION_KEY;
-
-typedef struct _QVDISK_IMPORT_SESSION_KEY_REQUEST {
-    QVDISK_SESSION_KEY sessionKey;
-    uint32_t nonce;
-    uint32_t reserved;
-} QVDISK_IMPORT_SESSION_KEY_REQUEST;
 
 typedef struct _QVDISK_STATUS_RESPONSE {
     uint8_t keyLoaded;

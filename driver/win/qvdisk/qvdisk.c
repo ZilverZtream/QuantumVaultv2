@@ -12,11 +12,14 @@ DRIVER_UNLOAD QvDiskUnload;
 static NTSTATUS QvDiskCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp);
 static NTSTATUS QvDiskDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp);
 static VOID     QvDiskZeroSessionKey(_Out_ QVDISK_SESSION_KEY *Key);
+static NTSTATUS QvDiskLoadFirmwareSessionKey(VOID);
+static VOID     QvDiskClearFirmwareSessionKey(VOID);
 
 static QVDISK_SESSION_KEY g_QvDiskActiveKey = { 0 };
 static QVDISK_RECOVERY_KEY_BLOB g_QvDiskRecoveryKey = { 0 };
 static BOOLEAN g_QvDiskKeyLoaded = FALSE;
 static BOOLEAN g_QvDiskUsingRecovery = FALSE;
+static const GUID g_QvDiskFirmwareVariableGuid = QVDISK_FIRMWARE_VARIABLE_GUID;
 
 static VOID
 QvDiskZeroSessionKey(
@@ -51,24 +54,52 @@ QvDiskCreateClose(
     return QvDiskCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
-static NTSTATUS
-QvDiskImportKey(
-    _In_reads_bytes_(InputLength) PVOID InputBuffer,
-    _In_ ULONG InputLength
+static VOID
+QvDiskClearFirmwareSessionKey(
+    VOID
     )
 {
-    if (InputBuffer == NULL || InputLength < sizeof(QVDISK_IMPORT_SESSION_KEY_REQUEST)) {
-        return STATUS_BUFFER_TOO_SMALL;
+    UNICODE_STRING variableName = RTL_CONSTANT_STRING(QVDISK_FIRMWARE_VARIABLE_NAME);
+    NTSTATUS status = ZwSetSystemEnvironmentValueEx(
+        &variableName,
+        (LPGUID)&g_QvDiskFirmwareVariableGuid,
+        NULL,
+        0,
+        QVDISK_FIRMWARE_VARIABLE_ATTRIBUTES);
+    UNREFERENCED_PARAMETER(status);
+}
+
+static NTSTATUS
+QvDiskLoadFirmwareSessionKey(
+    VOID
+    )
+{
+    UNICODE_STRING variableName = RTL_CONSTANT_STRING(QVDISK_FIRMWARE_VARIABLE_NAME);
+    ULONG attributes = 0;
+    ULONG valueLength = sizeof(g_QvDiskActiveKey);
+
+    QvDiskZeroSessionKey(&g_QvDiskActiveKey);
+
+    // TSK_CRIT_05: Pull the boot key directly from firmware storage
+    NTSTATUS status = ZwQuerySystemEnvironmentValueEx(
+        &variableName,
+        (LPGUID)&g_QvDiskFirmwareVariableGuid,
+        &g_QvDiskActiveKey,
+        &valueLength,
+        &attributes);
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
 
-    const QVDISK_IMPORT_SESSION_KEY_REQUEST *request = (const QVDISK_IMPORT_SESSION_KEY_REQUEST *)InputBuffer;
-    RtlCopyMemory(&g_QvDiskActiveKey, &request->sessionKey, sizeof(g_QvDiskActiveKey));
+    if (valueLength != sizeof(g_QvDiskActiveKey)) {
+        QvDiskZeroSessionKey(&g_QvDiskActiveKey);
+        return STATUS_INVALID_BUFFER_SIZE;
+    }
+
     g_QvDiskKeyLoaded = TRUE;
-    g_QvDiskUsingRecovery = ((request->sessionKey.flags & QVDISK_IMPORT_FLAG_RECOVERY_KEY) != 0);
+    g_QvDiskUsingRecovery = ((g_QvDiskActiveKey.flags & QVDISK_IMPORT_FLAG_RECOVERY_KEY) != 0);
 
-    // TSK_CRIT_12: Zero out the input buffer to prevent key exposure via kernel memory disclosure
-    RtlSecureZeroMemory(InputBuffer, InputLength);
-
+    QvDiskClearFirmwareSessionKey();
     return STATUS_SUCCESS;
 }
 
@@ -118,6 +149,7 @@ QvDiskLock()
     g_QvDiskUsingRecovery = FALSE;
     QvDiskZeroSessionKey(&g_QvDiskActiveKey);
     RtlSecureZeroMemory(&g_QvDiskRecoveryKey, sizeof(g_QvDiskRecoveryKey));
+    QvDiskClearFirmwareSessionKey();
 }
 
 static NTSTATUS
@@ -135,7 +167,11 @@ QvDiskDeviceControl(
 
     switch (code) {
     case IOCTL_QVDISK_IMPORT_SESSION_KEY:
-        status = QvDiskImportKey(Irp->AssociatedIrp.SystemBuffer, stack->Parameters.DeviceIoControl.InputBufferLength);
+        if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = QvDiskLoadFirmwareSessionKey();
         break;
     case IOCTL_QVDISK_LOCK:
         QvDiskLock();
@@ -197,6 +233,13 @@ DriverEntry(
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = QvDiskCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = QvDiskDeviceControl;
     DriverObject->DriverUnload = QvDiskUnload;
+
+    NTSTATUS keyStatus = QvDiskLoadFirmwareSessionKey();
+    if (!NT_SUCCESS(keyStatus)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "QvDisk: // TSK_CRIT_05 failed to load firmware session key (0x%08X)\n",
+            keyStatus);
+    }
 
     return STATUS_SUCCESS;
 }
