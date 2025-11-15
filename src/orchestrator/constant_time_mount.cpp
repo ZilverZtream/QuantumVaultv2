@@ -1590,7 +1590,9 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
   std::array<uint8_t, 32> output{};
   std::span<const uint8_t> password_span(pass_bytes.data(), pass_bytes.size());
   const auto kdf_start = std::chrono::steady_clock::now();            // TSK102_Timing_Side_Channels
-  bool used_argon2 = false;                                          // TSK102_Timing_Side_Channels
+  const uint32_t target_ms =                                         // TSK102_Timing_Side_Channels
+      (parsed.have_argon2 && parsed.argon2.target_ms != 0) ? parsed.argon2.target_ms : 150u;
+  const auto target_duration = std::chrono::milliseconds(target_ms); // TSK102_Timing_Side_Channels
 
   if (parsed.algorithm == PasswordKdf::kArgon2id) { // TSK036_PBKDF2_Argon2_Migration_Path
 #if defined(QV_HAVE_ARGON2) && QV_HAVE_ARGON2
@@ -1606,7 +1608,6 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
       throw qv::Error{qv::ErrorDomain::Crypto, rc,
                       std::string(qv::errors::msg::kArgon2DerivationFailed)};
     }
-    used_argon2 = true; // TSK102_Timing_Side_Channels
 #else
     throw qv::Error{qv::ErrorDomain::Dependency, 0,
                     std::string(qv::errors::msg::kArgon2Unavailable)};
@@ -1618,19 +1619,11 @@ std::array<uint8_t, 32> DerivePasswordKey(const std::string& password,
         parsed.pbkdf_iterations);
     output = derived;
   }
-  auto elapsed = std::chrono::steady_clock::now() - kdf_start; // TSK102_Timing_Side_Channels
-  if (!used_argon2) {                                          // TSK102_Timing_Side_Channels
-    uint32_t target_ms = parsed.have_argon2 && parsed.argon2.target_ms != 0
-                             ? parsed.argon2.target_ms
-                             : 150u;
-    auto target = std::chrono::milliseconds(target_ms);
-    if (elapsed < target) {
-      ConstantTimeDelay(target - elapsed); // TSK102_Timing_Side_Channels align PBKDF2 timing
-    } else {
-      std::atomic_signal_fence(std::memory_order_seq_cst); // TSK102_Timing_Side_Channels
-    }
+  const auto elapsed = std::chrono::steady_clock::now() - kdf_start; // TSK102_Timing_Side_Channels
+  if (elapsed < target_duration) {                                   // TSK102_Timing_Side_Channels
+    ConstantTimeDelay(target_duration - elapsed);                    // TSK102_Timing_Side_Channels
   } else {
-    std::atomic_signal_fence(std::memory_order_seq_cst); // TSK102_Timing_Side_Channels
+    std::atomic_signal_fence(std::memory_order_seq_cst);             // TSK102_Timing_Side_Channels
   }
   if (!pass_bytes.empty()) {
     qv::security::Zeroizer::Wipe(std::span<uint8_t>(pass_bytes.data(), pass_bytes.size()));
