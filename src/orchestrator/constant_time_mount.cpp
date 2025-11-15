@@ -1900,84 +1900,123 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     return std::nullopt;
   }
 
-  std::array<uint8_t, 32> classical_key{}; // TSK070
-  bool classical_ok = true;               // TSK070
-  try {
-    classical_key = DerivePasswordKey(password, parsed); // TSK070
-  } catch (const std::exception&) {                      // TSK070
-    classical_ok = false;                                 // TSK070
-  }
+  struct PasswordAttempt {                                           // TSK_CRIT_11
+    std::array<uint8_t, 32> key{};
+    bool success{false};
+  };
+
+  auto run_password_attempt = [&](const ParsedHeader& variant) {
+    PasswordAttempt attempt{};                                       // TSK_CRIT_11
+    try {
+      attempt.key = DerivePasswordKey(password, variant);            // TSK_CRIT_11
+      attempt.success = true;                                        // TSK_CRIT_11
+    } catch (const std::exception&) {
+      attempt.success = false;                                       // TSK_CRIT_11
+    }
+    return attempt;
+  };
+
+  auto pbkdf_variant = parsed;                                      // TSK_CRIT_11
+  pbkdf_variant.algorithm = PasswordKdf::kPbkdf2;                   // TSK_CRIT_11
+  auto argon2_variant = parsed;                                     // TSK_CRIT_11
+  argon2_variant.algorithm = PasswordKdf::kArgon2id;                // TSK_CRIT_11
+
+  auto pbkdf_attempt = run_password_attempt(pbkdf_variant);         // TSK_CRIT_11
+  auto argon2_attempt = run_password_attempt(argon2_variant);       // TSK_CRIT_11
 
   if (!check_deadline("password_kdf") || !check_resource("password_kdf")) {
     return std::nullopt;
   }
 
-  auto parsed_for_kdf = parsed;      // TSK038_Resource_Limits_and_DoS_Prevention
-  auto classical_key_copy = classical_key; // TSK038_Resource_Limits_and_DoS_Prevention
-  auto kdf_task = std::packaged_task<HybridKdfResult()>( // TSK038_Resource_Limits_and_DoS_Prevention
-      [parsed_for_kdf, classical_key_copy]() mutable {
-        HybridKdfResult result{};                                             // TSK070
-        std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(), parsed_for_kdf.hybrid_salt.size());
-        std::span<const uint8_t> epoch_span;                                  // TSK038_Resource_Limits_and_DoS_Prevention
-        if (parsed_for_kdf.have_epoch) {                                      // TSK038_Resource_Limits_and_DoS_Prevention
-          epoch_span = std::span<const uint8_t>(parsed_for_kdf.epoch_tlv_bytes.data(),
-                                                parsed_for_kdf.epoch_tlv_bytes.size());
-        }
-        try {
-          result.key = qv::core::PQCHybridKDF::Mount( // TSK038_Resource_Limits_and_DoS_Prevention
-              std::span<const uint8_t, 32>(classical_key_copy), parsed_for_kdf.pqc, hybrid_salt,
-              std::span<const uint8_t, 16>(parsed_for_kdf.header.uuid), parsed_for_kdf.version,
-              epoch_span);
-          result.success = true; // TSK070
-        } catch (const qv::AuthenticationFailureError&) {
-          result.success = false; // TSK070
-        } catch (const std::exception&) {
-          result.success = false; // TSK070
-        }
-        qv::security::Zeroizer::Wipe(
-            std::span<uint8_t>(classical_key_copy.data(), classical_key_copy.size())); // TSK038_Resource_Limits_and_DoS_Prevention
-        return result;                                                                      // TSK070
-      });
-  auto hybrid_future = HybridKdfExecutor::Instance().Submit(std::move(kdf_task));
+
+  auto submit_hybrid = [&](const std::array<uint8_t, 32>& classical_key) {
+    auto parsed_for_kdf = parsed;                                   // TSK_CRIT_11
+    auto classical_copy = classical_key;                            // TSK_CRIT_11
+    auto task = std::packaged_task<HybridKdfResult()>(              // TSK_CRIT_11
+        [parsed_for_kdf, classical_copy]() mutable {
+          HybridKdfResult result{};                                 // TSK_CRIT_11
+          std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(),
+                                               parsed_for_kdf.hybrid_salt.size());
+          std::span<const uint8_t> epoch_span;                      // TSK_CRIT_11
+          if (parsed_for_kdf.have_epoch) {                          // TSK_CRIT_11
+            epoch_span = std::span<const uint8_t>(parsed_for_kdf.epoch_tlv_bytes.data(),
+                                                  parsed_for_kdf.epoch_tlv_bytes.size());
+          }
+          try {
+            result.key = qv::core::PQCHybridKDF::Mount(             // TSK_CRIT_11
+                std::span<const uint8_t, 32>(classical_copy), parsed_for_kdf.pqc, hybrid_salt,
+                std::span<const uint8_t, 16>(parsed_for_kdf.header.uuid), parsed_for_kdf.version,
+                epoch_span);
+            result.success = true;                                  // TSK_CRIT_11
+          } catch (const qv::AuthenticationFailureError&) {
+            result.success = false;                                 // TSK_CRIT_11
+          } catch (const std::exception&) {
+            result.success = false;                                 // TSK_CRIT_11
+          }
+          qv::security::Zeroizer::Wipe(
+              std::span<uint8_t>(classical_copy.data(), classical_copy.size())); // TSK_CRIT_11
+          return result;                                            // TSK_CRIT_11
+        });
+    return HybridKdfExecutor::Instance().Submit(std::move(task));
+  };
+
+  auto pbkdf_future = submit_hybrid(pbkdf_attempt.key);             // TSK_CRIT_11
+  auto argon2_future = submit_hybrid(argon2_attempt.key);           // TSK_CRIT_11
 
   if (!check_resource("hybrid_kdf_launch")) {
     return std::nullopt;
   }
 
-  std::array<uint8_t, 32> hybrid_key{}; // TSK070
-  bool pqc_ok = false;                  // TSK070
-  auto status = hybrid_future.wait_until(attempt_deadline.Deadline()); // TSK236_Mount_Timeout_Bypass_Vulnerability
-  if (status == std::future_status::ready) {                           // TSK038_Resource_Limits_and_DoS_Prevention
-    auto hybrid_result = hybrid_future.get();                          // TSK070
-    hybrid_key = hybrid_result.key;                                    // TSK070
-    pqc_ok = hybrid_result.success;                                    // TSK070
-  } else {
-    pqc_ok = false;                                                    // TSK038_Resource_Limits_and_DoS_Prevention
-    PublishMountTimeoutEvent(container, attempt_deadline, "hybrid_kdf_wait");
-    qv::orchestrator::Event kdf_timeout{};                             // TSK038_Resource_Limits_and_DoS_Prevention
-    kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity; // TSK038_Resource_Limits_and_DoS_Prevention
-    kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning;  // TSK038_Resource_Limits_and_DoS_Prevention
-    kdf_timeout.event_id = "mount_key_timeout";                       // TSK080_Error_Info_Redaction_in_Release
-    kdf_timeout.message = std::string(qv::errors::msg::kKeyAgreementTimeout); // TSK080_Error_Info_Redaction_in_Release
-    kdf_timeout.fields.emplace_back("container_path", qv::PathToUtf8String(container),
-                                    qv::orchestrator::FieldPrivacy::kHash); // TSK038_Resource_Limits_and_DoS_Prevention, TSK103_Logging_and_Information_Disclosure
-    qv::orchestrator::EventBus::Instance().Publish(kdf_timeout);       // TSK038_Resource_Limits_and_DoS_Prevention
-    return std::nullopt;
-  }
+  auto await_hybrid = [&](std::future<HybridKdfResult>& future, std::string_view stage) {
+    HybridKdfResult result{};                                       // TSK_CRIT_11
+    auto status = future.wait_until(attempt_deadline.Deadline());   // TSK_CRIT_11
+    if (status == std::future_status::ready) {                      // TSK_CRIT_11
+      result = future.get();                                        // TSK_CRIT_11
+    } else {
+      PublishMountTimeoutEvent(container, attempt_deadline, stage); // TSK_CRIT_11
+      qv::orchestrator::Event kdf_timeout{};                        // TSK_CRIT_11
+      kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity;
+      kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning;
+      kdf_timeout.event_id = "mount_key_timeout";                   // TSK_CRIT_11
+      kdf_timeout.message = std::string(qv::errors::msg::kKeyAgreementTimeout);
+      kdf_timeout.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                      qv::orchestrator::FieldPrivacy::kHash);
+      qv::orchestrator::EventBus::Instance().Publish(kdf_timeout);  // TSK_CRIT_11
+    }
+    return result;                                                  // TSK_CRIT_11
+  };
+
+  auto pbkdf_hybrid = await_hybrid(pbkdf_future, "hybrid_kdf_wait_pbkdf2");   // TSK_CRIT_11
+  auto argon2_hybrid = await_hybrid(argon2_future, "hybrid_kdf_wait_argon2"); // TSK_CRIT_11
 
   if (!check_deadline("hybrid_kdf_result") || !check_resource("hybrid_kdf_result")) {
     return std::nullopt;
   }
 
-  auto mac_key = DeriveHeaderMacKey(hybrid_key, parsed);
-  auto computed_mac = qv::crypto::HMAC_SHA256::Compute(
-      std::span<const uint8_t>(mac_key.data(), mac_key.size()),
+  auto mac_key_pbkdf = DeriveHeaderMacKey(pbkdf_hybrid.key, parsed);   // TSK_CRIT_11
+  auto mac_key_argon2 = DeriveHeaderMacKey(argon2_hybrid.key, parsed); // TSK_CRIT_11
+  auto mac_pbkdf = qv::crypto::HMAC_SHA256::Compute(
+      std::span<const uint8_t>(mac_key_pbkdf.data(), mac_key_pbkdf.size()),
       std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
-  bool mac_ok = qv::crypto::ct::CompareEqual(stored_mac, computed_mac);
+  auto mac_argon2 = qv::crypto::HMAC_SHA256::Compute(
+      std::span<const uint8_t>(mac_key_argon2.data(), mac_key_argon2.size()),
+      std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
+  bool mac_ok_pbkdf = qv::crypto::ct::CompareEqual(stored_mac, mac_pbkdf);       // TSK_CRIT_11
+  bool mac_ok_argon2 = qv::crypto::ct::CompareEqual(stored_mac, mac_argon2);     // TSK_CRIT_11
 
   if (!check_deadline("mac_verify") || !check_resource("mac_verify")) {
     return std::nullopt;
   }
+
+
+  auto variant_mask = [](bool prefer_variant, bool condition) -> uint32_t { // TSK_CRIT_11
+    uint32_t prefer_mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, prefer_variant);
+    uint32_t condition_mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, condition);
+    return prefer_mask & condition_mask;
+  };
+
+  bool prefer_pbkdf = parsed.algorithm == PasswordKdf::kPbkdf2;      // TSK_CRIT_11
+  bool prefer_argon2 = parsed.algorithm == PasswordKdf::kArgon2id;   // TSK_CRIT_11
 
   uint32_t integrity_mask = 1u; // TSK102_Timing_Side_Channels
   integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, size_known);
@@ -1985,18 +2024,32 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, header_sized);
   integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, io_ok);
   integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, parsed.valid);
-  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, classical_ok);
-  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, pqc_ok);
-  integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, mac_ok);
+  uint32_t algorithm_mask = variant_mask(prefer_pbkdf, true) | variant_mask(prefer_argon2, true);
+  uint32_t classical_mask = variant_mask(prefer_pbkdf, pbkdf_attempt.success) |
+                            variant_mask(prefer_argon2, argon2_attempt.success);
+  uint32_t pqc_mask = variant_mask(prefer_pbkdf, pbkdf_hybrid.success) |
+                      variant_mask(prefer_argon2, argon2_hybrid.success);
+  uint32_t mac_mask = variant_mask(prefer_pbkdf, mac_ok_pbkdf) |
+                      variant_mask(prefer_argon2, mac_ok_argon2);
+  integrity_mask &= algorithm_mask;
+  integrity_mask &= classical_mask;
+  integrity_mask &= pqc_mask;
+  integrity_mask &= mac_mask;
   bool result = integrity_mask != 0u;                                             // TSK102_Timing_Side_Channels
   uint32_t mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, result);              // TSK022, TSK070
   std::atomic_signal_fence(std::memory_order_seq_cst);                   // TSK022
   volatile uint32_t guard_mask = mask;                                   // TSK022
   (void)guard_mask;                                                      // TSK022
 
-  qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_key.data(), classical_key.size()));
-  qv::security::Zeroizer::Wipe(std::span<uint8_t>(hybrid_key.data(), hybrid_key.size()));
-  qv::security::Zeroizer::Wipe(std::span<uint8_t>(mac_key.data(), mac_key.size()));
+  auto wipe_array = [](auto& arr) {                                     // TSK_CRIT_11
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(arr.data(), arr.size()));
+  };
+  wipe_array(pbkdf_attempt.key);
+  wipe_array(argon2_attempt.key);
+  wipe_array(pbkdf_hybrid.key);
+  wipe_array(argon2_hybrid.key);
+  wipe_array(mac_key_pbkdf);
+  wipe_array(mac_key_argon2);
 
   if (!check_deadline("finalize") || !check_resource("finalize")) {
     return std::nullopt;
