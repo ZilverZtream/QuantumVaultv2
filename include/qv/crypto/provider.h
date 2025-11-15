@@ -19,12 +19,17 @@ public:
       std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
       std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) = 0;
 
-  virtual std::vector<uint8_t> DecryptAES256GCM(
+  // TSK802_Insecure_Crypto_Interface_Flaw: Decrypt directly into destination buffer
+  // to avoid plaintext exposure in pageable std::vector memory.
+  // Returns the actual size of decrypted data written to destination.
+  // Throws AuthenticationFailureError on tag mismatch.
+  virtual size_t DecryptAES256GCM(
       std::span<const uint8_t> ciphertext,
       std::span<const uint8_t> aad,
       std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
       std::span<const uint8_t, AES256_GCM::TAG_SIZE> tag,
-      std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) = 0;
+      std::span<const uint8_t, AES256_GCM::KEY_SIZE> key,
+      std::span<uint8_t> destination) = 0;
 
   virtual std::array<uint8_t, 32> HMACSHA256(
       std::span<const uint8_t> key,
@@ -42,12 +47,13 @@ public:
       std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
       std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) override;
 
-  std::vector<uint8_t> DecryptAES256GCM(
+  size_t DecryptAES256GCM(
       std::span<const uint8_t> ciphertext,
       std::span<const uint8_t> aad,
       std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
       std::span<const uint8_t, AES256_GCM::TAG_SIZE> tag,
-      std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) override;
+      std::span<const uint8_t, AES256_GCM::KEY_SIZE> key,
+      std::span<uint8_t> destination) override;
 
   std::array<uint8_t, 32> HMACSHA256(
       std::span<const uint8_t> key,

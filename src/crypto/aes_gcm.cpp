@@ -23,10 +23,16 @@ std::vector<uint8_t> AES256_GCM_Decrypt(
     std::span<const uint8_t, AES256_GCM::TAG_SIZE> tag,
     std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) {
   auto provider = GetCryptoProviderShared();
-  return provider->DecryptAES256GCM(ciphertext, aad, nonce, tag, key);
+  std::vector<uint8_t> plaintext(ciphertext.size());
+  size_t decrypted_size = provider->DecryptAES256GCM(ciphertext, aad, nonce, tag, key,
+                                                      std::span<uint8_t>(plaintext.data(), plaintext.size()));
+  plaintext.resize(decrypted_size);
+  return plaintext;
 }
 
 // TSK_CRIT_03: Secure decrypt directly into locked, non-pageable memory
+// TSK802_Insecure_Crypto_Interface_Flaw: Now decrypts directly into SecureBuffer
+// without intermediate pageable std::vector, eliminating plaintext exposure window
 void AES256_GCM_Decrypt_Secure(
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> aad,
@@ -34,19 +40,16 @@ void AES256_GCM_Decrypt_Secure(
     std::span<const uint8_t, AES256_GCM::TAG_SIZE> tag,
     std::span<const uint8_t, AES256_GCM::KEY_SIZE> key,
     qv::security::SecureBuffer<uint8_t>& dest_buffer) {
-  // Decrypt via provider (unfortunately still returns std::vector)
+  // Decrypt directly into the SecureBuffer - no intermediate pageable memory!
   auto provider = GetCryptoProviderShared();
-  std::vector<uint8_t> plaintext = provider->DecryptAES256GCM(ciphertext, aad, nonce, tag, key);
+  size_t decrypted_size = provider->DecryptAES256GCM(ciphertext, aad, nonce, tag, key,
+                                                      std::span<uint8_t>(dest_buffer.data(), dest_buffer.size()));
 
-  // Immediately transfer to SecureBuffer and wipe the temporary vector
-  if (plaintext.size() != dest_buffer.size()) {
-    qv::security::Zeroizer::WipeVector(plaintext);
+  // Verify the decrypted size matches expected buffer size
+  if (decrypted_size != dest_buffer.size()) {
     throw qv::Error{qv::ErrorDomain::Validation, -1,
                     "Decrypted size mismatch in secure decrypt"};
   }
-
-  std::memcpy(dest_buffer.data(), plaintext.data(), plaintext.size());
-  qv::security::Zeroizer::WipeVector(plaintext);
 }
 
 } // namespace qv::crypto

@@ -250,14 +250,16 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
       ThrowCryptoError("AES-GCM KAT tag mismatch"); // TSK123_Missing_Constant_Time_Comparisons
     }
 
-    const auto dec = provider.DecryptAES256GCM(
+    std::vector<uint8_t> dec_plaintext(tv.ciphertext.size());
+    size_t dec_size = provider.DecryptAES256GCM(
         std::span<const uint8_t>(tv.ciphertext.data(), tv.ciphertext.size()),
         std::span<const uint8_t>(tv.aad.data(), tv.aad.size()),
         std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(tv.nonce),
         std::span<const uint8_t, AES256_GCM::TAG_SIZE>(tv.tag),
-        std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key));
+        std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key),
+        std::span<uint8_t>(dec_plaintext.data(), dec_plaintext.size()));
 
-    auto plaintext_span = std::span<const uint8_t>(dec.data(), dec.size());
+    auto plaintext_span = std::span<const uint8_t>(dec_plaintext.data(), dec_size);
     auto expected_plaintext_span =
         std::span<const uint8_t>(tv.plaintext.data(), tv.plaintext.size());
     if (plaintext_span.size() != expected_plaintext_span.size()) {
@@ -274,12 +276,14 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
       auto tampered_ct = tv.ciphertext;
       tampered_ct.front() ^= 0x01;
       try {
+        std::vector<uint8_t> tampered_plaintext(tampered_ct.size());
         (void)provider.DecryptAES256GCM(
             std::span<const uint8_t>(tampered_ct.data(), tampered_ct.size()),
             std::span<const uint8_t>(tv.aad.data(), tv.aad.size()),
             std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(tv.nonce),
             std::span<const uint8_t, AES256_GCM::TAG_SIZE>(tv.tag),
-            std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key));
+            std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key),
+            std::span<uint8_t>(tampered_plaintext.data(), tampered_plaintext.size()));
         log_kat_failure("tampered ciphertext accepted");
         ThrowCryptoError("AES-GCM tamper (ciphertext) undetected");
       } catch (const qv::AuthenticationFailureError&) {
@@ -290,12 +294,14 @@ void RunAESGCMKnownAnswerTest() { // TSK072_CryptoProvider_Init_and_KAT AES-GCM 
     auto tampered_tag = tv.tag;
     tampered_tag.front() ^= 0x01;
     try {
+      std::vector<uint8_t> tampered_tag_plaintext(tv.ciphertext.size());
       (void)provider.DecryptAES256GCM(
           std::span<const uint8_t>(tv.ciphertext.data(), tv.ciphertext.size()),
           std::span<const uint8_t>(tv.aad.data(), tv.aad.size()),
           std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(tv.nonce),
           std::span<const uint8_t, AES256_GCM::TAG_SIZE>(tampered_tag),
-          std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key));
+          std::span<const uint8_t, AES256_GCM::KEY_SIZE>(tv.key),
+          std::span<uint8_t>(tampered_tag_plaintext.data(), tampered_tag_plaintext.size()));
       log_kat_failure("tampered tag accepted");
       ThrowCryptoError("AES-GCM tamper (tag) undetected");
     } catch (const qv::AuthenticationFailureError&) {
@@ -390,12 +396,20 @@ AES256_GCM::EncryptionResult OpenSSLCryptoProvider::EncryptAES256GCM(
   return result;
 }
 
-std::vector<uint8_t> OpenSSLCryptoProvider::DecryptAES256GCM(
+// TSK802_Insecure_Crypto_Interface_Flaw: Decrypt directly into destination to prevent
+// plaintext exposure in pageable memory
+size_t OpenSSLCryptoProvider::DecryptAES256GCM(
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> aad,
     std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
     std::span<const uint8_t, AES256_GCM::TAG_SIZE> tag,
-    std::span<const uint8_t, AES256_GCM::KEY_SIZE> key) {
+    std::span<const uint8_t, AES256_GCM::KEY_SIZE> key,
+    std::span<uint8_t> destination) {
+  // Ensure destination buffer is large enough
+  if (destination.size() < ciphertext.size()) {
+    ThrowCryptoError("Destination buffer too small for AES-GCM decryption");
+  }
+
   CipherCtxPtr ctx(EVP_CIPHER_CTX_new());
   if (!ctx) {
     ThrowCryptoError("Failed to allocate AES-GCM context");
@@ -420,10 +434,9 @@ std::vector<uint8_t> OpenSSLCryptoProvider::DecryptAES256GCM(
     }
   }
 
-  std::vector<uint8_t> plaintext(ciphertext.size());
   int total = 0;
   if (!ciphertext.empty()) {
-    if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &len, ciphertext.data(),
+    if (EVP_DecryptUpdate(ctx.get(), destination.data(), &len, ciphertext.data(),
                           static_cast<int>(ciphertext.size())) != 1) {
       ThrowCryptoError(BuildOpenSSLErrorMessage("EVP_DecryptUpdate ciphertext"));
     }
@@ -436,15 +449,14 @@ std::vector<uint8_t> OpenSSLCryptoProvider::DecryptAES256GCM(
   }
 
   int final_len = 0;
-  int ret = EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + total, &final_len);
+  int ret = EVP_DecryptFinal_ex(ctx.get(), destination.data() + total, &final_len);
   if (ret <= 0) {
     throw qv::AuthenticationFailureError(
         BuildOpenSSLErrorMessage("EVP_DecryptFinal_ex (authentication failed)"));
   }
   total += final_len;
-  plaintext.resize(static_cast<size_t>(total));
 
-  return plaintext;
+  return static_cast<size_t>(total);
 }
 
 std::array<uint8_t, 32> OpenSSLCryptoProvider::HMACSHA256(
