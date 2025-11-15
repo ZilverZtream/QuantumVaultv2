@@ -34,9 +34,11 @@ budget.
   classical material. When swapping stub crypto for real providers, the
   resulting implementation must encapsulate with ML-KEM-768 (or stronger) and
   retain the ciphertext bytes to guarantee deterministic decapsulation.
-- **Key derivation** – password-based keys are derived with PBKDF2-HMAC-SHA256
-  and a 128-bit salt. Increasing iteration counts is encouraged; do not reduce
-  below the default without documenting the rationale.
+- **Key derivation** – password-based keys are derived via PBKDF2-HMAC-SHA256 or
+  Argon2id depending on the negotiated header parameters, always with a 128-bit
+  salt. PBKDF2 profiles enforce timing padding to match Argon2 budgets, and
+  maintainers may increase iterations/memory cost but must document any
+  reduction from the defaults. <!-- TSK220 -->
 
 ## Reporting vulnerabilities
 

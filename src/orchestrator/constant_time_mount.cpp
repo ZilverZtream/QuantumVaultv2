@@ -1370,7 +1370,7 @@ constexpr size_t kSerializedHeaderBytes = sizeof(VolumeHeader) + kPasswordTlvByt
                                           sizeof(qv::core::PQC_KEM_TLV) + sizeof(ReservedV2Tlv); // TSK013
 constexpr size_t kTotalHeaderBytes = kSerializedHeaderBytes + kHeaderMacSize;       // TSK013
 
-enum class PasswordKdf { // TSK036_PBKDF2_Argon2_Migration_Path
+enum class PasswordKdf { // TSK036_PBKDF2_Argon2_Migration_Path, TSK220
   kPbkdf2,
   kArgon2id
 };

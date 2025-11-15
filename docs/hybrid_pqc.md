@@ -6,7 +6,9 @@ symmetric encryption to secure bulk storage.
 
 ## Key Hierarchy
 
-1. User secrets are strengthened through Argon2id to derive a 256-bit master key.
+1. User secrets are strengthened through Argon2id to derive a 256-bit master
+   key when the runtime has Argon2 support; PBKDF2-HMAC-SHA256 remains available
+   as a hardened fallback and enforces the same salt/length requirements. <!-- TSK220 -->
 2. The master key is wrapped using ML-KEM-768 to withstand quantum attacks.
 3. Per-purpose keys (data, metadata, index) are derived via HMAC-based KDFs.
 
