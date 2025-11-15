@@ -34,10 +34,14 @@ QvStoreSessionKey(
     UINTN KeySize
     )
 {
+    // Ensure the session key survives ExitBootServices so qvflt can retrieve it.
+    // TSK714B_System_Drive_Encryption_(PreBoot_Windows_First)_Stage2_PreBoot_FullDisk
+    UINT32 attributes = EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS;
+
     return SystemTable->RuntimeServices->SetVariable(
         (CHAR16 *)kQvFirmwareVariableName,
         (EFI_GUID *)&gEfiCallerIdGuid,
-        EFI_VARIABLE_BOOTSERVICE_ACCESS,
+        attributes,
         KeySize,
         (VOID *)KeyBuffer);
 }
