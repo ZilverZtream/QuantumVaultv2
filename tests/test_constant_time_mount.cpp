@@ -3,6 +3,7 @@
 #include "qv/core/pqc_hybrid_kdf.h"
 #include "qv/core/nonce.h"
 #include "qv/crypto/hmac_sha256.h"
+#include "qv/error.h" // TSK_CRIT_16 asynchronous rate limiting assertions
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <span>
@@ -203,20 +205,37 @@ int main() {
   using qv::orchestrator::ConstantTimeMount;
   const std::string password = "correct horse battery staple";
   auto temp_dir = std::filesystem::temp_directory_path();
-  auto container = temp_dir / "qv_ct_mount_test.vol";
+  auto success_container = temp_dir / "qv_ct_mount_success.vol";
+  auto wrong_container = temp_dir / "qv_ct_mount_wrong.vol";
+  auto tamper_container = temp_dir / "qv_ct_mount_tamper.vol";
+  auto rate_container = temp_dir / "qv_ct_mount_rate.vol";
+  auto missing_container = temp_dir / "qv_ct_mount_missing.vol";
 
-  WriteValidContainer(container, password);
+  WriteValidContainer(success_container, password);
+  WriteValidContainer(wrong_container, password);
+  WriteValidContainer(tamper_container, password);
+  WriteValidContainer(rate_container, password);
+  std::error_code missing_ec;
+  std::filesystem::remove(missing_container, missing_ec);
+
+  auto cleanup = [](const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    auto lock = path;
+    lock += ".locked";
+    std::filesystem::remove(lock, ec);
+  }; // TSK_CRIT_16 cleanup of per-test artifacts
 
   ConstantTimeMount ctm;
-  auto ok = ctm.Mount(container, password);
+  auto ok = ctm.Mount(success_container, password);
   (void)ok;
   assert(ok.has_value() && "expected mount to succeed with correct password");
 
-  auto wrong = ctm.Mount(container, "wrong password");
+  auto wrong = ctm.Mount(wrong_container, "wrong password");
   (void)wrong;
   assert(!wrong.has_value() && "mount should fail with incorrect password");
 
-  auto tampered = container;
+  auto tampered = tamper_container;
   {
     std::fstream f(tampered, std::ios::in | std::ios::out | std::ios::binary);
     auto pos = static_cast<std::streamoff>(kSerializedHeaderBytes / 2);
@@ -227,14 +246,33 @@ int main() {
     f.seekp(pos);
     f.write(&flip, 1);
   }
-  auto tamper_result = ctm.Mount(container, password);
+  auto tamper_result = ctm.Mount(tamper_container, password);
   (void)tamper_result;
   assert(!tamper_result.has_value() && "tampered container should not mount");
 
-  std::filesystem::remove(container);
-  auto missing = ctm.Mount(container, password);
+  bool rate_limited = false;
+  try {
+    auto first_wrong_rate = ctm.Mount(rate_container, "wrong password");
+    (void)first_wrong_rate;
+    assert(!first_wrong_rate.has_value() && "expected failure for incorrect password");
+    auto second_wrong_rate = ctm.Mount(rate_container, "wrong password");
+    (void)second_wrong_rate;
+  } catch (const qv::Error& err) {
+    rate_limited = (err.domain() == qv::ErrorDomain::Security &&
+                    err.code() == qv::errors::security::kAuthenticationRejected &&
+                    err.message() == qv::errors::msg::kMountRateLimited); // TSK_CRIT_16
+  }
+  assert(rate_limited && "repeated failures should trigger async rate limiting"); // TSK_CRIT_16
+
+  auto missing = ctm.Mount(missing_container, password);
   (void)missing;
   assert(!missing.has_value() && "missing container should fail to mount");
+
+  cleanup(success_container);
+  cleanup(wrong_container);
+  cleanup(tamper_container);
+  cleanup(rate_container);
+  cleanup(missing_container);
 
   std::cout << "constant-time mount tests ok\n";
   return 0;
