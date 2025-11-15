@@ -119,7 +119,9 @@ public:
       }
       locked_ = all_chunks_locked;
       if (!locked_) {
-        std::cerr << "SecureBuffer warning: unable to lock all sensitive memory chunks; data may page to disk.\n"; // TSK012, TSK031
+        Release();
+        throw std::runtime_error(
+            "SecureBuffer: unable to lock required sensitive memory chunks"); // TSK541_Weak_Error_Handling_SecureBuffer fail closed
       }
     }
   }
