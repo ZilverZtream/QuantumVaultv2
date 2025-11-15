@@ -638,8 +638,17 @@ public:
       return;
     }
 
-    const auto sleep_for = required_duration - elapsed;
-    std::this_thread::sleep_for(sleep_for);
+    const auto remaining_delay = required_duration - elapsed;
+    auto message = std::string(qv::errors::msg::kMountRateLimited);                // TSK_CRIT_16
+    const auto remaining_seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(remaining_delay).count();
+    if (remaining_seconds > 0) {
+      message.append(" Retry after ");
+      message.append(std::to_string(remaining_seconds));
+      message.append(" seconds.");
+    }
+    throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                    std::move(message)};                                          // TSK_CRIT_16
   }
 
   FailureState RecordAttempt(const std::filesystem::path& container,

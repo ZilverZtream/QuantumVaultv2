@@ -40,6 +40,7 @@ inline constexpr std::string_view kVolumeLocked{"Volume locked due to repeated a
 inline constexpr std::string_view kPersistLockFileFailed{"Failed to persist lock file for protected volume"};
 inline constexpr std::string_view kMountAuthFailed{"Volume mount authentication failed"};
 inline constexpr std::string_view kMountLockedMessage{"Volume locked after repeated authentication failures"};
+inline constexpr std::string_view kMountRateLimited{"Mount attempts temporarily rate limited; try again later"}; // TSK_CRIT_16
 inline constexpr std::string_view kKeyAgreementTimeout{"Key agreement exceeded timeout"};
 inline constexpr std::string_view kMountAttemptTimeout{"Mount attempt exceeded time limit"};
 }  // namespace qv::errors::msg
