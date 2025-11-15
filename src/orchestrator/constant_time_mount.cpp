@@ -12,6 +12,7 @@
 #include <fstream>
 #include <semaphore> // TSK236_Mount_Timeout_Bypass_Vulnerability global concurrency guard
 #include <iostream>
+#include <cstdio>  // TSK901_Security_Hardening FILE handle bridging
 #include <limits>   // TSK099_Input_Validation_and_Sanitization checked casts
 #include <mutex>
 #include <optional> // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV tracking
@@ -24,6 +25,16 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdlib> // TSK099_Input_Validation_and_Sanitization container root policy
+#if defined(_WIN32)
+#include <winsock2.h> // TSK901_Security_Hardening kernel peer fingerprint
+#include <ws2tcpip.h> // TSK901_Security_Hardening peer IP decode
+#include <io.h>       // TSK901_Security_Hardening descriptor bridge
+#else
+#include <arpa/inet.h>   // TSK901_Security_Hardening peer IP decode
+#include <netinet/in.h>  // TSK901_Security_Hardening peer family
+#include <sys/socket.h>  // TSK901_Security_Hardening peer discovery
+#include <unistd.h>      // TSK901_Security_Hardening stdio file descriptors
+#endif
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -124,16 +135,97 @@ std::string HashClientIdentifier(std::string_view normalized) { // TSK136_Missin
   return HexEncode(std::span<const uint8_t>(mac.data(), mac.size()));
 }
 
-std::optional<std::string> ResolveClientFingerprint() { // TSK136_Missing_Rate_Limiting_Mount_Attempts
-  const char* env = std::getenv("QV_CLIENT_IP");
-  if (!env || !*env) {
+std::optional<std::string> FingerprintFromSockaddr(const sockaddr_storage& storage) { // TSK901_Security_Hardening
+  char buffer[INET6_ADDRSTRLEN] = {};
+  std::string literal;
+  if (storage.ss_family == AF_INET) {
+    auto addr4 = reinterpret_cast<const sockaddr_in*>(&storage);
+    if (::inet_ntop(AF_INET, &addr4->sin_addr, buffer, sizeof(buffer)) == nullptr) {
+      return std::nullopt;
+    }
+    literal.assign(buffer);
+  } else if (storage.ss_family == AF_INET6) {
+    auto addr6 = reinterpret_cast<const sockaddr_in6*>(&storage);
+    if (::inet_ntop(AF_INET6, &addr6->sin6_addr, buffer, sizeof(buffer)) == nullptr) {
+      return std::nullopt;
+    }
+    literal.push_back('[');
+    literal.append(buffer);
+    if (addr6->sin6_scope_id != 0) {
+      literal.push_back('%');
+      literal.append(std::to_string(addr6->sin6_scope_id));
+    }
+    literal.push_back(']');
+  } else {
     return std::nullopt;
   }
-  auto normalized = NormalizeClientIp(env);
+  auto normalized = NormalizeClientIp(literal);
   if (!normalized) {
     return std::nullopt;
   }
   return HashClientIdentifier(*normalized);
+}
+
+#if defined(_WIN32)
+bool EnsureWinsockInitialized() { // TSK901_Security_Hardening
+  static std::once_flag once;
+  static bool ready = false;
+  std::call_once(once, []() {
+    WSADATA data{};
+    ready = (::WSAStartup(MAKEWORD(2, 2), &data) == 0);
+  });
+  return ready;
+}
+
+std::optional<std::string> FingerprintFromDescriptor(int fd) { // TSK901_Security_Hardening
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  intptr_t handle = _get_osfhandle(fd);
+  if (handle == -1) {
+    return std::nullopt;
+  }
+  SOCKET socket_handle = reinterpret_cast<SOCKET>(handle);
+  if (socket_handle == INVALID_SOCKET) {
+    return std::nullopt;
+  }
+  sockaddr_storage storage{};
+  int length = static_cast<int>(sizeof(storage));
+  if (::getpeername(socket_handle, reinterpret_cast<sockaddr*>(&storage), &length) == SOCKET_ERROR) {
+    return std::nullopt;
+  }
+  return FingerprintFromSockaddr(storage);
+}
+#else
+std::optional<std::string> FingerprintFromDescriptor(int fd) { // TSK901_Security_Hardening
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  sockaddr_storage storage{};
+  socklen_t length = sizeof(storage);
+  if (::getpeername(fd, reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
+    return std::nullopt;
+  }
+  return FingerprintFromSockaddr(storage);
+}
+#endif
+
+std::optional<std::string> ResolveClientFingerprint() { // TSK136_Missing_Rate_Limiting_Mount_Attempts
+#if defined(_WIN32)
+  if (!EnsureWinsockInitialized()) { // TSK901_Security_Hardening
+    return std::nullopt;
+  }
+  std::array<int, 3> fds = {_fileno(stdin), _fileno(stdout), _fileno(stderr)};
+#else
+  std::array<int, 3> fds = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
+#endif
+  for (int fd : fds) {
+    auto fingerprint = FingerprintFromDescriptor(fd);
+    if (fingerprint) {
+      return fingerprint;
+    }
+  }
+  return std::nullopt;
 }
 
 void ConstantTimeDelay(std::chrono::nanoseconds duration) { // TSK102_Timing_Side_Channels
@@ -461,7 +553,7 @@ public:
 
 private:
   static constexpr std::chrono::nanoseconds kMaxCpuBudget{std::chrono::seconds(3)};
-  static constexpr uint64_t kMaxMemoryBudgetBytes = 64ull * 1024ull * 1024ull;
+  static constexpr uint64_t kMaxMemoryBudgetBytes = 256ull * 1024ull * 1024ull; // TSK901_Security_Hardening Argon2 headroom
 
   std::optional<ProcessUsage> baseline_{};
   ProcessUsage last_snapshot_{};
@@ -586,6 +678,7 @@ public:
   void EnforceDelay(const std::filesystem::path& container,
                     const std::optional<VolumeUuid>& volume_uuid,
                     const std::optional<std::string>& client_fingerprint) {
+    const bool have_uuid = volume_uuid.has_value();                               // TSK901_Security_Hardening
     const VolumeUuid uuid = NormalizeUuid(volume_uuid);                           // TSK075_Lockout_Persistence_and_IPC
     auto gate = qv::orchestrator::ScopedIpcLock::ForPath(container);              // TSK075_Lockout_Persistence_and_IPC
     const bool have_gate = gate.locked();                                         // TSK075_Lockout_Persistence_and_IPC
@@ -599,7 +692,7 @@ public:
     bool have_client = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      const auto key = BuildAttemptKey(container, uuid); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities canonicalize alias attempts
+      const auto key = BuildAttemptKey(container, uuid, have_uuid); // TSK901_Security_Hardening
       state = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
       global_snapshot = LoadGlobalStateLocked(now, have_global_gate);
       if (client_fingerprint) {
@@ -655,6 +748,7 @@ public:
                              const std::optional<VolumeUuid>& volume_uuid,
                              bool success,
                              const std::optional<std::string>& client_fingerprint) {
+    const bool have_uuid = volume_uuid.has_value();                               // TSK901_Security_Hardening
     const VolumeUuid uuid = NormalizeUuid(volume_uuid);                           // TSK075_Lockout_Persistence_and_IPC
     auto gate = qv::orchestrator::ScopedIpcLock::ForPath(container);              // TSK075_Lockout_Persistence_and_IPC
     const bool have_gate = gate.locked();                                         // TSK075_Lockout_Persistence_and_IPC
@@ -673,7 +767,7 @@ public:
 
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      const auto key = BuildAttemptKey(container, uuid); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities canonicalize alias attempts
+      const auto key = BuildAttemptKey(container, uuid, have_uuid); // TSK901_Security_Hardening canonical keying
       auto& entry = attempts_[key];
       snapshot = LoadAttemptStateLocked(key, container, uuid, now, have_gate);
       global_snapshot = LoadGlobalStateLocked(now, have_global_gate);
@@ -795,7 +889,8 @@ private:
   static VolumeUuid NormalizeUuid(const std::optional<VolumeUuid>& uuid);
   static std::optional<std::string> BuildFileIdentityKey(const std::filesystem::path& container); // TSK_CRIT_07
   static std::string BuildAttemptKey(const std::filesystem::path& container,
-                                     const VolumeUuid& uuid); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities container alias hardening
+                                     const VolumeUuid& uuid,
+                                     bool uuid_available); // TSK901_Security_Hardening stable per-volume keys
   static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> DeriveMacKey(const VolumeUuid& uuid);
   static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> ComputeLockMac(const LockFileHeader& header,
                                                                                const VolumeUuid& uuid);
@@ -1105,6 +1200,11 @@ void FailureTracker::PersistGlobalState(const GlobalState& state) const {
 
   auto mac = ComputeGlobalLockMac(header);
   auto path = GlobalStatePath();
+  auto dir = path.parent_path();                                                   // TSK901_Security_Hardening
+  if (!dir.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+  }
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) {
     throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
@@ -1119,8 +1219,12 @@ void FailureTracker::PersistGlobalState(const GlobalState& state) const {
 }
 
 std::filesystem::path FailureTracker::GlobalStatePath() const {
-  auto root = AllowedContainerRoot();                                              // TSK136
-  return root / ".qv_global_mount.lock";
+#if defined(_WIN32)
+  std::filesystem::path base = std::filesystem::path{L"C:\\ProgramData\\QuantumVault"};
+#else
+  std::filesystem::path base{"/var/run/quantumvault"};
+#endif
+  return base / ".qv_global_mount.lock";                                          // TSK901_Security_Hardening fixed system path
 }
 
 VolumeUuid FailureTracker::NormalizeUuid(const std::optional<VolumeUuid>& uuid) {
@@ -1168,25 +1272,21 @@ std::optional<std::string> FailureTracker::BuildFileIdentityKey(
 }
 
 std::string FailureTracker::BuildAttemptKey(const std::filesystem::path& container,
-                                            const VolumeUuid& uuid) {
-  auto identity_key = BuildFileIdentityKey(container);                             // TSK_CRIT_07
-  std::string lock_key;
-  if (identity_key) {
-    lock_key = *identity_key;
-  } else {
-    lock_key = LockFilePath(container).lexically_normal().generic_string();
-#if defined(_WIN32)
-    std::transform(lock_key.begin(), lock_key.end(), lock_key.begin(), [](unsigned char ch) {
-      return static_cast<char>(std::tolower(ch));
-    });
-#endif
+                                            const VolumeUuid& uuid,
+                                            bool uuid_available) {
+  const bool usable_uuid = uuid_available &&
+                           std::any_of(uuid.begin(), uuid.end(), [](uint8_t byte) { return byte != 0; });
+  if (usable_uuid) { // TSK901_Security_Hardening prefer immutable volume identity
+    std::string key{"uuid:"};
+    key.append(HexEncode(std::span<const uint8_t>(uuid.data(), uuid.size())));
+    return key;
   }
-  const bool have_uuid = std::any_of(uuid.begin(), uuid.end(), [](uint8_t byte) { return byte != 0; });
-  if (have_uuid) {
-    lock_key.push_back('#');
-    lock_key.append(HexEncode(std::span<const uint8_t>(uuid.data(), uuid.size()))); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities stabilize key material
+  auto identity_key = BuildFileIdentityKey(container);                             // TSK901_Security_Hardening fallback
+  if (!identity_key) {
+    throw qv::Error{qv::ErrorDomain::Security, qv::errors::security::kAuthenticationRejected,
+                    std::string(qv::errors::msg::kContainerIdentityUnavailable)}; // TSK901_Security_Hardening
   }
-  return lock_key;
+  return *identity_key;
 }
 
 std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> FailureTracker::DeriveMacKey(
@@ -1687,31 +1787,17 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   auto client_fingerprint = ResolveClientFingerprint();                       // TSK136_Missing_Rate_Limiting_Mount_Attempts
   tracker.EnforceDelay(sanitized_container, volume_uuid, client_fingerprint); // TSK026, TSK075, TSK136
 
-  Attempt a, b;
-  auto start = std::chrono::steady_clock::now();
-  a.start = start;
-  b.start = start;
+  Attempt attempt{};
+  attempt.start = std::chrono::steady_clock::now();                      // TSK901_Security_Hardening
+  auto mount_result = AttemptMount(sanitized_container, password);
+  attempt.duration = std::chrono::steady_clock::now() - attempt.start;
+  attempt.pad = ComputePadding(attempt.duration);
+  ConstantTimePadding(attempt.pad);
+  RecordSample(attempt.duration);
 
-  auto r1 = AttemptMount(sanitized_container, password);
-  a.duration = std::chrono::steady_clock::now() - a.start;
-  a.pad = ComputePadding(a.duration);
-  ConstantTimePadding(a.pad);
-  RecordSample(a.duration);
+  LogTiming(attempt);
 
-  auto r2 = AttemptMount(sanitized_container, password);
-  b.duration = std::chrono::steady_clock::now() - b.start;
-  b.pad = ComputePadding(b.duration);
-  ConstantTimePadding(b.pad);
-  RecordSample(b.duration);
-
-  LogTiming(a, b);
-
-  bool r1_ok = r1.has_value();
-  bool r2_ok = r2.has_value();
-  bool any_success = r1_ok || r2_ok;
-  uint32_t h1 = r1_ok ? CheckedCast<uint32_t>(r1->dummy) : 0;           // TSK099_Input_Validation_and_Sanitization
-  uint32_t h2 = r2_ok ? CheckedCast<uint32_t>(r2->dummy) : 0;           // TSK099_Input_Validation_and_Sanitization
-  uint32_t selected = qv::crypto::ct::Select<uint32_t>(h1, h2, (!r1_ok && r2_ok));
+  bool any_success = mount_result.has_value();
 
   auto state = tracker.RecordAttempt(sanitized_container, volume_uuid, any_success,
                                      client_fingerprint); // TSK026, TSK075, TSK136
@@ -1754,11 +1840,7 @@ ConstantTimeMount::Mount(const std::filesystem::path& container,
   }
 
   if (any_success) {
-    VolumeHandle handle{};
-    handle.dummy = static_cast<int>(selected);
-    handle.device = MakeBlockDevice(sanitized_container);
-    handle.hidden_region = std::nullopt; // TSK710_Implement_Hidden_Volumes default outer layout
-    return handle;
+    return mount_result;
   }
   return std::nullopt;
 }
@@ -1848,8 +1930,14 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     bool success{false};
   };
 
-  auto run_password_attempt = [&](const ParsedHeader& variant) {
+  const bool prefer_pbkdf = parsed.algorithm == PasswordKdf::kPbkdf2;      // TSK901_Security_Hardening
+  const bool prefer_argon2 = parsed.algorithm == PasswordKdf::kArgon2id;   // TSK901_Security_Hardening
+
+  auto run_password_attempt = [&](const ParsedHeader& variant, bool should_run) {
     PasswordAttempt attempt{};                                       // TSK_CRIT_11
+    if (!should_run) {
+      return attempt;                                                // TSK901_Security_Hardening avoid redundant derivation
+    }
     try {
       attempt.key = DerivePasswordKey(password, variant);            // TSK_CRIT_11
       attempt.success = true;                                        // TSK_CRIT_11
@@ -1864,8 +1952,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   auto argon2_variant = parsed;                                     // TSK_CRIT_11
   argon2_variant.algorithm = PasswordKdf::kArgon2id;                // TSK_CRIT_11
 
-  auto pbkdf_attempt = run_password_attempt(pbkdf_variant);         // TSK_CRIT_11
-  auto argon2_attempt = run_password_attempt(argon2_variant);       // TSK_CRIT_11
+  auto pbkdf_attempt = run_password_attempt(pbkdf_variant, prefer_pbkdf);   // TSK901_Security_Hardening
+  auto argon2_attempt = run_password_attempt(argon2_variant, prefer_argon2); // TSK901_Security_Hardening
 
   if (!check_deadline("password_kdf") || !check_resource("password_kdf")) {
     return std::nullopt;
@@ -1910,29 +1998,35 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     return result;                                                           // TSK_CRIT_13
   };
 
-  if (!check_deadline("hybrid_kdf_pbkdf2_start") ||                      // TSK_CRIT_13
-      !check_resource("hybrid_kdf_pbkdf2_start")) {                       // TSK_CRIT_13
-    return std::nullopt;
-  }
-  auto pbkdf_hybrid = run_hybrid_kdf(pbkdf_attempt.key);                    // TSK_CRIT_13
-  if (!check_deadline("hybrid_kdf_pbkdf2_finish")) {                       // TSK_CRIT_13
-    publish_kdf_timeout();                                                  // TSK_CRIT_13
-    return std::nullopt;
-  }
-  if (!check_resource("hybrid_kdf_pbkdf2_finish")) {                       // TSK_CRIT_13
-    return std::nullopt;
-  }
+  auto run_selected_hybrid = [&](const std::array<uint8_t, 32>& classical_key, bool should_run,
+                                 std::string_view start_stage, std::string_view finish_stage,
+                                 HybridKdfResult& output) -> bool { // TSK901_Security_Hardening
+    if (!should_run) {
+      output.success = false;
+      return true;
+    }
+    if (!check_deadline(start_stage) || !check_resource(start_stage)) {
+      return false;
+    }
+    output = run_hybrid_kdf(classical_key);
+    if (!check_deadline(finish_stage)) {
+      publish_kdf_timeout();
+      return false;
+    }
+    if (!check_resource(finish_stage)) {
+      return false;
+    }
+    return true;
+  };
 
-  if (!check_deadline("hybrid_kdf_argon2_start") ||                        // TSK_CRIT_13
-      !check_resource("hybrid_kdf_argon2_start")) {                         // TSK_CRIT_13
+  HybridKdfResult pbkdf_hybrid{};
+  HybridKdfResult argon2_hybrid{};
+  if (!run_selected_hybrid(pbkdf_attempt.key, prefer_pbkdf && pbkdf_attempt.success,
+                           "hybrid_kdf_pbkdf2_start", "hybrid_kdf_pbkdf2_finish", pbkdf_hybrid)) {
     return std::nullopt;
   }
-  auto argon2_hybrid = run_hybrid_kdf(argon2_attempt.key);                  // TSK_CRIT_13
-  if (!check_deadline("hybrid_kdf_argon2_finish")) {                        // TSK_CRIT_13
-    publish_kdf_timeout();                                                  // TSK_CRIT_13
-    return std::nullopt;
-  }
-  if (!check_resource("hybrid_kdf_argon2_finish")) {                        // TSK_CRIT_13
+  if (!run_selected_hybrid(argon2_attempt.key, prefer_argon2 && argon2_attempt.success,
+                           "hybrid_kdf_argon2_start", "hybrid_kdf_argon2_finish", argon2_hybrid)) {
     return std::nullopt;
   }
 
@@ -1940,16 +2034,24 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     return std::nullopt;
   }
 
-  auto mac_key_pbkdf = DeriveHeaderMacKey(pbkdf_hybrid.key, parsed);   // TSK_CRIT_11
-  auto mac_key_argon2 = DeriveHeaderMacKey(argon2_hybrid.key, parsed); // TSK_CRIT_11
-  auto mac_pbkdf = qv::crypto::HMAC_SHA256::Compute(
-      std::span<const uint8_t>(mac_key_pbkdf.data(), mac_key_pbkdf.size()),
-      std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
-  auto mac_argon2 = qv::crypto::HMAC_SHA256::Compute(
-      std::span<const uint8_t>(mac_key_argon2.data(), mac_key_argon2.size()),
-      std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
-  bool mac_ok_pbkdf = qv::crypto::ct::CompareEqual(stored_mac, mac_pbkdf);       // TSK_CRIT_11
-  bool mac_ok_argon2 = qv::crypto::ct::CompareEqual(stored_mac, mac_argon2);     // TSK_CRIT_11
+  std::array<uint8_t, 32> mac_key_pbkdf{};
+  std::array<uint8_t, 32> mac_key_argon2{};
+  bool mac_ok_pbkdf = false;
+  bool mac_ok_argon2 = false;
+  if (prefer_pbkdf && pbkdf_hybrid.success) {
+    mac_key_pbkdf = DeriveHeaderMacKey(pbkdf_hybrid.key, parsed);               // TSK_CRIT_11
+    auto mac_pbkdf = qv::crypto::HMAC_SHA256::Compute(
+        std::span<const uint8_t>(mac_key_pbkdf.data(), mac_key_pbkdf.size()),
+        std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
+    mac_ok_pbkdf = qv::crypto::ct::CompareEqual(stored_mac, mac_pbkdf);         // TSK_CRIT_11
+  }
+  if (prefer_argon2 && argon2_hybrid.success) {
+    mac_key_argon2 = DeriveHeaderMacKey(argon2_hybrid.key, parsed);             // TSK_CRIT_11
+    auto mac_argon2 = qv::crypto::HMAC_SHA256::Compute(
+        std::span<const uint8_t>(mac_key_argon2.data(), mac_key_argon2.size()),
+        std::span<const uint8_t>(header_bytes.data(), header_bytes.size()));
+    mac_ok_argon2 = qv::crypto::ct::CompareEqual(stored_mac, mac_argon2);       // TSK_CRIT_11
+  }
 
   if (!check_deadline("mac_verify") || !check_resource("mac_verify")) {
     return std::nullopt;
@@ -1961,9 +2063,6 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
     uint32_t condition_mask = qv::crypto::ct::Select<uint32_t>(0u, 1u, condition);
     return prefer_mask & condition_mask;
   };
-
-  bool prefer_pbkdf = parsed.algorithm == PasswordKdf::kPbkdf2;      // TSK_CRIT_11
-  bool prefer_argon2 = parsed.algorithm == PasswordKdf::kArgon2id;   // TSK_CRIT_11
 
   uint32_t integrity_mask = 1u; // TSK102_Timing_Side_Channels
   integrity_mask &= qv::crypto::ct::Select<uint32_t>(0u, 1u, size_known);
@@ -2014,7 +2113,8 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
 
 
 
-void ConstantTimeMount::LogTiming(const Attempt& a, const Attempt& b) {
+void ConstantTimeMount::LogTiming(const Attempt& attempt) { // TSK901_Security_Hardening consolidated attempts
+  (void)attempt;
   auto now_ns = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count());

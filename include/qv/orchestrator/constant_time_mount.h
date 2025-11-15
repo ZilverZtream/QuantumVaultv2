@@ -37,7 +37,7 @@ private:
   void ConstantTimePadding(std::chrono::nanoseconds duration);
   std::optional<VolumeHandle> AttemptMount(const std::filesystem::path& container,
                                            const std::string& password);
-  void LogTiming(const Attempt& a, const Attempt& b);
+  void LogTiming(const Attempt& attempt);
 };
 
 } // namespace qv::orchestrator
