@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable> // TSK_CRIT_08_Resource_Leak_DoS_via_Detached_KDF_Thread
 #include <cctype> // TSK136_Missing_Rate_Limiting_Mount_Attempts client IP normalization
 #include <cmath>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <limits>   // TSK099_Input_Validation_and_Sanitization checked casts
 #include <mutex>
 #include <optional> // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV tracking
+#include <queue>               // TSK_CRIT_08_Resource_Leak_DoS_via_Detached_KDF_Thread
 #include <span>
 #include <string>
 #include <string_view>
@@ -64,6 +66,74 @@
 using namespace qv::orchestrator;
 
 namespace {
+
+struct HybridKdfResult {                  // TSK070, TSK_CRIT_08_Resource_Leak_DoS_via_Detached_KDF_Thread
+  std::array<uint8_t, 32> key{};          // TSK070
+  bool success{false};                    // TSK070
+};                                        // TSK070
+
+class HybridKdfExecutor { // TSK_CRIT_08_Resource_Leak_DoS_via_Detached_KDF_Thread
+ public:
+  static HybridKdfExecutor& Instance() {
+    static HybridKdfExecutor executor;
+    return executor;
+  }
+
+  std::future<HybridKdfResult> Submit(std::packaged_task<HybridKdfResult()> task) {
+    auto future = task.get_future();
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      tasks_.emplace(std::move(task));
+    }
+    cv_.notify_one();
+    return future;
+  }
+
+ private:
+  HybridKdfExecutor() {
+    const unsigned int hw_threads = std::thread::hardware_concurrency();
+    const unsigned int worker_count = std::clamp<unsigned int>(hw_threads ? hw_threads : 1u, 1u, 4u);
+    workers_.reserve(worker_count);
+    for (unsigned int i = 0; i < worker_count; ++i) {
+      workers_.emplace_back([this](std::stop_token stop_token) { Worker(stop_token); });
+    }
+  }
+
+  ~HybridKdfExecutor() {
+    {
+      std::lock_guard<std::mutex> guard(mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  void Worker(std::stop_token stop_token) {
+    while (true) {
+      std::packaged_task<HybridKdfResult()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this, &stop_token]() {
+          return stopping_ || stop_token.stop_requested() || !tasks_.empty();
+        });
+        if ((stopping_ || stop_token.stop_requested()) && tasks_.empty()) {
+          return;
+        }
+        if (tasks_.empty()) {
+          continue;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop();
+      }
+      task();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::queue<std::packaged_task<HybridKdfResult()>> tasks_;
+  std::vector<std::jthread> workers_;
+  bool stopping_{false};
+};
 
 std::string TrimWhitespace(std::string_view input) { // TSK136_Missing_Rate_Limiting_Mount_Attempts
   const auto begin = input.find_first_not_of(" \t\r\n");
@@ -1844,11 +1914,7 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
 
   auto parsed_for_kdf = parsed;      // TSK038_Resource_Limits_and_DoS_Prevention
   auto classical_key_copy = classical_key; // TSK038_Resource_Limits_and_DoS_Prevention
-  struct HybridKdfResult {                  // TSK070
-    std::array<uint8_t, 32> key{};          // TSK070
-    bool success{false};                    // TSK070
-  };                                        // TSK070
-  auto kdf_task = std::packaged_task<HybridKdfResult>( // TSK038_Resource_Limits_and_DoS_Prevention
+  auto kdf_task = std::packaged_task<HybridKdfResult()>( // TSK038_Resource_Limits_and_DoS_Prevention
       [parsed_for_kdf, classical_key_copy]() mutable {
         HybridKdfResult result{};                                             // TSK070
         std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(), parsed_for_kdf.hybrid_salt.size());
@@ -1872,8 +1938,7 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
             std::span<uint8_t>(classical_key_copy.data(), classical_key_copy.size())); // TSK038_Resource_Limits_and_DoS_Prevention
         return result;                                                                      // TSK070
       });
-  auto hybrid_future = kdf_task.get_future(); // TSK038_Resource_Limits_and_DoS_Prevention
-  std::thread(std::move(kdf_task)).detach();  // TSK038_Resource_Limits_and_DoS_Prevention
+  auto hybrid_future = HybridKdfExecutor::Instance().Submit(std::move(kdf_task));
 
   if (!check_resource("hybrid_kdf_launch")) {
     return std::nullopt;
