@@ -662,7 +662,7 @@ void NonceLog::ReloadUnlocked() {
     if (!entries_.empty() && counter <= entries_.back().counter) {
       throw Error{ErrorDomain::Validation, 0, "Nonce log counters not monotonic"};
     }
-    auto expected = ComputeMac(prev, counter, key_);
+    auto expected = ComputeMac(prev, counter, key_, {}); // TSK000_FixNonceMacBinding empty binding for persisted entries
     if (!std::equal(expected.begin(), expected.end(), mac.begin())) {
       throw Error{ErrorDomain::Validation, 0, "Nonce log MAC chain broken"};
     }
@@ -819,7 +819,7 @@ size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
       chain_broken = true;
       break;
     }
-    auto expected = ComputeMac(prev, counter, key_);
+    auto expected = ComputeMac(prev, counter, key_, {}); // TSK000_FixNonceMacBinding empty binding for persisted entries
     if (!std::equal(expected.begin(), expected.end(), mac.begin())) {
       chain_broken = true;
       break;
