@@ -128,7 +128,8 @@ PQCKeyEncapsulation::Decapsulate(std::span<const uint8_t, PQC::SECRET_KEY_SIZE> 
   // TSK_CRIT_10: No fallback - liboqs is required
   auto kem = MakeKem();
   if (OQS_KEM_decaps(kem.get(), ss.data(), ct.data(), sk.data()) != OQS_SUCCESS) {
-    throw Error(ErrorDomain::Crypto, -1, "OQS_KEM_decaps failed");
+    throw AuthenticationFailureError(
+        "Failed to authenticate PQC secret key"); // TSK719_Crypto_Side_Channel_KEM_Failure ensure indistinguishable failure
   }
   return ss;
 }
