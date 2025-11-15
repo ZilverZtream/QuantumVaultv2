@@ -4,20 +4,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable> // TSK_CRIT_08_Resource_Leak_DoS_via_Detached_KDF_Thread
 #include <cctype> // TSK136_Missing_Rate_Limiting_Mount_Attempts client IP normalization
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <future> // TSK038_Resource_Limits_and_DoS_Prevention crypto timeout
 #include <semaphore> // TSK236_Mount_Timeout_Bypass_Vulnerability global concurrency guard
 #include <iostream>
 #include <limits>   // TSK099_Input_Validation_and_Sanitization checked casts
 #include <mutex>
 #include <optional> // TSK036_PBKDF2_Argon2_Migration_Path Argon2 TLV tracking
-#include <queue>               // TSK_CRIT_08_Resource_Leak_DoS_via_Detached_KDF_Thread
 #include <span>
 #include <string>
 #include <string_view>
@@ -71,69 +68,6 @@ struct HybridKdfResult {                  // TSK070, TSK_CRIT_08_Resource_Leak_D
   std::array<uint8_t, 32> key{};          // TSK070
   bool success{false};                    // TSK070
 };                                        // TSK070
-
-class HybridKdfExecutor { // TSK_CRIT_08_Resource_Leak_DoS_via_Detached_KDF_Thread
- public:
-  static HybridKdfExecutor& Instance() {
-    static HybridKdfExecutor executor;
-    return executor;
-  }
-
-  std::future<HybridKdfResult> Submit(std::packaged_task<HybridKdfResult()> task) {
-    auto future = task.get_future();
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      tasks_.emplace(std::move(task));
-    }
-    cv_.notify_one();
-    return future;
-  }
-
- private:
-  HybridKdfExecutor() {
-    const unsigned int hw_threads = std::thread::hardware_concurrency();
-    const unsigned int worker_count = std::clamp<unsigned int>(hw_threads ? hw_threads : 1u, 1u, 4u);
-    workers_.reserve(worker_count);
-    for (unsigned int i = 0; i < worker_count; ++i) {
-      workers_.emplace_back([this](std::stop_token stop_token) { Worker(stop_token); });
-    }
-  }
-
-  ~HybridKdfExecutor() {
-    {
-      std::lock_guard<std::mutex> guard(mutex_);
-      stopping_ = true;
-    }
-    cv_.notify_all();
-  }
-
-  void Worker(std::stop_token stop_token) {
-    while (true) {
-      std::packaged_task<HybridKdfResult()> task;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this, &stop_token]() {
-          return stopping_ || stop_token.stop_requested() || !tasks_.empty();
-        });
-        if ((stopping_ || stop_token.stop_requested()) && tasks_.empty()) {
-          return;
-        }
-        if (tasks_.empty()) {
-          continue;
-        }
-        task = std::move(tasks_.front());
-        tasks_.pop();
-      }
-      task();
-    }
-  }
-
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  std::queue<std::packaged_task<HybridKdfResult()>> tasks_;
-  std::vector<std::jthread> workers_;
-  bool stopping_{false};
-};
 
 std::string TrimWhitespace(std::string_view input) { // TSK136_Missing_Rate_Limiting_Mount_Attempts
   const auto begin = input.find_first_not_of(" \t\r\n");
@@ -1929,65 +1863,69 @@ ConstantTimeMount::AttemptMount(const std::filesystem::path& container,
   }
 
 
-  auto submit_hybrid = [&](const std::array<uint8_t, 32>& classical_key) {
-    auto parsed_for_kdf = parsed;                                   // TSK_CRIT_11
-    auto classical_copy = classical_key;                            // TSK_CRIT_11
-    auto task = std::packaged_task<HybridKdfResult()>(              // TSK_CRIT_11
-        [parsed_for_kdf, classical_copy]() mutable {
-          HybridKdfResult result{};                                 // TSK_CRIT_11
-          std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(),
-                                               parsed_for_kdf.hybrid_salt.size());
-          std::span<const uint8_t> epoch_span;                      // TSK_CRIT_11
-          if (parsed_for_kdf.have_epoch) {                          // TSK_CRIT_11
-            epoch_span = std::span<const uint8_t>(parsed_for_kdf.epoch_tlv_bytes.data(),
-                                                  parsed_for_kdf.epoch_tlv_bytes.size());
-          }
-          try {
-            result.key = qv::core::PQCHybridKDF::Mount(             // TSK_CRIT_11
-                std::span<const uint8_t, 32>(classical_copy), parsed_for_kdf.pqc, hybrid_salt,
-                std::span<const uint8_t, 16>(parsed_for_kdf.header.uuid), parsed_for_kdf.version,
-                epoch_span);
-            result.success = true;                                  // TSK_CRIT_11
-          } catch (const qv::AuthenticationFailureError&) {
-            result.success = false;                                 // TSK_CRIT_11
-          } catch (const std::exception&) {
-            result.success = false;                                 // TSK_CRIT_11
-          }
-          qv::security::Zeroizer::Wipe(
-              std::span<uint8_t>(classical_copy.data(), classical_copy.size())); // TSK_CRIT_11
-          return result;                                            // TSK_CRIT_11
-        });
-    return HybridKdfExecutor::Instance().Submit(std::move(task));
+  auto publish_kdf_timeout = [&]() {                                        // TSK_CRIT_13_KDF_Resource_Budget_Bypass
+    qv::orchestrator::Event kdf_timeout{};                                  // TSK_CRIT_13_KDF_Resource_Budget_Bypass
+    kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity;       // TSK_CRIT_13_KDF_Resource_Budget_Bypass
+    kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning;        // TSK_CRIT_13_KDF_Resource_Budget_Bypass
+    kdf_timeout.event_id = "mount_key_timeout";                             // TSK_CRIT_13_KDF_Resource_Budget_Bypass
+    kdf_timeout.message = std::string(qv::errors::msg::kKeyAgreementTimeout); // TSK_CRIT_13
+    kdf_timeout.fields.emplace_back("container_path", qv::PathToUtf8String(container),
+                                    qv::orchestrator::FieldPrivacy::kHash);  // TSK_CRIT_13
+    qv::orchestrator::EventBus::Instance().Publish(kdf_timeout);             // TSK_CRIT_13
   };
 
-  auto pbkdf_future = submit_hybrid(pbkdf_attempt.key);             // TSK_CRIT_11
-  auto argon2_future = submit_hybrid(argon2_attempt.key);           // TSK_CRIT_11
+  auto run_hybrid_kdf = [&](const std::array<uint8_t, 32>& classical_key) {  // TSK_CRIT_13
+    auto parsed_for_kdf = parsed;                                            // TSK_CRIT_13
+    auto classical_copy = classical_key;                                     // TSK_CRIT_13
+    HybridKdfResult result{};                                                // TSK_CRIT_13
+    std::span<const uint8_t> hybrid_salt(parsed_for_kdf.hybrid_salt.data(),  // TSK_CRIT_13
+                                         parsed_for_kdf.hybrid_salt.size()); // TSK_CRIT_13
+    std::span<const uint8_t> epoch_span;                                     // TSK_CRIT_13
+    if (parsed_for_kdf.have_epoch) {                                         // TSK_CRIT_13
+      epoch_span = std::span<const uint8_t>(parsed_for_kdf.epoch_tlv_bytes.data(),
+                                            parsed_for_kdf.epoch_tlv_bytes.size());
+    }
+    try {
+      result.key = qv::core::PQCHybridKDF::Mount(                            // TSK_CRIT_13
+          std::span<const uint8_t, 32>(classical_copy), parsed_for_kdf.pqc, hybrid_salt,
+          std::span<const uint8_t, 16>(parsed_for_kdf.header.uuid), parsed_for_kdf.version,
+          epoch_span);
+      result.success = true;                                                 // TSK_CRIT_13
+    } catch (const qv::AuthenticationFailureError&) {
+      result.success = false;                                                // TSK_CRIT_13
+    } catch (const std::exception&) {
+      result.success = false;                                                // TSK_CRIT_13
+    }
+    qv::security::Zeroizer::Wipe(std::span<uint8_t>(classical_copy.data(),  // TSK_CRIT_13
+                                                    classical_copy.size()));
+    return result;                                                           // TSK_CRIT_13
+  };
 
-  if (!check_resource("hybrid_kdf_launch")) {
+  if (!check_deadline("hybrid_kdf_pbkdf2_start") ||                      // TSK_CRIT_13
+      !check_resource("hybrid_kdf_pbkdf2_start")) {                       // TSK_CRIT_13
+    return std::nullopt;
+  }
+  auto pbkdf_hybrid = run_hybrid_kdf(pbkdf_attempt.key);                    // TSK_CRIT_13
+  if (!check_deadline("hybrid_kdf_pbkdf2_finish")) {                       // TSK_CRIT_13
+    publish_kdf_timeout();                                                  // TSK_CRIT_13
+    return std::nullopt;
+  }
+  if (!check_resource("hybrid_kdf_pbkdf2_finish")) {                       // TSK_CRIT_13
     return std::nullopt;
   }
 
-  auto await_hybrid = [&](std::future<HybridKdfResult>& future, std::string_view stage) {
-    HybridKdfResult result{};                                       // TSK_CRIT_11
-    auto status = future.wait_until(attempt_deadline.Deadline());   // TSK_CRIT_11
-    if (status == std::future_status::ready) {                      // TSK_CRIT_11
-      result = future.get();                                        // TSK_CRIT_11
-    } else {
-      PublishMountTimeoutEvent(container, attempt_deadline, stage); // TSK_CRIT_11
-      qv::orchestrator::Event kdf_timeout{};                        // TSK_CRIT_11
-      kdf_timeout.category = qv::orchestrator::EventCategory::kSecurity;
-      kdf_timeout.severity = qv::orchestrator::EventSeverity::kWarning;
-      kdf_timeout.event_id = "mount_key_timeout";                   // TSK_CRIT_11
-      kdf_timeout.message = std::string(qv::errors::msg::kKeyAgreementTimeout);
-      kdf_timeout.fields.emplace_back("container_path", qv::PathToUtf8String(container),
-                                      qv::orchestrator::FieldPrivacy::kHash);
-      qv::orchestrator::EventBus::Instance().Publish(kdf_timeout);  // TSK_CRIT_11
-    }
-    return result;                                                  // TSK_CRIT_11
-  };
-
-  auto pbkdf_hybrid = await_hybrid(pbkdf_future, "hybrid_kdf_wait_pbkdf2");   // TSK_CRIT_11
-  auto argon2_hybrid = await_hybrid(argon2_future, "hybrid_kdf_wait_argon2"); // TSK_CRIT_11
+  if (!check_deadline("hybrid_kdf_argon2_start") ||                        // TSK_CRIT_13
+      !check_resource("hybrid_kdf_argon2_start")) {                         // TSK_CRIT_13
+    return std::nullopt;
+  }
+  auto argon2_hybrid = run_hybrid_kdf(argon2_attempt.key);                  // TSK_CRIT_13
+  if (!check_deadline("hybrid_kdf_argon2_finish")) {                        // TSK_CRIT_13
+    publish_kdf_timeout();                                                  // TSK_CRIT_13
+    return std::nullopt;
+  }
+  if (!check_resource("hybrid_kdf_argon2_finish")) {                        // TSK_CRIT_13
+    return std::nullopt;
+  }
 
   if (!check_deadline("hybrid_kdf_result") || !check_resource("hybrid_kdf_result")) {
     return std::nullopt;
