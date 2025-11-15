@@ -347,80 +347,69 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
   auto chunk_hash =
       qv::crypto::SHA256_Hash(std::span<const uint8_t>(plaintext.data(), copy_size)); // TSK128_Missing_AAD_Validation_in_Chunks
   qv::security::Zeroizer::ScopeWiper chunk_hash_guard(chunk_hash.data(), chunk_hash.size());
-  {
-    std::unique_lock<std::shared_mutex> nonce_guard(nonce_mutex_); // TSK118_Nonce_Reuse_Vulnerabilities
-    nonce_record = nonce_generator_.NextAuthenticated(
-        chunk_index, std::span<const uint8_t>(chunk_hash.data(), chunk_hash.size()));
+  nonce_record = nonce_generator_.NextAuthenticated(
+      chunk_index, std::span<const uint8_t>(chunk_hash.data(), chunk_hash.size())); // TSK_CRIT_01_Nonce_Replay_Stopgap direct logging
+
+  auto nonce = MakeNonce(nonce_record, chunk_index);
+  qv::security::Zeroizer::ScopeWiper<uint8_t> nonce_guard(nonce.data(), nonce.size()); // TSK125_Missing_Secure_Deletion_for_Keys scoped nonce wipe
+  if (nonce.size() != expected_nonce_size) {
+    throw Error{ErrorDomain::Crypto, 0, "Nonce length mismatch"};
   }
-  try {
-    auto nonce = MakeNonce(nonce_record, chunk_index);
-    qv::security::Zeroizer::ScopeWiper<uint8_t> nonce_guard(nonce.data(), nonce.size()); // TSK125_Missing_Secure_Deletion_for_Keys scoped nonce wipe
-    if (nonce.size() != expected_nonce_size) {
-      throw Error{ErrorDomain::Crypto, 0, "Nonce length mismatch"};
-    }
-    auto context = MakeChunkContext(cipher_, static_cast<uint8_t>(expected_tag_size),
-                                    static_cast<uint8_t>(expected_nonce_size), epoch_);      // TSK083, TSK128_Missing_AAD_Validation_in_Chunks
-    if (!ValidateChunkContext(cipher_, expected_tag_size, expected_nonce_size, epoch_, context)) {
-      throw Error{ErrorDomain::Crypto, 0, "Chunk context derivation mismatch"}; // TSK128_Missing_AAD_Validation_in_Chunks
-    }
-    qv::security::Zeroizer::ScopeWiper<uint8_t> context_guard(context.data(), context.size()); // TSK125_Missing_Secure_Deletion_for_Keys scoped context wipe
-    auto aad_data = qv::core::MakeAADData(epoch_, chunk_index, logical_offset,
-                                          static_cast<uint32_t>(copy_size), context, nonce_record.counter);
-    qv::security::Zeroizer::ScopeWiper<uint8_t> aad_data_guard(
-        reinterpret_cast<uint8_t*>(&aad_data), sizeof(aad_data)); // TSK125_Missing_Secure_Deletion_for_Keys scoped AAD wipe
-    auto aad_envelope =
-        qv::core::MakeAADEnvelope(aad_data, nonce_record.mac);                        // TSK083
-    qv::security::Zeroizer::ScopeWiper<uint8_t> aad_envelope_guard(
-        reinterpret_cast<uint8_t*>(&aad_envelope), sizeof(aad_envelope)); // TSK125_Missing_Secure_Deletion_for_Keys envelope wipe
-    auto aad_bytes = qv::AsBytesConst(aad_envelope);
-    auto encrypt_result = qv::crypto::AEAD_Encrypt(
-        cipher_,
-        std::span<const uint8_t>(plaintext.data(), plaintext.size()),
-        aad_bytes,
-        nonce,
-        std::span<const uint8_t>(data_key_.data(), data_key_.size()));
-    if (encrypt_result.ciphertext.size() != kChunkPayloadSize) {
-      throw Error{ErrorDomain::Crypto, 0, "Encrypted chunk size mismatch"};
-    }
-    if (encrypt_result.tag.size() != expected_tag_size) {                          // TSK083
-      throw Error{ErrorDomain::Crypto, 0, "AEAD tag length mismatch"};
-    }
+  auto context = MakeChunkContext(cipher_, static_cast<uint8_t>(expected_tag_size),
+                                  static_cast<uint8_t>(expected_nonce_size), epoch_);      // TSK083, TSK128_Missing_AAD_Validation_in_Chunks
+  if (!ValidateChunkContext(cipher_, expected_tag_size, expected_nonce_size, epoch_, context)) {
+    throw Error{ErrorDomain::Crypto, 0, "Chunk context derivation mismatch"}; // TSK128_Missing_AAD_Validation_in_Chunks
+  }
+  qv::security::Zeroizer::ScopeWiper<uint8_t> context_guard(context.data(), context.size()); // TSK125_Missing_Secure_Deletion_for_Keys scoped context wipe
+  auto aad_data = qv::core::MakeAADData(epoch_, chunk_index, logical_offset,
+                                        static_cast<uint32_t>(copy_size), context, nonce_record.counter);
+  qv::security::Zeroizer::ScopeWiper<uint8_t> aad_data_guard(
+      reinterpret_cast<uint8_t*>(&aad_data), sizeof(aad_data)); // TSK125_Missing_Secure_Deletion_for_Keys scoped AAD wipe
+  auto aad_envelope =
+      qv::core::MakeAADEnvelope(aad_data, nonce_record.mac);                        // TSK083
+  qv::security::Zeroizer::ScopeWiper<uint8_t> aad_envelope_guard(
+      reinterpret_cast<uint8_t*>(&aad_envelope), sizeof(aad_envelope)); // TSK125_Missing_Secure_Deletion_for_Keys envelope wipe
+  auto aad_bytes = qv::AsBytesConst(aad_envelope);
+  auto encrypt_result = qv::crypto::AEAD_Encrypt(
+      cipher_,
+      std::span<const uint8_t>(plaintext.data(), plaintext.size()),
+      aad_bytes,
+      nonce,
+      std::span<const uint8_t>(data_key_.data(), data_key_.size()));
+  if (encrypt_result.ciphertext.size() != kChunkPayloadSize) {
+    throw Error{ErrorDomain::Crypto, 0, "Encrypted chunk size mismatch"};
+  }
+  if (encrypt_result.tag.size() != expected_tag_size) {                          // TSK083
+    throw Error{ErrorDomain::Crypto, 0, "AEAD tag length mismatch"};
+  }
 
-    ChunkHeader header{};
-    header.logical_offset = logical_offset;
-    header.data_size = static_cast<uint32_t>(copy_size);
-    header.epoch = epoch_;
-    header.chunk_index = chunk_index;
-    std::fill(header.tag.begin(), header.tag.end(), 0);
-    std::copy_n(encrypt_result.tag.begin(),
-                std::min<size_t>(encrypt_result.tag.size(), header.tag.size()),
-                header.tag.begin());
-    std::fill(header.nonce.begin(), header.nonce.end(), 0);
-    std::copy_n(nonce.begin(), std::min<size_t>(nonce.size(), header.nonce.size()), header.nonce.begin());
-    std::copy(nonce_record.mac.begin(), nonce_record.mac.end(), header.aad_mac.begin());
-    header.cipher_id = static_cast<uint8_t>(cipher_);
-    header.tag_size = static_cast<uint8_t>(expected_tag_size);
-    header.nonce_size = static_cast<uint8_t>(expected_nonce_size);
+  ChunkHeader header{};
+  header.logical_offset = logical_offset;
+  header.data_size = static_cast<uint32_t>(copy_size);
+  header.epoch = epoch_;
+  header.chunk_index = chunk_index;
+  std::fill(header.tag.begin(), header.tag.end(), 0);
+  std::copy_n(encrypt_result.tag.begin(),
+              std::min<size_t>(encrypt_result.tag.size(), header.tag.size()),
+              header.tag.begin());
+  std::fill(header.nonce.begin(), header.nonce.end(), 0);
+  std::copy_n(nonce.begin(), std::min<size_t>(nonce.size(), header.nonce.size()), header.nonce.begin());
+  std::copy(nonce_record.mac.begin(), nonce_record.mac.end(), header.aad_mac.begin());
+  header.cipher_id = static_cast<uint8_t>(cipher_);
+  header.tag_size = static_cast<uint8_t>(expected_tag_size);
+  header.nonce_size = static_cast<uint8_t>(expected_nonce_size);
 
-    device_.WriteChunk(header, encrypt_result.ciphertext);
+  device_.WriteChunk(header, encrypt_result.ciphertext);
 
-    std::unique_lock<std::shared_mutex> commit_guard(nonce_mutex_); // TSK118_Nonce_Reuse_Vulnerabilities
-    nonce_generator_.CommitNonce(nonce_record);
-    commit_guard.unlock();
-    {
-      std::lock_guard<std::mutex> freshness_guard(nonce_freshness_mutex_); // TSK128_Missing_AAD_Validation_in_Chunks
-      if (nonce_record.counter > nonce_high_watermark_) {
-        nonce_high_watermark_ = nonce_record.counter;
-      }
-      nonce_replay_floor_ =
-          (nonce_high_watermark_ > kNonceFreshnessWindow)
-              ? nonce_high_watermark_ - kNonceFreshnessWindow
-              : 0;
+  {
+    std::lock_guard<std::mutex> freshness_guard(nonce_freshness_mutex_); // TSK128_Missing_AAD_Validation_in_Chunks
+    if (nonce_record.counter > nonce_high_watermark_) {
+      nonce_high_watermark_ = nonce_record.counter;
     }
-  } catch (...) {
-    std::unique_lock<std::shared_mutex> release_guard(nonce_mutex_); // TSK118_Nonce_Reuse_Vulnerabilities
-    nonce_generator_.ReleaseNonce(nonce_record);
-    throw;
+    nonce_replay_floor_ =
+        (nonce_high_watermark_ > kNonceFreshnessWindow)
+            ? nonce_high_watermark_ - kNonceFreshnessWindow
+            : 0;
   }
 
   qv::security::Zeroizer::Wipe(plaintext);

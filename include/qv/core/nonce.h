@@ -12,7 +12,6 @@
 #include <new>      // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional> // TSK015
 #include <limits>   // TSK071_Epoch_Overflow_Safety exported thresholds
-#include <unordered_map> // TSK118_Nonce_Reuse_Vulnerabilities reservation tracking
 #include <span>
 #include <string_view> // TSK024_Key_Rotation_and_Lifecycle_Management
 #include <vector>
@@ -43,10 +42,6 @@ namespace qv::core {
     NonceLog(const std::filesystem::path& path, std::nothrow_t) noexcept; // TSK032_Backup_Recovery_and_Disaster_Recovery
     std::array<uint8_t, 32> Append(uint64_t counter,
                                    std::span<const uint8_t> binding); // TSK014, TSK128_Missing_AAD_Validation_in_Chunks binding
-    std::array<uint8_t, 32> Preview(uint64_t counter,
-                                    std::span<const uint8_t> binding); // TSK118_Nonce_Reuse_Vulnerabilities deferred logging
-    void Commit(uint64_t counter, std::span<const uint8_t, 32> mac,
-                std::span<const uint8_t> binding); // TSK118_Nonce_Reuse_Vulnerabilities
     std::array<uint8_t, 32> LastMac() const;          // TSK014
     bool VerifyChain();
     size_t Repair(); // TSK032_Backup_Recovery_and_Disaster_Recovery
@@ -60,6 +55,11 @@ namespace qv::core {
     void InitializeNewLog();
     void RecoverWalUnlocked(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
     void EnsureWalLock();      // TSK133_Race_in_Nonce_Log_Recovery acquire/process-level guard
+    void AppendWalEntryUnlocked(uint64_t counter,
+                                std::span<const uint8_t, 32> mac); // TSK_CRIT_01_Nonce_Replay_Stopgap journal writes
+    void ApplyWalEntries(const std::vector<LogEntry>& entries);     // TSK_CRIT_01_Nonce_Replay_Stopgap WAL replay
+    void ClearWalUnlocked();                                        // TSK_CRIT_01_Nonce_Replay_Stopgap truncate WAL
+    size_t wal_dirty_entries_{0};                                   // TSK_CRIT_01_Nonce_Replay_Stopgap pending journal count
   };
 
   class NonceGenerator {
@@ -91,8 +91,6 @@ namespace qv::core {
     explicit NonceGenerator(uint32_t epoch, uint64_t start_counter = 0);
     NonceRecord NextAuthenticated(int64_t chunk_index = kUnboundChunkIndex,
                                   std::span<const uint8_t> binding = {}); // TSK014, TSK118_Nonce_Reuse_Vulnerabilities, TSK128_Missing_AAD_Validation_in_Chunks
-    void ReleaseNonce(const NonceRecord& record); // TSK118_Nonce_Reuse_Vulnerabilities
-    void CommitNonce(const NonceRecord& record);  // TSK118_Nonce_Reuse_Vulnerabilities
     std::array<uint8_t, 12> Next();
     uint64_t CurrentCounter() const {
       std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
@@ -117,8 +115,6 @@ namespace qv::core {
     std::chrono::steady_clock::time_point epoch_started_monotonic_; // TSK118_Nonce_Reuse_Vulnerabilities monotonic ageing
     uint64_t base_counter_{0};                              // TSK015
     mutable std::mutex state_mutex_;                        // TSK067_Nonce_Safety
-    std::unordered_map<uint64_t, NonceRecord> inflight_;     // TSK118_Nonce_Reuse_Vulnerabilities
-    std::unordered_map<int64_t, NonceRecord> recycled_;      // TSK118_Nonce_Reuse_Vulnerabilities
     RekeyReason DetermineRekeyReason(uint64_t candidate,
                                      std::chrono::steady_clock::time_point now) const; // TSK015, TSK118_Nonce_Reuse_Vulnerabilities
     static std::array<uint8_t, 12> MakeNonceBytes(uint32_t epoch, uint64_t counter);   // TSK015
