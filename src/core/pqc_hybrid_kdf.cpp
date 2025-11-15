@@ -157,6 +157,8 @@ PQCHybridKDF::Create(std::span<const uint8_t, 32> classical_key,
   RandomBytes(std::span<uint8_t>(tlv.sk_nonce.data(), tlv.sk_nonce.size()));
 
   const auto aad = MakeStableAad(volume_uuid, header_version, epoch_tlv);
+  // TSK245 clarifies the "KEM-in-AEAD" model: the classical key is the AEAD key
+  // that wraps the PQC secret key, keeping sk opaque without the password-derived key.
   auto enc_result = AES256_GCM_Encrypt(kp.sk.AsSpan(), aad,
       std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(tlv.sk_nonce.data(), tlv.sk_nonce.size()),
       classical_key);
