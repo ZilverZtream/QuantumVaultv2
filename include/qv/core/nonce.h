@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <memory> // TSK133_Race_in_Nonce_Log_Recovery scoped WAL locks
+#include <memory> // TSK133_Race_in_Nonce_Log_Recovery scoped log locks
 #include <mutex>
 #include <new>      // TSK032_Backup_Recovery_and_Disaster_Recovery
 #include <optional> // TSK015
@@ -34,7 +34,7 @@ namespace qv::core {
     bool loaded_{false};
     mutable std::mutex mu_;
     struct FileLock;                                       // TSK133_Race_in_Nonce_Log_Recovery forward-declare lock wrapper
-    std::unique_ptr<FileLock> wal_lock_;                   // TSK133_Race_in_Nonce_Log_Recovery serialized WAL access
+    std::unique_ptr<FileLock> file_lock_;                  // TSK133_Race_in_Nonce_Log_Recovery serialized file access
 
   public:
     NonceLog() = default;
@@ -53,13 +53,10 @@ namespace qv::core {
     void ReloadUnlocked();
     void PersistUnlocked();
     void InitializeNewLog();
-    void RecoverWalUnlocked(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    void EnsureWalLock();      // TSK133_Race_in_Nonce_Log_Recovery acquire/process-level guard
-    void AppendWalEntryUnlocked(uint64_t counter,
-                                std::span<const uint8_t, 32> mac); // TSK_CRIT_01_Nonce_Replay_Stopgap journal writes
-    void ApplyWalEntries(const std::vector<LogEntry>& entries);     // TSK_CRIT_01_Nonce_Replay_Stopgap WAL replay
-    void ClearWalUnlocked();                                        // TSK_CRIT_01_Nonce_Replay_Stopgap truncate WAL
-    size_t wal_dirty_entries_{0};                                   // TSK_CRIT_01_Nonce_Replay_Stopgap pending journal count
+    void EnsureFileLock();      // TSK133_Race_in_Nonce_Log_Recovery acquire/process-level guard
+    void AppendEntryToFileUnlocked(
+        uint64_t counter,
+        std::span<const uint8_t, 32> mac); // TSK_CRIT_09_Nonce_Log_Write_Amplification_DoS append durability
   };
 
   class NonceGenerator {

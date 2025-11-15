@@ -14,7 +14,7 @@
 #include <fstream>
 #include <iostream> // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
 #include <limits>      // TSK095_Memory_Safety_and_Buffer_Bounds overflow guards
-#include <memory>       // TSK133_Race_in_Nonce_Log_Recovery WAL guard lifetime
+#include <memory>       // TSK133_Race_in_Nonce_Log_Recovery file lock lifetime
 #include <mutex>        // TSK023_Production_Crypto_Provider_Complete_Integration sodium init guard
 #include <stdexcept>  // TSK104_Concurrency_Deadlock_and_Lock_Ordering misuse detection
 #include <system_error>
@@ -59,23 +59,11 @@ using qv::crypto::HMAC_SHA256;
 
 namespace {
   constexpr std::array<char, 8> kHeaderMagic{'Q', 'V', 'N', 'O', 'N', 'C', 'E', '1'};
-  constexpr std::array<char, 8> kTrailerMagic{'Q', 'V', 'N', 'T', 'R', 'L', 'R', '1'};
-  constexpr std::array<char, 8> kCommitMagic{'Q', 'V', 'C', 'O', 'M', 'M', 'I'}; // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  constexpr std::array<char, 8> kWalMagic{'Q', 'V', 'W', 'A', 'L', '0', '1', 'A'}; // TSK021_Nonce_Log_Durability_and_Crash_Safety
   constexpr uint32_t kLogVersion = 1;
-  constexpr uint32_t kWalVersion = 1; // TSK021_Nonce_Log_Durability_and_Crash_Safety
   constexpr size_t kMacSize = 32;
   constexpr size_t kEntrySize = sizeof(uint64_t) + kMacSize;
-  constexpr size_t kWalHeaderSize = kWalMagic.size() + sizeof(uint32_t) + sizeof(uint32_t) +
-                                    sizeof(uint64_t) + sizeof(uint32_t); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  constexpr size_t kWalEntryPayloadSize = sizeof(uint64_t) + kMacSize; // TSK_CRIT_01_Nonce_Replay_Stopgap entry payload size
-  constexpr size_t kWalCheckpointInterval = 1024;                      // TSK_CRIT_01_Nonce_Replay_Stopgap snapshot cadence
-
-  enum class WalRecordType : uint32_t { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    kSnapshotBegin = 1,
-    kSnapshotCommit = 2,
-    kAppendEntry = 3,
-  };
+  constexpr size_t kHeaderSize =
+      kHeaderMagic.size() + sizeof(uint32_t) + kMacSize; // TSK_CRIT_09_Nonce_Log_Write_Amplification_DoS
 
 #ifdef _WIN32
   using NativeStat = struct _stat64; // TSK021_Nonce_Log_Durability_and_Crash_Safety
@@ -90,8 +78,6 @@ namespace {
     }
     return dir;
   }
-
-  uint32_t ComputeFNV1a(std::span<const uint8_t> data); // TSK021_Nonce_Log_Durability_and_Crash_Safety forward decl
 
   template <typename Target, typename Source>
   Target CheckedUnsignedCast(Source value, const char* context) { // TSK100_Integer_Overflow_and_Arithmetic cast guard
@@ -242,13 +228,7 @@ namespace {
     }
   }
 
-  std::filesystem::path WalPathFor(const std::filesystem::path& path) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    auto wal = path;
-    wal += ".wal";
-    return wal;
-  }
-
-  std::filesystem::path WalLockPathFor(const std::filesystem::path& path) { // TSK133_Race_in_Nonce_Log_Recovery lock file suffix
+  std::filesystem::path LockPathFor(const std::filesystem::path& path) { // TSK133_Race_in_Nonce_Log_Recovery lock file suffix
     auto lock = path;
     lock += ".lock";
     return lock;
@@ -273,20 +253,20 @@ namespace {
       if (handle_ == INVALID_HANDLE_VALUE) {
         auto err = static_cast<int>(::GetLastError());
         throw Error{ErrorDomain::IO, err,
-                    "Failed to lock nonce WAL " + qv::PathToUtf8String(path)};
+                    "Failed to lock nonce log " + qv::PathToUtf8String(path)};
       }
 #else
       fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
       if (fd_ < 0) {
         throw Error{ErrorDomain::IO, errno,
-                    "Failed to open nonce WAL lock " + qv::PathToUtf8String(path)};
+                    "Failed to open nonce log lock " + qv::PathToUtf8String(path)};
       }
       if (::flock(fd_, LOCK_EX) != 0) {
         int err = errno;
         ::close(fd_);
         fd_ = -1;
         throw Error{ErrorDomain::IO, err,
-                    "Failed to acquire nonce WAL lock " + qv::PathToUtf8String(path)};
+                    "Failed to acquire nonce log lock " + qv::PathToUtf8String(path)};
       }
 #endif
     }
@@ -368,47 +348,6 @@ namespace {
     std::filesystem::path path_;
   };
 
-  void WriteWalRecord(const std::filesystem::path& wal_path, WalRecordType type,
-                      std::span<const uint8_t> payload) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    int flags = 0;
-#ifdef _WIN32
-    flags = _O_WRONLY | _O_CREAT | _O_APPEND;
-    int fd = NativeOpen(wal_path, flags, _S_IREAD | _S_IWRITE);
-#else
-    flags = O_WRONLY | O_CREAT | O_APPEND;
-    int fd = NativeOpen(wal_path, flags, 0600);
-#endif
-    if (fd < 0) {
-      throw Error{ErrorDomain::IO, errno, "Failed to open nonce WAL"};
-    }
-
-    std::vector<uint8_t> record;
-    record.insert(record.end(), kWalMagic.begin(), kWalMagic.end());
-    uint32_t version_le = qv::ToLittleEndian(kWalVersion);
-    record.insert(record.end(), reinterpret_cast<uint8_t*>(&version_le),
-                  reinterpret_cast<uint8_t*>(&version_le) + sizeof(version_le));
-    uint32_t type_le = qv::ToLittleEndian(static_cast<uint32_t>(type));
-    record.insert(record.end(), reinterpret_cast<uint8_t*>(&type_le),
-                  reinterpret_cast<uint8_t*>(&type_le) + sizeof(type_le));
-    uint64_t size_le = qv::ToLittleEndian(static_cast<uint64_t>(payload.size()));
-    record.insert(record.end(), reinterpret_cast<uint8_t*>(&size_le),
-                  reinterpret_cast<uint8_t*>(&size_le) + sizeof(size_le));
-    uint32_t checksum = ComputeFNV1a(payload);
-    uint32_t checksum_le = qv::ToLittleEndian(checksum);
-    record.insert(record.end(), reinterpret_cast<uint8_t*>(&checksum_le),
-                  reinterpret_cast<uint8_t*>(&checksum_le) + sizeof(checksum_le));
-    record.insert(record.end(), payload.begin(), payload.end());
-
-    try {
-      WriteAll(fd, record);
-      SyncFileDescriptor(fd);
-    } catch (...) {
-      NativeClose(fd);
-      throw;
-    }
-    NativeClose(fd);
-  }
-
   void WriteSnapshotFile(const std::filesystem::path& path,
                          std::span<const uint8_t> bytes) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
     auto temp_path = path;
@@ -464,104 +403,6 @@ namespace {
 #ifndef _WIN32
     SyncDirectory(ResolveDirectory(path));
 #endif
-  }
-
-  struct WalReplayState { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    bool has_pending_snapshot{false};
-    std::vector<uint8_t> pending_snapshot;
-    std::vector<NonceLog::LogEntry> append_entries; // TSK_CRIT_01_Nonce_Replay_Stopgap
-  };
-
-  WalReplayState ParseWal(const std::vector<uint8_t>& wal_bytes) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    WalReplayState state;
-    size_t offset = 0;
-    while (offset + kWalHeaderSize <= wal_bytes.size()) {
-      if (offset > wal_bytes.size()) { // TSK095_Memory_Safety_and_Buffer_Bounds
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL offset exceeds buffer"};
-      }
-      if (kWalHeaderSize > wal_bytes.size() - offset) { // TSK095_Memory_Safety_and_Buffer_Bounds
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL truncated"};
-      }
-      const uint8_t* base = wal_bytes.data() + offset;
-      if (!std::equal(kWalMagic.begin(), kWalMagic.end(), base)) {
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL magic mismatch"};
-      }
-      base += kWalMagic.size();
-      uint32_t version_le;
-      std::memcpy(&version_le, base, sizeof(version_le));
-      base += sizeof(version_le);
-      uint32_t version = qv::ToLittleEndian(version_le);
-      if (version != kWalVersion) {
-        throw Error{ErrorDomain::Validation, static_cast<int>(version), "Nonce WAL version"};
-      }
-      uint32_t type_le;
-      std::memcpy(&type_le, base, sizeof(type_le));
-      base += sizeof(type_le);
-      auto type = static_cast<WalRecordType>(qv::ToLittleEndian(type_le));
-      uint64_t size_le;
-      std::memcpy(&size_le, base, sizeof(size_le));
-      base += sizeof(size_le);
-      uint64_t payload_size = qv::ToLittleEndian(size_le);
-      uint32_t checksum_le;
-      std::memcpy(&checksum_le, base, sizeof(checksum_le));
-      base += sizeof(checksum_le);
-      uint32_t checksum = qv::ToLittleEndian(checksum_le);
-      size_t header_consumed = kWalHeaderSize;
-      if (payload_size > std::numeric_limits<size_t>::max()) { // TSK095_Memory_Safety_and_Buffer_Bounds
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL payload too large"};
-      }
-      size_t payload_length = static_cast<size_t>(payload_size);
-      if (header_consumed > wal_bytes.size() - offset ||
-          payload_length > wal_bytes.size() - offset - header_consumed) { // TSK095_Memory_Safety_and_Buffer_Bounds
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL truncated"};
-      }
-      const size_t payload_offset = offset + header_consumed;
-      std::span<const uint8_t> payload{wal_bytes.data() + payload_offset, payload_length};
-      if (ComputeFNV1a(payload) != checksum) {
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL checksum mismatch"};
-      }
-      size_t record_advance = header_consumed + payload_length;               // TSK095_Memory_Safety_and_Buffer_Bounds
-      // overflow guard TSK095_Memory_Safety_and_Buffer_Bounds
-      if (record_advance < header_consumed ||
-          offset > std::numeric_limits<size_t>::max() - record_advance) {
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL offset overflow"};
-      }
-      offset += record_advance;
-      if (type == WalRecordType::kSnapshotBegin) {
-        state.has_pending_snapshot = true;
-        state.pending_snapshot.assign(payload.begin(), payload.end());
-      } else if (type == WalRecordType::kSnapshotCommit) {
-        state.has_pending_snapshot = false;
-        state.pending_snapshot.clear();
-      } else if (type == WalRecordType::kAppendEntry) {
-        state.append_entries.push_back(ParseWalEntry(payload));
-      } else {
-        throw Error{ErrorDomain::Validation, 0, "Nonce WAL record type"};
-      }
-    }
-    if (offset != wal_bytes.size()) {
-      throw Error{ErrorDomain::Validation, 0, "Nonce WAL trailing bytes"};
-    }
-    return state;
-  }
-
-  void EnsureIntegrityMarker(const std::vector<uint8_t>& bytes) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    if (bytes.size() < kCommitMagic.size()) {
-      throw Error{ErrorDomain::Validation, 0, "Nonce log missing integrity marker"};
-    }
-    auto marker_begin = bytes.end() - static_cast<std::ptrdiff_t>(kCommitMagic.size());
-    if (!std::equal(kCommitMagic.begin(), kCommitMagic.end(), marker_begin)) {
-      throw Error{ErrorDomain::Validation, 0, "Nonce log integrity marker mismatch"};
-    }
-  }
-
-  uint32_t ComputeFNV1a(std::span<const uint8_t> data) {
-    uint32_t hash = 2166136261u;
-    for (auto byte : data) {
-      hash ^= byte;
-      hash *= 16777619u;
-    }
-    return hash;
   }
 
   // TSK_CRIT_19: The binding parameter should contain a hash of PLAINTEXT data or other
@@ -704,62 +545,25 @@ namespace {
     out.insert(out.end(), mac.begin(), mac.end());
   }
 
-  std::vector<uint8_t> SerializeWalEntry(uint64_t counter,
-                                         std::span<const uint8_t, kMacSize> mac) { // TSK_CRIT_01_Nonce_Replay_Stopgap
-    std::vector<uint8_t> payload;
-    payload.reserve(kWalEntryPayloadSize);
-    uint64_t counter_be = qv::ToBigEndian(counter);
-    uint8_t counter_bytes[sizeof(counter_be)];
-    std::memcpy(counter_bytes, &counter_be, sizeof(counter_be));
-    payload.insert(payload.end(), counter_bytes, counter_bytes + sizeof(counter_bytes));
-    payload.insert(payload.end(), mac.begin(), mac.end());
-    return payload;
-  }
-
-  NonceLog::LogEntry ParseWalEntry(std::span<const uint8_t> payload) { // TSK_CRIT_01_Nonce_Replay_Stopgap
-    if (payload.size() != kWalEntryPayloadSize) {
-      throw Error{ErrorDomain::Validation, 0, "Nonce WAL entry malformed"};
-    }
-    uint64_t counter_be = 0;
-    std::memcpy(&counter_be, payload.data(), sizeof(counter_be));
-    uint64_t counter = qv::ToBigEndian(counter_be);
-    std::array<uint8_t, kMacSize> mac{};
-    std::copy(payload.begin() + sizeof(counter_be), payload.end(), mac.begin());
-    return NonceLog::LogEntry{counter, mac};
-  }
-
-  void AppendTrailer(std::vector<uint8_t>& out, uint32_t checksum, uint32_t entry_count) {
-    out.insert(out.end(), kTrailerMagic.begin(), kTrailerMagic.end());
-    uint32_t checksum_le = qv::ToLittleEndian(checksum);
-    uint8_t checksum_bytes[4];
-    std::memcpy(checksum_bytes, &checksum_le, sizeof(checksum_le));
-    out.insert(out.end(), checksum_bytes, checksum_bytes + sizeof(checksum_bytes));
-    uint32_t count_le = qv::ToLittleEndian(entry_count);
-    uint8_t count_bytes[4];
-    std::memcpy(count_bytes, &count_le, sizeof(count_le));
-    out.insert(out.end(), count_bytes, count_bytes + sizeof(count_bytes));
-  }
-
 } // namespace
 
-void NonceLog::EnsureWalLock() {                                        // TSK133_Race_in_Nonce_Log_Recovery lazy guard setup
-  if (wal_lock_) {
+void NonceLog::EnsureFileLock() {                                      // TSK133_Race_in_Nonce_Log_Recovery lazy guard setup
+  if (file_lock_) {
     return;
   }
   if (path_.empty()) {
     throw std::logic_error("NonceLog path must be set before locking");
   }
-  auto lock_path = WalLockPathFor(path_);
-  wal_lock_ = std::make_unique<FileLock>(lock_path);
+  auto lock_path = LockPathFor(path_);
+  file_lock_ = std::make_unique<FileLock>(lock_path);
 }
 
 NonceLog::NonceLog(const std::filesystem::path& path) : path_(path) {
   if (!path_.parent_path().empty()) {
     std::filesystem::create_directories(path_.parent_path());
   }
-  EnsureWalLock();
+  EnsureFileLock();
   std::lock_guard<std::mutex> lock(mu_);
-  RecoverWalUnlocked(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   if (std::filesystem::exists(path_)) {
     ReloadUnlocked();
   } else {
@@ -779,7 +583,7 @@ void NonceLog::InitializeNewLog() {
   if (!path_.parent_path().empty()) {
     std::filesystem::create_directories(path_.parent_path());
   }
-  EnsureWalLock();
+  EnsureFileLock();
   GenerateKey(key_);
   last_mac_.fill(0);
   entries_.clear();
@@ -787,7 +591,7 @@ void NonceLog::InitializeNewLog() {
 }
 
 void NonceLog::EnsureLoadedUnlocked() {
-  EnsureWalLock();
+  EnsureFileLock();
   if (loaded_) {
     return;
   }
@@ -799,50 +603,8 @@ void NonceLog::EnsureLoadedUnlocked() {
   ReloadUnlocked();
 }
 
-void NonceLog::RecoverWalUnlocked() { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  EnsureWalLock();
-  auto wal_path = WalPathFor(path_);
-  wal_dirty_entries_ = 0;
-  if (!std::filesystem::exists(wal_path)) {
-    return;
-  }
-  std::ifstream wal(wal_path, std::ios::binary);
-  if (!wal.is_open()) {
-    throw Error{ErrorDomain::IO, 0,
-                "Failed to open nonce WAL " + qv::PathToUtf8String(wal_path)};
-  }
-  wal.seekg(0, std::ios::end);
-  auto size = static_cast<std::streamoff>(wal.tellg());
-  wal.seekg(0, std::ios::beg);
-  if (size < 0) {
-    throw Error{ErrorDomain::IO, 0, "Failed to determine nonce WAL size"};
-  }
-  if (size == 0) {
-    return;
-  }
-  std::vector<uint8_t> wal_bytes(static_cast<size_t>(size));
-  wal.read(reinterpret_cast<char*>(wal_bytes.data()), static_cast<std::streamsize>(wal_bytes.size()));
-  if (!wal) {
-    throw Error{ErrorDomain::IO, 0,
-                "Failed to read nonce WAL " + qv::PathToUtf8String(wal_path)};
-  }
-  auto state = ParseWal(wal_bytes);
-  bool performed_recovery = false;
-  if (state.has_pending_snapshot) {
-    EnsureIntegrityMarker(state.pending_snapshot);
-    WriteSnapshotFile(path_, state.pending_snapshot);
-    performed_recovery = true;
-  }
-  if (!state.append_entries.empty()) {
-    ApplyWalEntries(state.append_entries);
-    performed_recovery = true;
-  }
-  ClearWalUnlocked();
-  (void)performed_recovery;
-}
-
 void NonceLog::ReloadUnlocked() {
-  EnsureWalLock();
+  EnsureFileLock();
   std::ifstream in(path_, std::ios::binary);
   if (!in.is_open()) {
     throw Error{ErrorDomain::IO, 0,
@@ -852,8 +614,7 @@ void NonceLog::ReloadUnlocked() {
   in.seekg(0, std::ios::end);
   auto size = static_cast<std::streamoff>(in.tellg());
   in.seekg(0, std::ios::beg);
-  if (size < static_cast<std::streamoff>(kHeaderMagic.size() + 4 + kMacSize +
-                                         kTrailerMagic.size() + 8 + kCommitMagic.size())) {
+  if (size < static_cast<std::streamoff>(kHeaderSize)) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};
   }
   std::vector<uint8_t> data(static_cast<size_t>(size));
@@ -864,150 +625,52 @@ void NonceLog::ReloadUnlocked() {
                     qv::PathToUtf8String(path_)}; // TSK016_Windows_Compatibility_Fixes
   }
 
-  EnsureIntegrityMarker(data); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-
-  const size_t committed_size = data.size() - kCommitMagic.size();
-
-  const size_t trailer_size = CheckedAdd(kTrailerMagic.size(), size_t{8},
-                                         "Nonce log trailer size overflow"); // TSK100_Integer_Overflow_and_Arithmetic trailer guard
-  size_t minimum_payload = CheckedAdd(trailer_size, kHeaderMagic.size(),
-                                      "Nonce log minimum payload overflow (header)"); // TSK100_Integer_Overflow_and_Arithmetic
-  minimum_payload = CheckedAdd(minimum_payload, sizeof(uint32_t),
-                               "Nonce log minimum payload overflow (version)");     // TSK100_Integer_Overflow_and_Arithmetic
-  minimum_payload = CheckedAdd(minimum_payload, kMacSize,
-                               "Nonce log minimum payload overflow (mac)");         // TSK100_Integer_Overflow_and_Arithmetic
-  if (committed_size < minimum_payload) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log too small"};
-  }
-
-  const size_t payload_size = committed_size - trailer_size;
-  if (payload_size > data.size()) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log payload overflow"}; // TSK100_Integer_Overflow_and_Arithmetic pointer guard
-  }
-  const uint8_t* payload = data.data();
-  const uint8_t* payload_end = data.data() + payload_size;                    // TSK030
-  const uint8_t* trailer_ptr = data.data() + payload_size;
-  const uint8_t* committed_end = data.data() + committed_size;                // TSK030
-
-  auto ensure_range = [](const uint8_t* cursor, const uint8_t* limit,
-                         size_t needed) -> bool { // TSK095_Memory_Safety_and_Buffer_Bounds
-    if (cursor > limit) {
-      return false;
-    }
-    size_t remaining = static_cast<size_t>(limit - cursor);
-    return needed <= remaining;
-  };
-
-  auto ensure_payload = [&](size_t needed) {                                  // TSK030
-    if (!ensure_range(payload, payload_end, needed)) {                        // TSK095_Memory_Safety_and_Buffer_Bounds
-      throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};        // TSK030
-    }
-  };
-
-  auto ensure_trailer = [&](size_t needed) {                                  // TSK030
-    if (!ensure_range(trailer_ptr, committed_end, needed)) {                  // TSK095_Memory_Safety_and_Buffer_Bounds
-      throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};        // TSK030
-    }
-  };
-
-  ensure_trailer(kTrailerMagic.size());                                       // TSK030
-  if (!std::equal(kTrailerMagic.begin(), kTrailerMagic.end(), trailer_ptr)) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log trailer missing"};
-  }
-  trailer_ptr += kTrailerMagic.size();
-
-  uint32_t stored_checksum_le;
-  ensure_trailer(sizeof(stored_checksum_le));                                 // TSK030
-  std::memcpy(&stored_checksum_le, trailer_ptr, sizeof(stored_checksum_le));
-  trailer_ptr += sizeof(stored_checksum_le);
-  uint32_t stored_checksum = qv::ToLittleEndian(stored_checksum_le);
-
-  uint32_t stored_count_le;
-  ensure_trailer(sizeof(stored_count_le));                                    // TSK030
-  std::memcpy(&stored_count_le, trailer_ptr, sizeof(stored_count_le));
-  uint32_t stored_count = qv::ToLittleEndian(stored_count_le);
-
-  ensure_payload(kHeaderMagic.size());                                        // TSK030
-  if (!std::equal(kHeaderMagic.begin(), kHeaderMagic.end(), payload)) {
+  const uint8_t* cursor = data.data();
+  if (!std::equal(kHeaderMagic.begin(), kHeaderMagic.end(), cursor)) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log header magic mismatch"};
   }
-  payload += kHeaderMagic.size();
+  cursor += kHeaderMagic.size();
 
-  uint32_t version_le;
-  ensure_payload(sizeof(version_le));                                         // TSK030
-  std::memcpy(&version_le, payload, sizeof(version_le));
-  payload += sizeof(version_le);
+  uint32_t version_le = 0;
+  std::memcpy(&version_le, cursor, sizeof(version_le));
+  cursor += sizeof(version_le);
   uint32_t version = qv::ToLittleEndian(version_le);
   if (version != kLogVersion) {
     throw Error{ErrorDomain::Validation, static_cast<int>(version),
                 "Nonce log version unsupported"};
   }
 
-  ensure_payload(kMacSize);                                                   // TSK030
-  std::copy(payload, payload + kMacSize, key_.begin());
-  payload += kMacSize;
+  std::copy(cursor, cursor + kMacSize, key_.begin());
+  cursor += kMacSize;
 
-  if (payload > payload_end) {                                                // TSK095_Memory_Safety_and_Buffer_Bounds
+  size_t payload_remaining = data.size() - kHeaderSize;
+  if (payload_remaining % kEntrySize != 0) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};
-  }
-  const size_t entries_bytes = static_cast<size_t>(payload_end - payload);    // TSK030
-  const size_t header_overhead = CheckedAdd(CheckedAdd(kHeaderMagic.size(), sizeof(uint32_t),
-                                                       "Nonce log header overhead overflow"),
-                                            kMacSize,
-                                            "Nonce log MAC overhead overflow"); // TSK100_Integer_Overflow_and_Arithmetic header guard
-  if (entries_bytes < header_overhead) { // TSK_CRIT_15 prevent underflow
-    throw Error{ErrorDomain::Validation, 0, "Nonce log entries truncated"};
-  }
-  const size_t entry_bytes = entries_bytes - header_overhead; // TSK_CRIT_15 safe after bounds check
-  if (entry_bytes % kEntrySize != 0) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log entry misalignment"};
-  }
-
-  const size_t computed_count = entry_bytes / kEntrySize;
-  if (computed_count > std::numeric_limits<uint32_t>::max()) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log entry count overflow"}; // TSK100_Integer_Overflow_and_Arithmetic count guard
-  }
-  const uint32_t computed_count32 = static_cast<uint32_t>(computed_count);
-  const bool count_mismatch = stored_count != computed_count32;  // TSK108_Data_Structure_Invariants derive from entries size
-
-  uint32_t computed_checksum =
-      ComputeFNV1a(std::span<const uint8_t>(data.data(), payload_size));
-  if (stored_checksum != computed_checksum) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log checksum mismatch"};
   }
 
   entries_.clear();
-  entries_.reserve(computed_count);
+  entries_.reserve(payload_remaining / kEntrySize);
   std::array<uint8_t, kMacSize> prev{};
-
-  for (uint32_t i = 0; i < computed_count32; ++i) {
-    uint64_t counter_be;
-    ensure_payload(sizeof(counter_be));                                       // TSK030
-    std::memcpy(&counter_be, payload, sizeof(counter_be));
-    payload += sizeof(counter_be);
+  for (size_t offset = 0; offset < payload_remaining; offset += kEntrySize) {
+    const uint8_t* entry_ptr = cursor + offset;
+    uint64_t counter_be = 0;
+    std::memcpy(&counter_be, entry_ptr, sizeof(counter_be));
     uint64_t counter = qv::ToBigEndian(counter_be);
-
     std::array<uint8_t, kMacSize> mac{};
-    ensure_payload(kMacSize);                                                 // TSK030
-    std::copy(payload, payload + kMacSize, mac.begin());
-    payload += kMacSize;
-
+    std::copy(entry_ptr + sizeof(counter_be),
+              entry_ptr + sizeof(counter_be) + kMacSize, mac.begin());
+    if (!entries_.empty() && counter <= entries_.back().counter) {
+      throw Error{ErrorDomain::Validation, 0, "Nonce log counters not monotonic"};
+    }
     auto expected = ComputeMac(prev, counter, key_);
     if (!std::equal(expected.begin(), expected.end(), mac.begin())) {
       throw Error{ErrorDomain::Validation, 0, "Nonce log MAC chain broken"};
     }
-
     entries_.push_back(LogEntry{counter, mac});
     prev = mac;
   }
 
   last_mac_ = entries_.empty() ? std::array<uint8_t, kMacSize>{} : entries_.back().mac;
-
-  if (count_mismatch) {  // TSK108_Data_Structure_Invariants rewrite trailer from canonical size
-    PersistUnlocked();
-    return;
-  }
-
   loaded_ = true;
 }
 
@@ -1016,72 +679,40 @@ void NonceLog::PersistUnlocked() {
     mu_.unlock();
     throw std::logic_error("PersistUnlocked requires caller to hold mu_");
   }
-  EnsureWalLock();
-  std::vector<uint8_t> buffer = SerializeHeader(kLogVersion, kHeaderMagic, key_);
+  EnsureFileLock();
+  std::vector<uint8_t> file_bytes = SerializeHeader(kLogVersion, kHeaderMagic, key_);
   for (const auto& entry : entries_) {
-    AppendEntryBytes(buffer, entry.counter, entry.mac);
+    AppendEntryBytes(file_bytes, entry.counter, entry.mac);
   }
-
-  uint32_t checksum = ComputeFNV1a(buffer);
-  std::vector<uint8_t> file_bytes = buffer;
-  const uint32_t entry_count =
-      CheckedUnsignedCast<uint32_t>(entries_.size(), "Nonce log entry count overflow"); // TSK100_Integer_Overflow_and_Arithmetic cast guard
-  AppendTrailer(file_bytes, checksum, entry_count);
-  file_bytes.insert(file_bytes.end(), kCommitMagic.begin(), kCommitMagic.end()); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-
-  auto wal_path = WalPathFor(path_); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  WriteWalRecord(wal_path, WalRecordType::kSnapshotBegin, file_bytes); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  try {
-    WriteSnapshotFile(path_, file_bytes); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  } catch (...) {
-    throw;
-  }
-  WriteWalRecord(wal_path, WalRecordType::kSnapshotCommit, {}); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  ClearWalUnlocked();
+  WriteSnapshotFile(path_, file_bytes); // TSK021_Nonce_Log_Durability_and_Crash_Safety atomic rewrite when repairing
   loaded_ = true;
 }
 
-void NonceLog::ClearWalUnlocked() { // TSK_CRIT_01_Nonce_Replay_Stopgap reset WAL after checkpoint
-  EnsureWalLock();
-  auto wal_path = WalPathFor(path_);
-  std::error_code ec;
-  if (!std::filesystem::remove(wal_path, ec) && ec) {
-    throw Error{ErrorDomain::IO, ec.value(),
-                "Failed to clear nonce WAL " + qv::PathToUtf8String(wal_path)};
+void NonceLog::AppendEntryToFileUnlocked(
+    uint64_t counter,
+    std::span<const uint8_t, 32> mac) { // TSK_CRIT_09_Nonce_Log_Write_Amplification_DoS
+  EnsureFileLock();
+#ifdef _WIN32
+  int fd = NativeOpen(path_, _O_WRONLY | _O_APPEND, _S_IREAD | _S_IWRITE);
+#else
+  int fd = NativeOpen(path_, O_WRONLY | O_APPEND, 0600);
+#endif
+  if (fd < 0) {
+    throw Error{ErrorDomain::IO, errno,
+                "Failed to open nonce log for append"};
   }
-  wal_dirty_entries_ = 0;
-}
-
-void NonceLog::AppendWalEntryUnlocked(uint64_t counter,
-                                      std::span<const uint8_t, 32> mac) { // TSK_CRIT_01_Nonce_Replay_Stopgap
-  EnsureWalLock();
-  auto wal_path = WalPathFor(path_);
-  auto payload = SerializeWalEntry(counter, mac);
-  WriteWalRecord(wal_path, WalRecordType::kAppendEntry, payload);
-}
-
-void NonceLog::ApplyWalEntries(const std::vector<LogEntry>& entries) { // TSK_CRIT_01_Nonce_Replay_Stopgap
-  if (entries.empty()) {
-    return;
+  std::array<uint8_t, kEntrySize> record{};
+  uint64_t counter_be = qv::ToBigEndian(counter);
+  std::memcpy(record.data(), &counter_be, sizeof(counter_be));
+  std::memcpy(record.data() + sizeof(counter_be), mac.data(), mac.size());
+  try {
+    WriteAll(fd, std::span<const uint8_t>(record.data(), record.size()));
+    SyncFileDescriptor(fd);
+  } catch (...) {
+    NativeClose(fd);
+    throw;
   }
-  if (!std::filesystem::exists(path_)) {
-    throw Error{ErrorDomain::IO, 0,
-                "Nonce log missing for WAL replay at " + qv::PathToUtf8String(path_)};
-  }
-  loaded_ = false;
-  ReloadUnlocked();
-  bool appended = false;
-  for (const auto& entry : entries) {
-    if (!entries_.empty() && entry.counter <= entries_.back().counter) {
-      continue;
-    }
-    entries_.push_back(entry);
-    last_mac_ = entry.mac;
-    appended = true;
-  }
-  if (appended) {
-    PersistUnlocked();
-  }
+  NativeClose(fd);
 }
 
 std::array<uint8_t, 32> NonceLog::Append(uint64_t counter,
@@ -1092,13 +723,9 @@ std::array<uint8_t, 32> NonceLog::Append(uint64_t counter,
     throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
   }
   auto mac = ComputeMac(last_mac_, counter, key_, binding);
-  AppendWalEntryUnlocked(counter, mac); // TSK_CRIT_01_Nonce_Replay_Stopgap journal durability
+  AppendEntryToFileUnlocked(counter, std::span<const uint8_t, 32>(mac)); // TSK_CRIT_09_Nonce_Log_Write_Amplification_DoS append-only persistence
   entries_.push_back(LogEntry{counter, mac});
   last_mac_ = mac;
-  wal_dirty_entries_ += 1;
-  if (wal_dirty_entries_ >= kWalCheckpointInterval) {
-    PersistUnlocked();
-  }
   return mac; // TSK014
 }
 
@@ -1116,7 +743,7 @@ bool NonceLog::VerifyChain() {
 size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
   std::lock_guard<std::mutex> lock(mu_);
   loaded_ = false;
-  RecoverWalUnlocked();
+  EnsureFileLock();
 
   if (!std::filesystem::exists(path_)) {
     entries_.clear();
@@ -1142,6 +769,10 @@ size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
     return 0;
   }
 
+  if (size < static_cast<std::streamoff>(kHeaderSize)) {
+    throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};
+  }
+
   std::vector<uint8_t> data(static_cast<size_t>(size));
   in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
   if (!in) {
@@ -1149,121 +780,69 @@ size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
                 "Failed to read nonce log " + qv::PathToUtf8String(path_)};
   }
 
-  EnsureIntegrityMarker(data);
-
-  const size_t committed_size = data.size() - kCommitMagic.size();
-  const size_t trailer_size = CheckedAdd(kTrailerMagic.size(), size_t{8},
-                                         "Nonce log trailer size overflow"); // TSK100_Integer_Overflow_and_Arithmetic trailer guard
-  size_t minimum_payload = CheckedAdd(trailer_size, kHeaderMagic.size(),
-                                      "Nonce log minimum payload overflow (header)"); // TSK100_Integer_Overflow_and_Arithmetic
-  minimum_payload = CheckedAdd(minimum_payload, sizeof(uint32_t),
-                               "Nonce log minimum payload overflow (version)");     // TSK100_Integer_Overflow_and_Arithmetic
-  minimum_payload = CheckedAdd(minimum_payload, kMacSize,
-                               "Nonce log minimum payload overflow (mac)");         // TSK100_Integer_Overflow_and_Arithmetic
-  if (committed_size < minimum_payload) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log too small"};
-  }
-
-  const size_t payload_size = committed_size - trailer_size;
-  if (payload_size > data.size()) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log payload overflow"}; // TSK100_Integer_Overflow_and_Arithmetic pointer guard
-  }
-  const uint8_t* payload = data.data();
-  const uint8_t* payload_end = data.data() + payload_size;
-  const uint8_t* trailer_ptr = data.data() + payload_size;
-
-  if (!std::equal(kHeaderMagic.begin(), kHeaderMagic.end(), payload)) {
+  const uint8_t* cursor = data.data();
+  if (!std::equal(kHeaderMagic.begin(), kHeaderMagic.end(), cursor)) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log header magic mismatch"};
   }
-  payload += kHeaderMagic.size();
+  cursor += kHeaderMagic.size();
 
   uint32_t version_le = 0;
-  std::memcpy(&version_le, payload, sizeof(version_le));
-  payload += sizeof(version_le);
+  std::memcpy(&version_le, cursor, sizeof(version_le));
+  cursor += sizeof(version_le);
   uint32_t version = qv::ToLittleEndian(version_le);
   if (version != kLogVersion) {
     throw Error{ErrorDomain::Validation, static_cast<int>(version),
                 "Nonce log version unsupported"};
   }
 
-  if (static_cast<size_t>(payload_end - payload) < kMacSize) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log truncated"};
-  }
-  std::copy(payload, payload + kMacSize, key_.begin());
-  payload += kMacSize;
+  std::copy(cursor, cursor + kMacSize, key_.begin());
+  cursor += kMacSize;
 
-  if (!std::equal(kTrailerMagic.begin(), kTrailerMagic.end(), trailer_ptr)) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce log trailer missing"};
-  }
-  trailer_ptr += kTrailerMagic.size();
-
-  uint32_t stored_checksum_le = 0;
-  std::memcpy(&stored_checksum_le, trailer_ptr, sizeof(stored_checksum_le));
-  trailer_ptr += sizeof(stored_checksum_le);
-  uint32_t stored_checksum = qv::ToLittleEndian(stored_checksum_le);
-
-  uint32_t stored_count_le = 0;
-  std::memcpy(&stored_count_le, trailer_ptr, sizeof(stored_count_le));
-  uint32_t stored_count = qv::ToLittleEndian(stored_count_le);
-
-  const size_t entries_bytes = static_cast<size_t>(payload_end - payload);
-  const size_t header_overhead = CheckedAdd(CheckedAdd(kHeaderMagic.size(), sizeof(uint32_t),
-                                                       "Nonce log header overhead overflow"),
-                                            kMacSize,
-                                            "Nonce log MAC overhead overflow"); // TSK100_Integer_Overflow_and_Arithmetic header guard
-  if (entries_bytes < header_overhead) { // TSK_CRIT_15 prevent underflow
-    throw Error{ErrorDomain::Validation, 0, "Nonce log entries truncated"};
-  }
-  const size_t entry_bytes = entries_bytes - header_overhead; // TSK_CRIT_15 safe after bounds check
-  const size_t entry_slots = entry_bytes / kEntrySize;
-  const size_t trailing_bytes = entry_bytes % kEntrySize;
+  size_t payload_remaining = data.size() - kHeaderSize;
+  size_t entry_slots = payload_remaining / kEntrySize;
+  size_t trailing_bytes = payload_remaining % kEntrySize;
 
   std::vector<LogEntry> valid_entries;
   valid_entries.reserve(entry_slots);
   std::array<uint8_t, kMacSize> prev{};
 
+  bool chain_broken = false;
   for (size_t i = 0; i < entry_slots; ++i) {
+    const uint8_t* entry_ptr = cursor + (i * kEntrySize);
     uint64_t counter_be = 0;
-    std::memcpy(&counter_be, payload, sizeof(counter_be));
-    payload += sizeof(counter_be);
+    std::memcpy(&counter_be, entry_ptr, sizeof(counter_be));
     uint64_t counter = qv::ToBigEndian(counter_be);
-
     std::array<uint8_t, kMacSize> mac{};
-    std::copy(payload, payload + kMacSize, mac.begin());
-    payload += kMacSize;
-
+    std::copy(entry_ptr + sizeof(counter_be),
+              entry_ptr + sizeof(counter_be) + kMacSize, mac.begin());
     if (!valid_entries.empty() && counter <= valid_entries.back().counter) {
+      chain_broken = true;
       break;
     }
-
     auto expected = ComputeMac(prev, counter, key_);
     if (!std::equal(expected.begin(), expected.end(), mac.begin())) {
+      chain_broken = true;
       break;
     }
-
     valid_entries.push_back(LogEntry{counter, mac});
     prev = mac;
   }
-
-  const uint32_t computed_checksum =
-      ComputeFNV1a(std::span<const uint8_t>(data.data(), payload_size));
 
   entries_ = std::move(valid_entries);
   last_mac_ = entries_.empty() ? std::array<uint8_t, kMacSize>{} : entries_.back().mac;
 
   size_t truncated = 0;
-  if (stored_count > entries_.size()) {
-    truncated = stored_count - entries_.size();
-  }
   if (entry_slots > entries_.size()) {
-    truncated = std::max(truncated, entry_slots - entries_.size());
+    truncated = entry_slots - entries_.size();
   }
   if (trailing_bytes != 0) {
     truncated = std::max<size_t>(truncated, 1);
   }
+  if (chain_broken) {
+    truncated = std::max<size_t>(truncated, 1);
+  }
 
-  bool needs_rewrite = truncated > 0 || stored_checksum != computed_checksum;
-  if (needs_rewrite) {
+  if (truncated > 0) {
     PersistUnlocked();
   } else {
     loaded_ = true;
