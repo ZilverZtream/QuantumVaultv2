@@ -90,22 +90,6 @@ NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated(int64_t chunk_inde
     }
     throw Error{ErrorDomain::Security, code, msg};
   }
-  if (chunk_index != kUnboundChunkIndex) { // TSK118_Nonce_Reuse_Vulnerabilities reuse binding
-    auto recycled = recycled_.find(chunk_index);
-    if (recycled != recycled_.end()) {
-      NonceRecord record = recycled->second;
-      record.chunk_index = chunk_index; // TSK118_Nonce_Reuse_Vulnerabilities ensure binding stays explicit
-      if (binding.size() != record.binding_size ||
-          !std::equal(binding.begin(), binding.end(), record.binding.begin(),
-                      record.binding.begin() + record.binding_size)) {
-        throw Error{ErrorDomain::Validation, 0, "Nonce binding mismatch"};
-      }
-      recycled_.erase(recycled);
-      inflight_[record.counter] = record;
-      return record;
-    }
-  }
-
   uint64_t next = counter_;
   counter_ += 1;  // TSK096_Race_Conditions_and_Thread_Safety
 
@@ -120,13 +104,7 @@ NonceGenerator::NonceRecord NonceGenerator::NextAuthenticated(int64_t chunk_inde
     record.binding_size = static_cast<uint8_t>(binding.size());
   }
   record.chunk_index = chunk_index; // TSK118_Nonce_Reuse_Vulnerabilities
-  if (chunk_index == kUnboundChunkIndex) {
-    record.mac = log_.Append(next, binding); // TSK014 legacy immediate commit
-    return record; // TSK014
-  }
-
-  record.mac = log_.Preview(next, binding); // TSK118_Nonce_Reuse_Vulnerabilities defer commit until success
-  inflight_[record.counter] = record; // TSK118_Nonce_Reuse_Vulnerabilities
+  record.mac = log_.Append(next, binding); // TSK_CRIT_01_Nonce_Replay_Stopgap immediate durability
   return record; // TSK014
 }
 
@@ -175,51 +153,6 @@ void NonceGenerator::SetPolicy(uint64_t max_nonces, std::chrono::hours max_age) 
   std::lock_guard<std::mutex> lock(state_mutex_);  // TSK096_Race_Conditions_and_Thread_Safety
   policy_.max_nonces = max_nonces;
   policy_.max_age = max_age;
-}
-
-void NonceGenerator::ReleaseNonce(const NonceRecord& record) { // TSK118_Nonce_Reuse_Vulnerabilities
-  if (record.chunk_index == kUnboundChunkIndex) {
-    throw Error{ErrorDomain::Validation, 0, "Cannot release unbound nonce"};
-  }
-  std::lock_guard<std::mutex> lock(state_mutex_); // TSK067_Nonce_Safety
-  auto it = inflight_.find(record.counter);
-  if (it == inflight_.end()) {
-    throw Error{ErrorDomain::Validation, 0, "Unknown nonce reservation"};
-  }
-  if (it->second.chunk_index != record.chunk_index ||
-      !std::equal(it->second.mac.begin(), it->second.mac.end(), record.mac.begin(), record.mac.end())) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce reservation mismatch"};
-  }
-  if (it->second.binding_size != record.binding_size ||
-      !std::equal(it->second.binding.begin(), it->second.binding.begin() + it->second.binding_size,
-                  record.binding.begin(), record.binding.begin() + record.binding_size)) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce binding mismatch"};
-  }
-  recycled_[record.chunk_index] = it->second;
-  inflight_.erase(it);
-}
-
-void NonceGenerator::CommitNonce(const NonceRecord& record) { // TSK118_Nonce_Reuse_Vulnerabilities
-  if (record.chunk_index == kUnboundChunkIndex) {
-    throw Error{ErrorDomain::Validation, 0, "Cannot commit unbound nonce"};
-  }
-  std::lock_guard<std::mutex> lock(state_mutex_); // TSK067_Nonce_Safety
-  auto it = inflight_.find(record.counter);
-  if (it == inflight_.end()) {
-    throw Error{ErrorDomain::Validation, 0, "Unknown nonce reservation"};
-  }
-  if (it->second.chunk_index != record.chunk_index ||
-      !std::equal(it->second.mac.begin(), it->second.mac.end(), record.mac.begin(), record.mac.end())) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce reservation mismatch"};
-  }
-  if (it->second.binding_size != record.binding_size ||
-      !std::equal(it->second.binding.begin(), it->second.binding.begin() + it->second.binding_size,
-                  record.binding.begin(), record.binding.begin() + record.binding_size)) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce binding mismatch"};
-  }
-  log_.Commit(record.counter, record.mac,
-              std::span<const uint8_t>(record.binding.data(), record.binding_size)); // TSK118_Nonce_Reuse_Vulnerabilities, TSK128_Missing_AAD_Validation_in_Chunks
-  inflight_.erase(it);
 }
 
 std::optional<NonceGenerator::NonceRecord> NonceGenerator::LastPersisted() const { // TSK015

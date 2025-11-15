@@ -68,10 +68,13 @@ namespace {
   constexpr size_t kEntrySize = sizeof(uint64_t) + kMacSize;
   constexpr size_t kWalHeaderSize = kWalMagic.size() + sizeof(uint32_t) + sizeof(uint32_t) +
                                     sizeof(uint64_t) + sizeof(uint32_t); // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  constexpr size_t kWalEntryPayloadSize = sizeof(uint64_t) + kMacSize; // TSK_CRIT_01_Nonce_Replay_Stopgap entry payload size
+  constexpr size_t kWalCheckpointInterval = 1024;                      // TSK_CRIT_01_Nonce_Replay_Stopgap snapshot cadence
 
   enum class WalRecordType : uint32_t { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    kBegin = 1,
-    kCommit = 2,
+    kSnapshotBegin = 1,
+    kSnapshotCommit = 2,
+    kAppendEntry = 3,
   };
 
 #ifdef _WIN32
@@ -464,8 +467,9 @@ namespace {
   }
 
   struct WalReplayState { // TSK021_Nonce_Log_Durability_and_Crash_Safety
-    bool has_pending{false};
-    std::vector<uint8_t> pending;
+    bool has_pending_snapshot{false};
+    std::vector<uint8_t> pending_snapshot;
+    std::vector<NonceLog::LogEntry> append_entries; // TSK_CRIT_01_Nonce_Replay_Stopgap
   };
 
   WalReplayState ParseWal(const std::vector<uint8_t>& wal_bytes) { // TSK021_Nonce_Log_Durability_and_Crash_Safety
@@ -523,12 +527,14 @@ namespace {
         throw Error{ErrorDomain::Validation, 0, "Nonce WAL offset overflow"};
       }
       offset += record_advance;
-      if (type == WalRecordType::kBegin) {
-        state.has_pending = true;
-        state.pending.assign(payload.begin(), payload.end());
-      } else if (type == WalRecordType::kCommit) {
-        state.has_pending = false;
-        state.pending.clear();
+      if (type == WalRecordType::kSnapshotBegin) {
+        state.has_pending_snapshot = true;
+        state.pending_snapshot.assign(payload.begin(), payload.end());
+      } else if (type == WalRecordType::kSnapshotCommit) {
+        state.has_pending_snapshot = false;
+        state.pending_snapshot.clear();
+      } else if (type == WalRecordType::kAppendEntry) {
+        state.append_entries.push_back(ParseWalEntry(payload));
       } else {
         throw Error{ErrorDomain::Validation, 0, "Nonce WAL record type"};
       }
@@ -698,6 +704,30 @@ namespace {
     out.insert(out.end(), mac.begin(), mac.end());
   }
 
+  std::vector<uint8_t> SerializeWalEntry(uint64_t counter,
+                                         std::span<const uint8_t, kMacSize> mac) { // TSK_CRIT_01_Nonce_Replay_Stopgap
+    std::vector<uint8_t> payload;
+    payload.reserve(kWalEntryPayloadSize);
+    uint64_t counter_be = qv::ToBigEndian(counter);
+    uint8_t counter_bytes[sizeof(counter_be)];
+    std::memcpy(counter_bytes, &counter_be, sizeof(counter_be));
+    payload.insert(payload.end(), counter_bytes, counter_bytes + sizeof(counter_bytes));
+    payload.insert(payload.end(), mac.begin(), mac.end());
+    return payload;
+  }
+
+  NonceLog::LogEntry ParseWalEntry(std::span<const uint8_t> payload) { // TSK_CRIT_01_Nonce_Replay_Stopgap
+    if (payload.size() != kWalEntryPayloadSize) {
+      throw Error{ErrorDomain::Validation, 0, "Nonce WAL entry malformed"};
+    }
+    uint64_t counter_be = 0;
+    std::memcpy(&counter_be, payload.data(), sizeof(counter_be));
+    uint64_t counter = qv::ToBigEndian(counter_be);
+    std::array<uint8_t, kMacSize> mac{};
+    std::copy(payload.begin() + sizeof(counter_be), payload.end(), mac.begin());
+    return NonceLog::LogEntry{counter, mac};
+  }
+
   void AppendTrailer(std::vector<uint8_t>& out, uint32_t checksum, uint32_t entry_count) {
     out.insert(out.end(), kTrailerMagic.begin(), kTrailerMagic.end());
     uint32_t checksum_le = qv::ToLittleEndian(checksum);
@@ -772,6 +802,7 @@ void NonceLog::EnsureLoadedUnlocked() {
 void NonceLog::RecoverWalUnlocked() { // TSK021_Nonce_Log_Durability_and_Crash_Safety
   EnsureWalLock();
   auto wal_path = WalPathFor(path_);
+  wal_dirty_entries_ = 0;
   if (!std::filesystem::exists(wal_path)) {
     return;
   }
@@ -796,12 +827,18 @@ void NonceLog::RecoverWalUnlocked() { // TSK021_Nonce_Log_Durability_and_Crash_S
                 "Failed to read nonce WAL " + qv::PathToUtf8String(wal_path)};
   }
   auto state = ParseWal(wal_bytes);
-  if (!state.has_pending) {
-    return;
+  bool performed_recovery = false;
+  if (state.has_pending_snapshot) {
+    EnsureIntegrityMarker(state.pending_snapshot);
+    WriteSnapshotFile(path_, state.pending_snapshot);
+    performed_recovery = true;
   }
-  EnsureIntegrityMarker(state.pending);
-  WriteSnapshotFile(path_, state.pending);
-  WriteWalRecord(wal_path, WalRecordType::kCommit, {});
+  if (!state.append_entries.empty()) {
+    ApplyWalEntries(state.append_entries);
+    performed_recovery = true;
+  }
+  ClearWalUnlocked();
+  (void)performed_recovery;
 }
 
 void NonceLog::ReloadUnlocked() {
@@ -993,14 +1030,58 @@ void NonceLog::PersistUnlocked() {
   file_bytes.insert(file_bytes.end(), kCommitMagic.begin(), kCommitMagic.end()); // TSK021_Nonce_Log_Durability_and_Crash_Safety
 
   auto wal_path = WalPathFor(path_); // TSK021_Nonce_Log_Durability_and_Crash_Safety
-  WriteWalRecord(wal_path, WalRecordType::kBegin, file_bytes); // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  WriteWalRecord(wal_path, WalRecordType::kSnapshotBegin, file_bytes); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   try {
     WriteSnapshotFile(path_, file_bytes); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   } catch (...) {
     throw;
   }
-  WriteWalRecord(wal_path, WalRecordType::kCommit, {}); // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  WriteWalRecord(wal_path, WalRecordType::kSnapshotCommit, {}); // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  ClearWalUnlocked();
   loaded_ = true;
+}
+
+void NonceLog::ClearWalUnlocked() { // TSK_CRIT_01_Nonce_Replay_Stopgap reset WAL after checkpoint
+  EnsureWalLock();
+  auto wal_path = WalPathFor(path_);
+  std::error_code ec;
+  if (!std::filesystem::remove(wal_path, ec) && ec) {
+    throw Error{ErrorDomain::IO, ec.value(),
+                "Failed to clear nonce WAL " + qv::PathToUtf8String(wal_path)};
+  }
+  wal_dirty_entries_ = 0;
+}
+
+void NonceLog::AppendWalEntryUnlocked(uint64_t counter,
+                                      std::span<const uint8_t, 32> mac) { // TSK_CRIT_01_Nonce_Replay_Stopgap
+  EnsureWalLock();
+  auto wal_path = WalPathFor(path_);
+  auto payload = SerializeWalEntry(counter, mac);
+  WriteWalRecord(wal_path, WalRecordType::kAppendEntry, payload);
+}
+
+void NonceLog::ApplyWalEntries(const std::vector<LogEntry>& entries) { // TSK_CRIT_01_Nonce_Replay_Stopgap
+  if (entries.empty()) {
+    return;
+  }
+  if (!std::filesystem::exists(path_)) {
+    throw Error{ErrorDomain::IO, 0,
+                "Nonce log missing for WAL replay at " + qv::PathToUtf8String(path_)};
+  }
+  loaded_ = false;
+  ReloadUnlocked();
+  bool appended = false;
+  for (const auto& entry : entries) {
+    if (!entries_.empty() && entry.counter <= entries_.back().counter) {
+      continue;
+    }
+    entries_.push_back(entry);
+    last_mac_ = entry.mac;
+    appended = true;
+  }
+  if (appended) {
+    PersistUnlocked();
+  }
 }
 
 std::array<uint8_t, 32> NonceLog::Append(uint64_t counter,
@@ -1011,36 +1092,14 @@ std::array<uint8_t, 32> NonceLog::Append(uint64_t counter,
     throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
   }
   auto mac = ComputeMac(last_mac_, counter, key_, binding);
+  AppendWalEntryUnlocked(counter, mac); // TSK_CRIT_01_Nonce_Replay_Stopgap journal durability
   entries_.push_back(LogEntry{counter, mac});
   last_mac_ = mac;
-  PersistUnlocked();
+  wal_dirty_entries_ += 1;
+  if (wal_dirty_entries_ >= kWalCheckpointInterval) {
+    PersistUnlocked();
+  }
   return mac; // TSK014
-}
-
-std::array<uint8_t, 32> NonceLog::Preview(uint64_t counter,
-                                          std::span<const uint8_t> binding) {
-  std::lock_guard<std::mutex> lock(mu_);
-  EnsureLoadedUnlocked();
-  if (!entries_.empty() && counter <= entries_.back().counter) {
-    throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
-  }
-  return ComputeMac(last_mac_, counter, key_, binding); // TSK118_Nonce_Reuse_Vulnerabilities
-}
-
-void NonceLog::Commit(uint64_t counter, std::span<const uint8_t, 32> mac,
-                      std::span<const uint8_t> binding) {
-  std::lock_guard<std::mutex> lock(mu_);
-  EnsureLoadedUnlocked();
-  if (!entries_.empty() && counter <= entries_.back().counter) {
-    throw Error{ErrorDomain::Validation, 0, "Counter not strictly increasing"};
-  }
-  auto expected = ComputeMac(last_mac_, counter, key_, binding);
-  if (!std::equal(expected.begin(), expected.end(), mac.begin(), mac.end())) {
-    throw Error{ErrorDomain::Validation, 0, "Nonce MAC mismatch"}; // TSK118_Nonce_Reuse_Vulnerabilities
-  }
-  entries_.push_back(LogEntry{counter, expected});
-  last_mac_ = expected;
-  PersistUnlocked();
 }
 
 bool NonceLog::VerifyChain() {

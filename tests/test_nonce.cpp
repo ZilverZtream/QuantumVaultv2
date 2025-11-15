@@ -137,49 +137,36 @@ void TestNonceWalRecovery() { // TSK021_Nonce_Log_Durability_and_Crash_Safety
   {
     qv::core::NonceLog log(std::filesystem::path("qv_nonce.log"));
     [[maybe_unused]] auto mac = log.Append(1, std::span<const uint8_t>{}); // TSK128_Missing_AAD_Validation_in_Chunks
+    (void)mac;
   }
   std::filesystem::path wal_path{"qv_nonce.log.wal"};
   assert(std::filesystem::exists(wal_path) && "wal file must exist after append");
   std::ifstream wal_in(wal_path, std::ios::binary);
   std::vector<uint8_t> wal_bytes((std::istreambuf_iterator<char>(wal_in)),
                                  std::istreambuf_iterator<char>());
-  constexpr std::array<char, 8> kWalMagic{'Q', 'V', 'W', 'A', 'L', '0', '1', 'A'};
-  [[maybe_unused]] constexpr uint32_t kWalVersion = 1; // TSK021_Nonce_Log_Durability_and_Crash_Safety
+  constexpr std::array<char, 8> kWalMagic{'Q', 'V', 'W', 'A', 'L', '0', '1', 'A'}; // TSK_CRIT_01_Nonce_Replay_Stopgap
+  constexpr uint32_t kWalVersion = 1;
   constexpr size_t kWalHeaderSize = kWalMagic.size() + sizeof(uint32_t) + sizeof(uint32_t) +
                                     sizeof(uint64_t) + sizeof(uint32_t);
-  size_t offset = 0;
-  size_t last_commit_offset = 0;
-  while (offset + kWalHeaderSize <= wal_bytes.size()) {
-    const uint8_t* base = wal_bytes.data() + offset;
-    assert(std::equal(kWalMagic.begin(), kWalMagic.end(), base) && "wal magic must match");
-    base += kWalMagic.size();
-    uint32_t version_le;
-    std::memcpy(&version_le, base, sizeof(version_le));
-    base += sizeof(version_le);
-    [[maybe_unused]] uint32_t version = qv::ToLittleEndian(version_le);
-    assert(version == kWalVersion && "unexpected wal version");
-    uint32_t type_le;
-    std::memcpy(&type_le, base, sizeof(type_le));
-    base += sizeof(type_le);
-    uint32_t type = qv::ToLittleEndian(type_le);
-    uint64_t size_le;
-    std::memcpy(&size_le, base, sizeof(size_le));
-    base += sizeof(size_le);
-    uint64_t payload_size = qv::ToLittleEndian(size_le);
-    uint32_t checksum_le;
-    std::memcpy(&checksum_le, base, sizeof(checksum_le));
-    base += sizeof(checksum_le);
-    (void)checksum_le;
-    offset += kWalHeaderSize + static_cast<size_t>(payload_size);
-    if (type == 2) {
-      last_commit_offset = offset - (kWalHeaderSize + static_cast<size_t>(payload_size));
-    }
-  }
-  assert(last_commit_offset > 0 && "commit record must exist");
-  std::filesystem::resize_file(wal_path, last_commit_offset);
+  assert(wal_bytes.size() >= kWalHeaderSize + sizeof(uint64_t) + 32 &&
+         "wal record must include append entry");
+  const uint8_t* base = wal_bytes.data();
+  assert(std::equal(kWalMagic.begin(), kWalMagic.end(), base) && "wal magic must match");
+  base += kWalMagic.size();
+  uint32_t version_le;
+  std::memcpy(&version_le, base, sizeof(version_le));
+  base += sizeof(version_le);
+  uint32_t version = qv::ToLittleEndian(version_le);
+  assert(version == kWalVersion && "unexpected wal version");
+  uint32_t type_le;
+  std::memcpy(&type_le, base, sizeof(type_le));
+  uint32_t type = qv::ToLittleEndian(type_le);
+  assert(type == 3 && "wal entry must record append operations"); // TSK_CRIT_01_Nonce_Replay_Stopgap
+
   qv::core::NonceLog recovered(std::filesystem::path("qv_nonce.log"));
   assert(recovered.EntryCount() == 1 && "recovery must preserve entries");
   assert(recovered.GetLastCounter() == 1 && "recovered counter must match");
+  assert(!std::filesystem::exists(wal_path) && "wal should be cleared after recovery");
   qv::core::NonceLog verifier(std::filesystem::path("qv_nonce.log"));
   assert(verifier.EntryCount() == 1 && "log should remain stable post recovery");
 }
@@ -262,36 +249,6 @@ void TestConcurrentNonceGeneration() { // TSK067_Nonce_Safety
   std::filesystem::remove("qv_nonce.log.wal");
 }
 
-void TestNonceReservationLifecycle() { // TSK118_Nonce_Reuse_Vulnerabilities
-  std::filesystem::remove("qv_nonce.log");
-  std::filesystem::remove("qv_nonce.log.wal");
-  qv::core::NonceGenerator generator(99, 0);
-  auto reserved = generator.NextAuthenticated(42);
-  assert(reserved.chunk_index == 42 && "reservation must bind chunk index");
-  generator.CommitNonce(reserved);
-  auto persisted = generator.LastPersisted();
-  assert(persisted.has_value() && persisted->counter == reserved.counter &&
-         "commit must persist nonce");
-
-  auto retry = generator.NextAuthenticated(7);
-  generator.ReleaseNonce(retry);
-  auto reused = generator.NextAuthenticated(7);
-  assert(retry.counter == reused.counter &&
-         std::equal(retry.nonce.begin(), retry.nonce.end(), reused.nonce.begin()) &&
-         "released nonce must be reused for same chunk");
-  generator.CommitNonce(reused);
-
-  bool threw = false;
-  try {
-    generator.ReleaseNonce(reserved);
-  } catch (const qv::Error&) {
-    threw = true;
-  }
-  assert(threw && "unbound nonce release should be rejected");
-  std::filesystem::remove("qv_nonce.log");
-  std::filesystem::remove("qv_nonce.log.wal");
-}
-
 } // namespace
 
 int main() {
@@ -315,7 +272,6 @@ int main() {
   TestNonceWalRecovery();       // TSK021_Nonce_Log_Durability_and_Crash_Safety
   TestNonceDetectsCorruption(); // TSK021_Nonce_Log_Durability_and_Crash_Safety
   TestConcurrentNonceGeneration(); // TSK067_Nonce_Safety
-  TestNonceReservationLifecycle(); // TSK118_Nonce_Reuse_Vulnerabilities
   std::cout << "nonce test ok\n";
   return 0;
 }
