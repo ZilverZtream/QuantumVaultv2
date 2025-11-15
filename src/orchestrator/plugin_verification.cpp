@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 #include <charconv>
+#include <limits>
 
 #include "qv/crypto/ct.h"
 #include "qv/orchestrator/plugin_abi.h"
@@ -35,6 +36,13 @@
 #include <wintrust.h>
 #else
 #include <dlfcn.h>
+#endif
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #if defined(__APPLE__)
@@ -111,6 +119,146 @@ std::optional<PluginCompatibilityRange> ParseAbiRange(std::string_view text) {
   }
   return range;
 }
+
+class PluginFile { // TSK142_Plugin_Security_Bypass_Vulnerabilities maintain single verified handle
+ public:
+  PluginFile() = default;
+  ~PluginFile() { Close(); }
+
+  PluginFile(const PluginFile&) = delete;
+  PluginFile& operator=(const PluginFile&) = delete;
+
+  bool Open(const std::filesystem::path& resolved_path) {
+    Close();
+    resolved_path_ = resolved_path;
+#if defined(_WIN32)
+    std::wstring wide = resolved_path.wstring();
+    handle_ = ::CreateFileW(wide.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle_ == INVALID_HANDLE_VALUE) {
+      resolved_path_.clear();
+      return false;
+    }
+    FILE_STANDARD_INFO info{};
+    if (!::GetFileInformationByHandleEx(handle_, FileStandardInfo, &info, sizeof(info))) {
+      Close();
+      resolved_path_.clear();
+      return false;
+    }
+    if (info.Directory) {
+      Close();
+      resolved_path_.clear();
+      ::SetLastError(ERROR_DIRECTORY_NOT_SUPPORTED);
+      return false;
+    }
+    file_size_ = static_cast<uintmax_t>(info.EndOfFile.QuadPart);
+#else
+    std::string utf8 = resolved_path.string();
+    handle_ = ::open(utf8.c_str(), O_RDONLY | O_CLOEXEC);
+    if (handle_ < 0) {
+      resolved_path_.clear();
+      return false;
+    }
+    struct stat st {
+    };
+    if (::fstat(handle_, &st) != 0) {
+      Close();
+      resolved_path_.clear();
+      return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+      Close();
+      resolved_path_.clear();
+      errno = EINVAL;
+      return false;
+    }
+    file_size_ = static_cast<uintmax_t>(st.st_size);
+#endif
+    return true;
+  }
+
+  void Close() {
+#if defined(_WIN32)
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      ::CloseHandle(handle_);
+      handle_ = INVALID_HANDLE_VALUE;
+    }
+#else
+    if (handle_ >= 0) {
+      ::close(handle_);
+      handle_ = -1;
+    }
+#endif
+  }
+
+  uintmax_t file_size() const { return file_size_; }
+  const std::filesystem::path& resolved_path() const { return resolved_path_; }
+
+  std::filesystem::path LibraryPathForLoading() const {
+#if defined(_WIN32)
+    return resolved_path_;
+#else
+    if (handle_ < 0) return {};
+    return std::filesystem::path("/proc/self/fd") / std::to_string(handle_);
+#endif
+  }
+
+  bool ReadAll(std::vector<uint8_t>& buffer) const {
+    buffer.resize(static_cast<size_t>(file_size_));
+#if defined(_WIN32)
+    LARGE_INTEGER origin{};
+    if (!::SetFilePointerEx(handle_, origin, nullptr, FILE_BEGIN)) {
+      return false;
+    }
+    if (buffer.empty()) {
+      return true;
+    }
+    size_t offset = 0;
+    while (offset < buffer.size()) {
+      DWORD chunk = 0;
+      DWORD to_read = static_cast<DWORD>(std::min<uintmax_t>(buffer.size() - offset,
+                                                             std::numeric_limits<DWORD>::max()));
+      if (!::ReadFile(handle_, buffer.data() + offset, to_read, &chunk, nullptr)) {
+        return false;
+      }
+      if (chunk == 0) {
+        return false;
+      }
+      offset += static_cast<size_t>(chunk);
+    }
+    return true;
+#else
+    if (buffer.empty()) {
+      return true;
+    }
+    size_t offset = 0;
+    while (offset < buffer.size()) {
+      ssize_t result =
+          ::pread(handle_, buffer.data() + offset, buffer.size() - offset, static_cast<off_t>(offset));
+      if (result < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        return false;
+      }
+      if (result == 0) {
+        return false;
+      }
+      offset += static_cast<size_t>(result);
+    }
+    return true;
+#endif
+  }
+
+ private:
+#if defined(_WIN32)
+  HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+  int handle_{-1};
+#endif
+  std::filesystem::path resolved_path_{};
+  uintmax_t file_size_{0};
+};
 
 struct ScopedLibrary {
 #if defined(_WIN32)
@@ -378,29 +526,36 @@ std::optional<VerifiedPluginMetadata> VerifyPlugin(const std::filesystem::path& 
     return std::nullopt;
   }
 
-  auto file_size = std::filesystem::file_size(resolved, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
-  if (ec) {
+  PluginFile plugin_file;
+  if (!plugin_file.Open(resolved)) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
     return std::nullopt;
   }
+
+  auto file_size = plugin_file.file_size();
   if (file_size > kMaxPluginImageBytes) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
     return std::nullopt;
   }
-
-  std::ifstream f(resolved, std::ios::binary);
-  if (!f)
+  if (file_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
     return std::nullopt;
-  std::vector<uint8_t> data(static_cast<size_t>(file_size));
-  if (!data.empty()) {
-    f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(file_size));
-    if (f.gcount() != static_cast<std::streamsize>(file_size)) {
-      return std::nullopt;
-    }
+  }
+
+  std::vector<uint8_t> data;
+  if (!plugin_file.ReadAll(data)) { // TSK142_Plugin_Security_Bypass_Vulnerabilities
+    return std::nullopt;
   }
   auto hash = qv::crypto::SHA256_Hash(data);
 
-  auto last_write_time = std::filesystem::last_write_time(resolved, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
-  if (ec) {
+  auto library_path = plugin_file.LibraryPathForLoading(); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (library_path.empty()) {
     return std::nullopt;
+  }
+  auto last_write_time = std::filesystem::last_write_time(library_path, ec); // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (ec) {
+    ec.clear();
+    last_write_time = std::filesystem::last_write_time(resolved, ec);
+    if (ec) {
+      return std::nullopt;
+    }
   }
 
   VerifiedPluginMetadata metadata{}; // TSK142_Plugin_Security_Bypass_Vulnerabilities
@@ -462,7 +617,7 @@ std::optional<VerifiedPluginMetadata> VerifyPlugin(const std::filesystem::path& 
     return std::nullopt;                                                               // TSK142_Plugin_Security_Bypass_Vulnerabilities
   }
 
-  auto abi = QueryPluginABI(resolved);                                                 // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  auto abi = QueryPluginABI(library_path);                                             // TSK142_Plugin_Security_Bypass_Vulnerabilities
   if (!abi) {
     return std::nullopt;
   }
@@ -486,7 +641,7 @@ std::optional<VerifiedPluginMetadata> VerifyPlugin(const std::filesystem::path& 
   if (abi->has_selftest && !abi->selftest_passed) {
     return std::nullopt;
   }
-  if (!HasSecurityFlags(resolved)) return std::nullopt; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (!HasSecurityFlags(library_path)) return std::nullopt; // TSK142_Plugin_Security_Bypass_Vulnerabilities
   return metadata;
 }
 
