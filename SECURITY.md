@@ -48,6 +48,9 @@ days and provide a remediation timeline within 7 days.
 ## Hardening checklist for releases
 
 1. Build with `-DQV_USE_STUB_CRYPTO=OFF` and vendor OpenSSL/libsodium/liboqs.
+   <!-- // TSK942_PQC_Liboqs_Optional_Build --> Deployments missing liboqs
+   compile with PQC disabled; release builds must treat this as a blocking
+   configuration error because PQC volume provisioning and mounts will fail.
 2. Run the threat-model validation steps in `THREATMODEL.md`.
 3. Audit the nonce log for monotonic counters after migrations.
 4. Re-sign all plugins and update the trust store fingerprints.

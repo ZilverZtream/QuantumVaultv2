@@ -19,6 +19,13 @@
 
 #include <span>
 
+#if defined(QV_USE_STUB_CRYPTO) || !QV_HAVE_LIBOQS
+int main() {
+  std::cout << "qv_constant_time_mount_test skipped: PQC backend unavailable\n"; // TSK942_PQC_Liboqs_Optional_Build skip message
+  return 0;
+}
+#else
+
 namespace {
 // TSK004 / TSK013
 constexpr std::array<uint8_t, 8> kMagic = {'Q','V','A','U','L','T','\0','\0'};
@@ -277,3 +284,5 @@ int main() {
   std::cout << "constant-time mount tests ok\n";
   return 0;
 }
+
+#endif // TSK942_PQC_Liboqs_Optional_Build conditional PQC test

@@ -14,14 +14,12 @@
 #include "qv/crypto/hkdf.h" // TSK106_Cryptographic_Implementation_Weaknesses
 #include "qv/crypto/random.h" // TSK106_Cryptographic_Implementation_Weaknesses
 
-// TSK_CRIT_10: liboqs is now a required dependency for PQC security
-#if !defined(QV_USE_STUB_CRYPTO) && __has_include(<oqs/oqs.h>)
-#define QV_HAVE_LIBOQS 1
+// TSK942_PQC_Liboqs_Optional_Build conditional PQC backend wiring
+#if !defined(QV_USE_STUB_CRYPTO) && QV_HAVE_LIBOQS
+#define QV_PQC_BACKEND_AVAILABLE 1
 #include <oqs/oqs.h>
 #else
-#define QV_HAVE_LIBOQS 0
-// TSK_CRIT_10: Fail build if liboqs is not available
-#error "liboqs is required for PQC security. Install liboqs and configure with -DQV_HAVE_LIBOQS=1 or disable PQC entirely."
+#define QV_PQC_BACKEND_AVAILABLE 0
 #endif
 
 #include <openssl/evp.h>
@@ -47,7 +45,7 @@ void RandomBytes(std::span<uint8_t> out) {
   qv::crypto::SystemRandomBytes(out); // TSK106_Cryptographic_Implementation_Weaknesses
 }
 
-#if QV_HAVE_LIBOQS
+#if QV_PQC_BACKEND_AVAILABLE
 using KemPtr = std::unique_ptr<OQS_KEM, decltype(&OQS_KEM_free)>;
 
 KemPtr MakeKem() {
@@ -56,6 +54,15 @@ KemPtr MakeKem() {
     throw Error(ErrorDomain::Crypto, -1, "OQS_KEM_new(ML-KEM-768) failed");
   }
   return KemPtr(raw, &OQS_KEM_free);
+}
+#endif
+
+#if !QV_PQC_BACKEND_AVAILABLE
+[[noreturn]] void ThrowPqcUnavailable(std::string_view action) {
+  throw Error(ErrorDomain::Configuration,
+              -1,
+              std::string(action) +
+                  ": PQC hybrid KDF requires liboqs support at build time"); // TSK942_PQC_Liboqs_Optional_Build runtime guard
 }
 #endif
 
@@ -97,6 +104,9 @@ void AppendContribution(std::vector<uint8_t>& buffer, std::string_view label,
 } // namespace
 
 PQCKeyEncapsulation::KeyPair PQCKeyEncapsulation::GenerateKeypair() {
+#if !QV_PQC_BACKEND_AVAILABLE
+  ThrowPqcUnavailable("PQCKeyEncapsulation::GenerateKeypair");
+#else
   KeyPair kp;
   // TSK_CRIT_04: Enforce strict locking for PQC secret keys
   kp.sk.RequireLocking();
@@ -107,10 +117,15 @@ PQCKeyEncapsulation::KeyPair PQCKeyEncapsulation::GenerateKeypair() {
     throw Error(ErrorDomain::Crypto, -1, "OQS_KEM_keypair failed");
   }
   return kp;
+#endif
 }
 
 PQCKeyEncapsulation::EncapsulationResult
 PQCKeyEncapsulation::Encapsulate(const std::array<uint8_t, PQC::PUBLIC_KEY_SIZE>& pk) {
+#if !QV_PQC_BACKEND_AVAILABLE
+  (void)pk;
+  ThrowPqcUnavailable("PQCKeyEncapsulation::Encapsulate");
+#else
   EncapsulationResult r{};
   // TSK_CRIT_10: No fallback - liboqs is required
   auto kem = MakeKem();
@@ -119,11 +134,17 @@ PQCKeyEncapsulation::Encapsulate(const std::array<uint8_t, PQC::PUBLIC_KEY_SIZE>
     throw Error(ErrorDomain::Crypto, -1, "OQS_KEM_encaps failed");
   }
   return r;
+#endif
 }
 
 std::array<uint8_t, PQC::SHARED_SECRET_SIZE>
 PQCKeyEncapsulation::Decapsulate(std::span<const uint8_t, PQC::SECRET_KEY_SIZE> sk,
                                  std::span<const uint8_t, PQC::CIPHERTEXT_SIZE> ct) {
+#if !QV_PQC_BACKEND_AVAILABLE
+  (void)sk;
+  (void)ct;
+  ThrowPqcUnavailable("PQCKeyEncapsulation::Decapsulate");
+#else
   std::array<uint8_t, PQC::SHARED_SECRET_SIZE> ss{};
   // TSK_CRIT_10: No fallback - liboqs is required
   auto kem = MakeKem();
@@ -132,6 +153,7 @@ PQCKeyEncapsulation::Decapsulate(std::span<const uint8_t, PQC::SECRET_KEY_SIZE> 
         "Failed to authenticate PQC secret key"); // TSK719_Crypto_Side_Channel_KEM_Failure ensure indistinguishable failure
   }
   return ss;
+#endif
 }
 
 PQCHybridKDF::CreationResult
@@ -140,6 +162,14 @@ PQCHybridKDF::Create(std::span<const uint8_t, 32> classical_key,
                      std::span<const uint8_t, 16> volume_uuid,
                      uint32_t header_version,
                      std::span<const uint8_t> epoch_tlv) {
+#if !QV_PQC_BACKEND_AVAILABLE
+  (void)classical_key;
+  (void)salt;
+  (void)volume_uuid;
+  (void)header_version;
+  (void)epoch_tlv;
+  ThrowPqcUnavailable("PQCHybridKDF::Create");
+#else
   PQCKeyEncapsulation kem;
   auto kp = kem.GenerateKeypair();
   ByteScopeWiper sk_guard(kp.sk.AsSpan());
@@ -178,6 +208,7 @@ PQCHybridKDF::Create(std::span<const uint8_t, 32> classical_key,
   result.kem_blob = tlv;
   result.hybrid_key = hybrid_key;
   return result;
+#endif
 }
 
 std::array<uint8_t, 32>
@@ -187,6 +218,15 @@ PQCHybridKDF::Mount(std::span<const uint8_t, 32> classical_key,
                     std::span<const uint8_t, 16> volume_uuid,
                     uint32_t header_version,
                     std::span<const uint8_t> epoch_tlv) {
+#if !QV_PQC_BACKEND_AVAILABLE
+  (void)classical_key;
+  (void)kem_blob;
+  (void)salt;
+  (void)volume_uuid;
+  (void)header_version;
+  (void)epoch_tlv;
+  ThrowPqcUnavailable("PQCHybridKDF::Mount");
+#else
   if (kem_blob.version != PQC::KEM_TLV_VERSION) {
     throw Error(ErrorDomain::Validation, -1, "Unsupported PQC KEM TLV version");
   }
@@ -225,6 +265,7 @@ PQCHybridKDF::Mount(std::span<const uint8_t, 32> classical_key,
   ByteScopeWiper ss_guard(std::span<uint8_t>(shared_secret.data(), shared_secret.size()));
 
   return DeriveHybridKey(classical_key, shared_secret, salt, volume_uuid);
+#endif
 }
 
 std::array<uint8_t, 32>

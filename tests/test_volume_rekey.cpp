@@ -18,6 +18,13 @@
 #include <string_view>
 #include <vector>
 
+#if defined(QV_USE_STUB_CRYPTO) || !QV_HAVE_LIBOQS
+int main() {
+  std::cout << "qv_volume_rekey_test skipped: PQC backend unavailable\n"; // TSK942_PQC_Liboqs_Optional_Build skip message
+  return 0;
+}
+#else
+
 namespace {
 constexpr std::array<uint8_t, 8> kMagic = {'Q', 'V', 'A', 'U', 'L', 'T', '\0', '\0'}; // TSK071_Epoch_Overflow_Safety
 constexpr uint16_t kTlvTypePbkdf2 = 0x1001;
@@ -293,3 +300,5 @@ int main() {
   std::cout << "volume rekey tests ok\n";
   return 0;
 }
+
+#endif // TSK942_PQC_Liboqs_Optional_Build conditional PQC test

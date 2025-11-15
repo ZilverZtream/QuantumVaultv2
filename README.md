@@ -114,9 +114,11 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
 cmake --build build --config Release
 ```
 
-> liboqs is optional for now; when unavailable the build will continue with
-> PQC stubs. The README's security notes call out the locations that must be
-> revisited when swapping to production crypto providers.
+> <!-- // TSK942_PQC_Liboqs_Optional_Build -->
+> When `oqs/oqs.h` or `liboqs` are not detected, CMake emits a status line and
+> compiles the tree with PQC hybrid KDFs disabled. Any attempt to create or
+> mount PQC-enabled volumes at runtime fails with a configuration error so the
+> rest of the codebase can still be analyzed and tested.
 
 <!-- TSK035_Platform_Specific_Security_Integration -->
 ### Platform credential integration
