@@ -18,7 +18,8 @@ static const wchar_t kFilterDevicePath[] = L"\\\\.\\QvFlt";
 static const wchar_t kDiskDevicePath[] = L"\\\\.\\QvDisk";
 static const wchar_t kFirmwareVariableName[] = L"QVKey";
 static const wchar_t kFirmwareVariableGuid[] = L"{d16a4c54-0f07-4a28-9a5e-5de41a3b928c}";
-static const wchar_t kRecoveryKeyPath[] = L"C:\\ProgramData\\QuantumVault\\recovery.qvkey";
+// TSK_CRIT_20: Default path - configurable via registry HKLM\Software\QuantumVault\RecoveryKeyPath
+static const wchar_t kDefaultRecoveryKeyPath[] = L"C:\\ProgramData\\QuantumVault\\recovery.qvkey";
 
 #define QV_EFI_VARIABLE_BOOTSERVICE_ACCESS 0x00000002
 
@@ -75,9 +76,33 @@ static BOOL QvLoadFirmwareSessionKey(QVDISK_SESSION_KEY &session)
     return TRUE;
 }
 
+// TSK_CRIT_20: Query configurable recovery key path from registry
+static std::wstring QvGetRecoveryKeyPath()
+{
+    HKEY hKey = nullptr;
+    LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\QuantumVault", 0, KEY_QUERY_VALUE, &hKey);
+    if (result != ERROR_SUCCESS) {
+        return kDefaultRecoveryKeyPath;
+    }
+
+    wchar_t buffer[MAX_PATH] = {};
+    DWORD bufferSize = sizeof(buffer);
+    DWORD type = REG_SZ;
+    result = RegQueryValueExW(hKey, L"RecoveryKeyPath", nullptr, &type, reinterpret_cast<LPBYTE>(buffer), &bufferSize);
+    RegCloseKey(hKey);
+
+    if (result == ERROR_SUCCESS && type == REG_SZ && buffer[0] != L'\0') {
+        return std::wstring(buffer);
+    }
+
+    return kDefaultRecoveryKeyPath;
+}
+
 static BOOL QvLoadRecoveryKeyFromFile(QVDISK_RECOVERY_KEY_BLOB &blob)
 {
-    HANDLE file = CreateFileW(kRecoveryKeyPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // TSK_CRIT_20: Use configurable path instead of hardcoded path
+    std::wstring recoveryPath = QvGetRecoveryKeyPath();
+    HANDLE file = CreateFileW(recoveryPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         return FALSE;
     }

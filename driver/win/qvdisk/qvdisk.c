@@ -65,6 +65,10 @@ QvDiskImportKey(
     RtlCopyMemory(&g_QvDiskActiveKey, &request->sessionKey, sizeof(g_QvDiskActiveKey));
     g_QvDiskKeyLoaded = TRUE;
     g_QvDiskUsingRecovery = ((request->sessionKey.flags & QVDISK_IMPORT_FLAG_RECOVERY_KEY) != 0);
+
+    // TSK_CRIT_12: Zero out the input buffer to prevent key exposure via kernel memory disclosure
+    RtlSecureZeroMemory(InputBuffer, InputLength);
+
     return STATUS_SUCCESS;
 }
 

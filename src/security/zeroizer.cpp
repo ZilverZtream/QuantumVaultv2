@@ -64,46 +64,9 @@ namespace qv::security {
       }
     }
 
-    struct LockedRegion { // TSK085
-      uint8_t* ptr{nullptr};
-      std::size_t size{0};
-      std::size_t refcount{0};
-    };
-
-    std::mutex g_lock_registry_mutex;          // TSK085
-    std::vector<LockedRegion> g_lock_registry; // TSK085
-
-    void RegisterLock(uint8_t* ptr, std::size_t size) noexcept { // TSK085
-      if (!ptr || size == 0) {
-        return;
-      }
-      std::lock_guard<std::mutex> guard(g_lock_registry_mutex);
-      for (auto& region : g_lock_registry) {
-        if (region.ptr == ptr && region.size == size) {
-          region.refcount += 1;
-          return;
-        }
-      }
-      g_lock_registry.push_back(LockedRegion{ptr, size, 1});
-    }
-
-    bool UnregisterLock(uint8_t* ptr, std::size_t size) noexcept { // TSK085
-      if (!ptr || size == 0) {
-        return false;
-      }
-      std::lock_guard<std::mutex> guard(g_lock_registry_mutex);
-      for (auto it = g_lock_registry.begin(); it != g_lock_registry.end(); ++it) {
-        if (it->ptr == ptr && it->size == size) {
-          if (it->refcount > 1) {
-            it->refcount -= 1;
-          } else {
-            g_lock_registry.erase(it);
-          }
-          return true;
-        }
-      }
-      return false;
-    }
+    // TSK_CRIT_18: Removed global lock registry - SecureBuffer tracks its own locked regions
+    // in a per-instance std::vector<LockRegion>. The global registry was a severe
+    // performance bottleneck and unnecessary.
 
 #if !defined(_WIN32) && (defined(_POSIX_VERSION) || defined(__APPLE__))
     constexpr bool kHasPosixLocking = true; // TSK006
@@ -210,7 +173,7 @@ namespace qv::security {
 #endif
     status = qv::platform::LockMemory(data.data(), data.size());
     if (status == qv::platform::MemoryLockStatus::kLocked) {
-      RegisterLock(data.data(), data.size());
+      // TSK_CRIT_18: No global registry - SecureBuffer tracks its own regions
       return LockStatus::Locked;
     }
     if (status == qv::platform::MemoryLockStatus::kBestEffort) {
@@ -219,14 +182,12 @@ namespace qv::security {
     return LockStatus::Unsupported;
   }
 
-  void Zeroizer::UnlockMemory(std::span<uint8_t> data) noexcept { // TSK006, TSK085
+  void Zeroizer::UnlockMemory(std::span<uint8_t> data) noexcept { // TSK006, TSK085, TSK_CRIT_18
     if (data.empty()) {
       return;
     }
 
-    if (!UnregisterLock(data.data(), data.size())) {
-      return;
-    }
+    // TSK_CRIT_18: No global registry - SecureBuffer manages unlocking per-instance
     qv::platform::UnlockMemory(data.data(), data.size());
   }
 
