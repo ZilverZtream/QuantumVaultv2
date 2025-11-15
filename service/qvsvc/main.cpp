@@ -13,6 +13,8 @@ static SERVICE_STATUS_HANDLE g_ServiceStatusHandle = nullptr;
 static HANDLE g_StopEvent = nullptr;
 static HANDLE g_DeviceHandle = nullptr;
 static BOOL g_UsingDiskDriver = FALSE;
+static QVDISK_SESSION_KEY g_CachedSessionKey = {};
+static BOOL g_HaveCachedSessionKey = FALSE;
 
 static const wchar_t kFilterDevicePath[] = L"\\\\.\\QvFlt";
 static const wchar_t kDiskDevicePath[] = L"\\\\.\\QvDisk";
@@ -58,6 +60,24 @@ static BOOL QvSendDiskSessionKey(HANDLE device, const QVDISK_SESSION_KEY &sessio
     BOOL result = DeviceIoControl(device, IOCTL_QVDISK_IMPORT_SESSION_KEY, &request, sizeof(request), nullptr, 0, &bytesReturned, nullptr);
     QvSecureZero(&request, sizeof(request));
     return result;
+}
+
+static VOID QvInvalidateCachedSessionKey()
+{
+    // TSK_CRIT_06
+    if (!g_HaveCachedSessionKey) {
+        return;
+    }
+
+    QvSecureZero(&g_CachedSessionKey, sizeof(g_CachedSessionKey));
+    g_HaveCachedSessionKey = FALSE;
+}
+
+static VOID QvCacheSessionKey(const QVDISK_SESSION_KEY &session)
+{
+    // TSK_CRIT_06
+    CopyMemory(&g_CachedSessionKey, &session, sizeof(g_CachedSessionKey));
+    g_HaveCachedSessionKey = TRUE;
 }
 
 static BOOL QvClearFirmwareSessionKey()
@@ -152,15 +172,11 @@ static VOID QvHandlePowerEvent(DWORD eventType)
         DeviceIoControl(g_DeviceHandle, IOCTL_QVDISK_LOCK, nullptr, 0, nullptr, 0, nullptr, nullptr);
         break;
     case PBT_APMRESUMEAUTOMATIC:
-    {
-        QVDISK_SESSION_KEY session = {};
-        if (QvLoadFirmwareSessionKey(session)) {
-            QvSendDiskSessionKey(g_DeviceHandle, session, FALSE);
-            QvClearFirmwareSessionKey();
+        if (g_HaveCachedSessionKey) {
+            // TSK_CRIT_06
+            QvSendDiskSessionKey(g_DeviceHandle, g_CachedSessionKey, FALSE);
         }
-        QvSecureZero(&session, sizeof(session));
         break;
-    }
     default:
         break;
     }
@@ -256,8 +272,13 @@ static DWORD WINAPI QvServiceWorker(LPVOID context)
     if (g_UsingDiskDriver) {
         QVDISK_SESSION_KEY session = {};
         if (QvLoadFirmwareSessionKey(session)) {
-            QvSendDiskSessionKey(device, session, FALSE);
-            QvClearFirmwareSessionKey();
+            if (QvSendDiskSessionKey(device, session, FALSE)) {
+                // TSK_CRIT_06
+                QvCacheSessionKey(session);
+                QvClearFirmwareSessionKey();
+            } else {
+                QvInvalidateCachedSessionKey();
+            }
         }
         QvEnrollRecoveryKey(device);
         QvSecureZero(&session, sizeof(session));
@@ -279,6 +300,7 @@ static DWORD WINAPI QvServiceWorker(LPVOID context)
     CloseHandle(device);
     g_DeviceHandle = nullptr;
     g_UsingDiskDriver = FALSE;
+    QvInvalidateCachedSessionKey();
     return NO_ERROR;
 }
 
