@@ -8,6 +8,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view> // TSK432_Crypto_Hybrid_KDF labeled HKDF helper
 #include <vector>
 
 #include "qv/crypto/hkdf.h" // TSK106_Cryptographic_Implementation_Weaknesses
@@ -39,6 +40,8 @@ namespace {
 
 static constexpr uint16_t kKemIdMlKem768 = 0x0300; // TSK003
 static constexpr std::array<uint8_t, 8> kPqcSkAadContext{'Q','V','P','Q','C','S','K','1'}; // TSK014
+constexpr std::string_view kClassicalLabel = "QV-HYBRID-CLASSICAL/v1"; // TSK432_Crypto_Hybrid_KDF labeled HKDF inputs
+constexpr std::string_view kPqcLabel = "QV-HYBRID-PQC/v1";             // TSK432_Crypto_Hybrid_KDF labeled HKDF inputs
 
 void RandomBytes(std::span<uint8_t> out) {
   qv::crypto::SystemRandomBytes(out); // TSK106_Cryptographic_Implementation_Weaknesses
@@ -80,6 +83,15 @@ std::vector<uint8_t> MakeStableAad(std::span<const uint8_t, 16> volume_uuid,
   aad.insert(aad.end(), version_bytes, version_bytes + sizeof(version_le));
   aad.insert(aad.end(), epoch_tlv.begin(), epoch_tlv.end());
   return aad;
+}
+
+void AppendContribution(std::vector<uint8_t>& buffer, std::string_view label,
+                        std::span<const uint8_t> data) { // TSK432_Crypto_Hybrid_KDF length-delimited contributions
+  const uint16_t length = static_cast<uint16_t>(data.size());
+  buffer.insert(buffer.end(), label.begin(), label.end());
+  buffer.push_back(static_cast<uint8_t>(length >> 8));
+  buffer.push_back(static_cast<uint8_t>(length & 0xFF));
+  buffer.insert(buffer.end(), data.begin(), data.end());
 }
 
 } // namespace
@@ -217,16 +229,21 @@ PQCHybridKDF::DeriveHybridKey(std::span<const uint8_t, 32> classical_key,
                               std::span<const uint8_t, 32> pqc_shared_secret,
                               std::span<const uint8_t> salt,
                               std::span<const uint8_t, 16> volume_uuid) {
-  std::array<uint8_t, 64> ikm{};
-  std::memcpy(ikm.data(), classical_key.data(), classical_key.size());
-  std::memcpy(ikm.data() + classical_key.size(), pqc_shared_secret.data(),
-              pqc_shared_secret.size());
-  ByteScopeWiper ikm_guard(ikm.data(), ikm.size());
+  std::vector<uint8_t> labeled_ikm; // TSK432_Crypto_Hybrid_KDF
+  labeled_ikm.reserve(kClassicalLabel.size() + kPqcLabel.size() + 4 +
+                      classical_key.size() + pqc_shared_secret.size());
+
+  AppendContribution(labeled_ikm, kClassicalLabel,
+                     std::span<const uint8_t>(classical_key.data(), classical_key.size()));
+  AppendContribution(labeled_ikm, kPqcLabel,
+                     std::span<const uint8_t>(pqc_shared_secret.data(), pqc_shared_secret.size()));
+  ByteScopeWiper ikm_guard(labeled_ikm.data(), labeled_ikm.size());
 
   const std::string info_label = std::string("QV-HYBRID/v4.1|") + FormatUuid(volume_uuid);
   const std::span<const uint8_t> info_span(
       reinterpret_cast<const uint8_t*>(info_label.data()), info_label.size());
 
-  return qv::crypto::HKDF_SHA256(std::span<const uint8_t>(ikm.data(), ikm.size()), salt,
-                                 info_span); // TSK106_Cryptographic_Implementation_Weaknesses
+  return qv::crypto::HKDF_SHA256(
+      std::span<const uint8_t>(labeled_ikm.data(), labeled_ikm.size()), salt,
+      info_span); // TSK106_Cryptographic_Implementation_Weaknesses
 }
