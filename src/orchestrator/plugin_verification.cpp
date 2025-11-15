@@ -203,6 +203,12 @@ class PluginFile { // TSK142_Plugin_Security_Bypass_Vulnerabilities maintain sin
 #endif
   }
 
+#if defined(_WIN32)
+  HANDLE native_handle() const { return handle_; }
+#else
+  int native_handle() const { return handle_; }
+#endif
+
   bool ReadAll(std::vector<uint8_t>& buffer) const {
     buffer.resize(static_cast<size_t>(file_size_));
 #if defined(_WIN32)
@@ -259,6 +265,8 @@ class PluginFile { // TSK142_Plugin_Security_Bypass_Vulnerabilities maintain sin
   std::filesystem::path resolved_path_{};
   uintmax_t file_size_{0};
 };
+
+bool HasSecurityFlags(const PluginFile& file); // TSK_CRIT_14 ensure verification uses trusted handles
 
 struct ScopedLibrary {
 #if defined(_WIN32)
@@ -641,24 +649,25 @@ std::optional<VerifiedPluginMetadata> VerifyPlugin(const std::filesystem::path& 
   if (abi->has_selftest && !abi->selftest_passed) {
     return std::nullopt;
   }
-  if (!HasSecurityFlags(library_path)) return std::nullopt; // TSK142_Plugin_Security_Bypass_Vulnerabilities
+  if (!HasSecurityFlags(plugin_file)) return std::nullopt; // TSK142_Plugin_Security_Bypass_Vulnerabilities & TSK_CRIT_14
   return metadata;
 }
 
-bool HasSecurityFlags(const std::filesystem::path& path) {
+bool HasSecurityFlags(const PluginFile& file) {
 #if defined(_WIN32)
-  (void)path;
-  return VerifyPlatformSignature(path);
+  return VerifyPlatformSignature(file.LibraryPathForLoading());
 #else
-  std::error_code ec;
-  auto status = std::filesystem::status(path, ec);
-  if (ec) {
+  int fd = file.native_handle();
+  if (fd < 0) {
     return false;
   }
-  auto perms = status.permissions();
-  const bool locked = (perms & std::filesystem::perms::group_write) == std::filesystem::perms::none &&
-                      (perms & std::filesystem::perms::others_write) == std::filesystem::perms::none;
-  return locked && VerifyPlatformSignature(path);
+  struct stat st {
+  };
+  if (::fstat(fd, &st) != 0) {
+    return false; // TSK_CRIT_14 guard against TOCTOU when file disappears
+  }
+  const bool locked = (st.st_mode & S_IWGRP) == 0 && (st.st_mode & S_IWOTH) == 0; // TSK_CRIT_14 descriptor-based perms
+  return locked && VerifyPlatformSignature(file.LibraryPathForLoading());
 #endif
 }
 

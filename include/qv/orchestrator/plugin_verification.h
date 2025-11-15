@@ -64,7 +64,7 @@ struct VerifiedPluginMetadata { // TSK142_Plugin_Security_Bypass_Vulnerabilities
 
 std::optional<VerifiedPluginMetadata> VerifyPlugin(const std::filesystem::path& path,
                                                    const PluginVerification& expected);
-bool HasSecurityFlags(const std::filesystem::path& path);
+// TSK_CRIT_14 tighten plugin file flag verification to a single trusted handle
 std::optional<PluginAbiQueryResult> QueryPluginABI(const std::filesystem::path& path);
 bool Ed25519_Verify(std::span<const uint8_t,32> pubkey,
                     std::span<const uint8_t,32> msg_hash,
