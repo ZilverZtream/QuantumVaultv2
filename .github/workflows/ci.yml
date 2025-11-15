@@ -26,18 +26,18 @@ jobs:
       - name: Install dudect runner # TSK022
         run: python -m pip install --upgrade pip dudect
 
-      - name: Install dependencies (Ubuntu) # TSK018
+      - name: Install dependencies (Ubuntu) # TSK018 TSK801_CI_Build_Integrity_Gaps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libssl-dev libsodium-dev
-          sudo apt-get install -y liboqs-dev || echo "liboqs-dev package not available on default channel" # TSK018
+          sudo apt-get install -y liboqs-dev # TSK801_CI_Build_Integrity_Gaps: fail if liboqs missing
 
-      - name: Install dependencies (macOS) # TSK018
+      - name: Install dependencies (macOS) # TSK018 TSK801_CI_Build_Integrity_Gaps
         if: runner.os == 'macOS'
         run: |
           brew update
-          brew install cmake ninja openssl libsodium liboqs || true
+          brew install cmake ninja openssl libsodium liboqs # TSK801_CI_Build_Integrity_Gaps: fail if deps missing
 
       - name: Install dependencies (Windows) # TSK018
         if: runner.os == 'Windows'
@@ -125,11 +125,11 @@ jobs:
       - name: Install dudect runner # TSK022
         run: python -m pip install --upgrade pip dudect
 
-      - name: Install dependencies (Ubuntu) # TSK018
+      - name: Install dependencies (Ubuntu) # TSK018 TSK801_CI_Build_Integrity_Gaps
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config libssl-dev libsodium-dev
-          sudo apt-get install -y liboqs-dev || echo "liboqs-dev package not available on default channel" # TSK018
+          sudo apt-get install -y liboqs-dev # TSK801_CI_Build_Integrity_Gaps: fail if liboqs missing
 
       - name: Verify ASLR configuration # TSK018
         run: |

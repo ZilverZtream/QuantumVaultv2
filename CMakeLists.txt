@@ -106,7 +106,12 @@ find_library(LIBOQS_LIBRARY oqs)
 if (LIBOQS_INCLUDE_DIR AND LIBOQS_LIBRARY)
   set(qv_have_liboqs ON)
 else()
-  message(STATUS "liboqs not found; PQC hybrid KDF will be disabled at runtime") # TSK942_PQC_Liboqs_Optional_Build status hint
+  # TSK801_CI_Build_Integrity_Gaps: block release builds without PQC support
+  if (CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    message(FATAL_ERROR "liboqs is required for Release and RelWithDebInfo builds to ensure PQC support; install liboqs or use Debug build type")
+  else()
+    message(STATUS "liboqs not found; PQC hybrid KDF will be disabled at runtime") # TSK942_PQC_Liboqs_Optional_Build status hint
+  endif()
 endif()
 
 set(qv_have_sodium OFF)
@@ -459,7 +464,12 @@ endif()
              COMMAND ${DUDECT_RUNNER} --test=mount_timing --samples=1000000
              WORKING_DIRECTORY ${CMAKE_BINARY_DIR}) # TSK022
   else()
-    message(WARNING "dudect_runner not found; constant-time analysis skipped") # TSK022
+    # TSK801_CI_Build_Integrity_Gaps: fail in CI/release builds to ensure constant-time validation
+    if (DEFINED ENV{CI} OR CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+      message(FATAL_ERROR "dudect_runner is required for CI and release builds to validate constant-time cryptography; install dudect via pip")
+    else()
+      message(WARNING "dudect_runner not found; constant-time analysis skipped") # TSK022
+    endif()
   endif()
 
   add_custom_target(fuzz_tests COMMENT "Build fuzzing targets") # TSK030
