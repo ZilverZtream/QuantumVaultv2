@@ -35,6 +35,7 @@
 #else
 #include <sys/resource.h> // TSK236_Mount_Timeout_Bypass_Vulnerability process usage query
 #include <sys/time.h>     // TSK236_Mount_Timeout_Bypass_Vulnerability timeval helpers
+#include <sys/stat.h>     // TSK_CRIT_07 hard link aware failure tracking
 #endif
 
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
@@ -779,6 +780,7 @@ private:
   std::filesystem::path GlobalStatePath() const;
 
   static VolumeUuid NormalizeUuid(const std::optional<VolumeUuid>& uuid);
+  static std::optional<std::string> BuildFileIdentityKey(const std::filesystem::path& container); // TSK_CRIT_07
   static std::string BuildAttemptKey(const std::filesystem::path& container,
                                      const VolumeUuid& uuid); // TSK138_Rate_Limiting_And_DoS_Vulnerabilities container alias hardening
   static std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE> DeriveMacKey(const VolumeUuid& uuid);
@@ -1116,14 +1118,56 @@ VolumeUuid FailureTracker::NormalizeUuid(const std::optional<VolumeUuid>& uuid) 
   return normalized;
 }
 
+std::optional<std::string> FailureTracker::BuildFileIdentityKey(
+    const std::filesystem::path& container) { // TSK_CRIT_07
+#if defined(_WIN32)
+  HANDLE handle = ::CreateFileW(container.c_str(), 0,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return std::nullopt;
+  }
+  BY_HANDLE_FILE_INFORMATION info{};
+  const BOOL ok = ::GetFileInformationByHandle(handle, &info);
+  ::CloseHandle(handle);
+  if (!ok) {
+    return std::nullopt;
+  }
+  const uint64_t file_index =
+      (static_cast<uint64_t>(info.nFileIndexHigh) << 32) | static_cast<uint64_t>(info.nFileIndexLow);
+  std::string key = "fidw:";
+  key.append(std::to_string(static_cast<uint64_t>(info.dwVolumeSerialNumber)));
+  key.push_back(':');
+  key.append(std::to_string(file_index));
+  return key;
+#else
+  struct stat st {
+  };
+  if (::stat(container.c_str(), &st) != 0) {
+    return std::nullopt;
+  }
+  std::string key = "fid:";
+  key.append(std::to_string(static_cast<uint64_t>(st.st_dev)));
+  key.push_back(':');
+  key.append(std::to_string(static_cast<uint64_t>(st.st_ino)));
+  return key;
+#endif
+}
+
 std::string FailureTracker::BuildAttemptKey(const std::filesystem::path& container,
                                             const VolumeUuid& uuid) {
-  auto lock_key = LockFilePath(container).lexically_normal().generic_string();
+  auto identity_key = BuildFileIdentityKey(container);                             // TSK_CRIT_07
+  std::string lock_key;
+  if (identity_key) {
+    lock_key = *identity_key;
+  } else {
+    lock_key = LockFilePath(container).lexically_normal().generic_string();
 #if defined(_WIN32)
-  std::transform(lock_key.begin(), lock_key.end(), lock_key.begin(), [](unsigned char ch) {
-    return static_cast<char>(std::tolower(ch));
-  });
+    std::transform(lock_key.begin(), lock_key.end(), lock_key.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
 #endif
+  }
   const bool have_uuid = std::any_of(uuid.begin(), uuid.end(), [](uint8_t byte) { return byte != 0; });
   if (have_uuid) {
     lock_key.push_back('#');
