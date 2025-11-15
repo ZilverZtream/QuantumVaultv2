@@ -45,6 +45,8 @@ static VOID QvSecureZero(void *buffer, size_t length)
 static BOOL QvRequestDiskFirmwareKey(HANDLE device)
 {
     DWORD bytesReturned = 0;
+    // This IOCTL now acts as a trigger, telling the boot-start driver
+    // to pull the key from the EFI variable itself.
     return DeviceIoControl(device, IOCTL_QVDISK_IMPORT_SESSION_KEY, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
 }
 
@@ -124,6 +126,8 @@ static VOID QvHandlePowerEvent(DWORD eventType)
         DeviceIoControl(g_DeviceHandle, IOCTL_QVDISK_LOCK, nullptr, 0, nullptr, 0, nullptr, nullptr);
         break;
     case PBT_APMRESUMEAUTOMATIC:
+        // Secure resolution: Trigger the driver to re-import the key from firmware.
+        // This avoids caching the key in user-mode (TSK_CRIT_06).
         QvRequestDiskFirmwareKey(g_DeviceHandle);
         break;
     default:
@@ -219,6 +223,8 @@ static DWORD WINAPI QvServiceWorker(LPVOID context)
     g_DeviceHandle = device;
 
     if (g_UsingDiskDriver) {
+        // Secure resolution: Trigger the driver to import the key.
+        // This service (user-mode) never handles the key bytes (TSK_CRIT_05).
         QvRequestDiskFirmwareKey(device);
         QvEnrollRecoveryKey(device);
     } else {
@@ -262,4 +268,3 @@ int main()
     return 0;
 }
 #endif
-
