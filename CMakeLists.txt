@@ -100,6 +100,15 @@ if (NOT ARGON2_INCLUDE_DIR OR NOT ARGON2_LIBRARY)
   message(FATAL_ERROR "libargon2 (argon2.h) is required for TSK036_PBKDF2_Argon2_Migration_Path")
 endif()
 
+set(qv_have_liboqs OFF) # TSK942_PQC_Liboqs_Optional_Build
+find_path(LIBOQS_INCLUDE_DIR oqs/oqs.h)
+find_library(LIBOQS_LIBRARY oqs)
+if (LIBOQS_INCLUDE_DIR AND LIBOQS_LIBRARY)
+  set(qv_have_liboqs ON)
+else()
+  message(STATUS "liboqs not found; PQC hybrid KDF will be disabled at runtime") # TSK942_PQC_Liboqs_Optional_Build status hint
+endif()
+
 set(qv_have_sodium OFF)
 set(qv_sodium_target "")
 if (TARGET sodium::sodium)
@@ -141,11 +150,16 @@ endif()
 if (NOT QV_USE_STUB_CRYPTO AND qv_have_sodium)
   target_link_libraries(qv_core PRIVATE ${qv_sodium_target}) # TSK008
 endif()
+if (NOT QV_USE_STUB_CRYPTO AND qv_have_liboqs)
+  target_include_directories(qv_core PRIVATE ${LIBOQS_INCLUDE_DIR}) # TSK942_PQC_Liboqs_Optional_Build include real PQC headers
+  target_link_libraries(qv_core PRIVATE ${LIBOQS_LIBRARY}) # TSK942_PQC_Liboqs_Optional_Build link liboqs when available
+endif()
 target_compile_definitions(qv_core
     PUBLIC
       QV_HAVE_OPENSSL=1 # TSK008
       $<$<BOOL:${QV_USE_STUB_CRYPTO}>:QV_USE_STUB_CRYPTO=1> # TSK008
       QV_HAVE_SODIUM=$<BOOL:$<AND:$<BOOL:${qv_have_sodium}>,$<NOT:$<BOOL:${QV_USE_STUB_CRYPTO}>>>> # TSK008
+      QV_HAVE_LIBOQS=$<BOOL:${qv_have_liboqs}> # TSK942_PQC_Liboqs_Optional_Build propagate PQC availability
       $<$<BOOL:${QV_FIPS_MODE}>:QV_FIPS_MODE=1> # TSK023_Production_Crypto_Provider_Complete_Integration propagate FIPS mode
 )
 

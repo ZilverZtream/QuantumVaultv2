@@ -4,6 +4,11 @@
 QuantumVault pairs post-quantum key encapsulation with high-throughput
 symmetric encryption to secure bulk storage.
 
+<!-- // TSK942_PQC_Liboqs_Optional_Build -->
+When liboqs headers or libraries are unavailable the build completes with PQC
+hybrid KDFs disabled; attempts to provision or mount volumes that require ML-KEM
+fail with a configuration error so other subsystems remain testable.
+
 ## Key Hierarchy
 
 1. User secrets are strengthened through Argon2id to derive a 256-bit classical master key.
