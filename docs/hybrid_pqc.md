@@ -6,7 +6,6 @@ symmetric encryption to secure bulk storage.
 
 ## Key Hierarchy
 
-<!-- // TSK245 -->
 1. User secrets are strengthened through Argon2id to derive a 256-bit classical master key.
 2. The classical key encrypts (wraps) the ML-KEM-768 secret key with AES-256-GCM, storing the PQC ciphertext, nonce, and tag beside the PQC public key material.
 3. Per-purpose keys (data, metadata, index) are derived from the hybrid key via HMAC-based KDFs.
