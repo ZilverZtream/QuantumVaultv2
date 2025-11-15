@@ -17,6 +17,7 @@ inline constexpr std::string_view kUnableToCanonicalizeContainerRoot{"Unable to 
 inline constexpr std::string_view kFailedToCanonicalizeContainerPath{"Failed to canonicalize container path"};
 inline constexpr std::string_view kContainerEscapesAllowedRoot{"Container path escapes allowed root"};
 inline constexpr std::string_view kPathEscapeAttemptDetected{"Path escape attempt detected"};
+inline constexpr std::string_view kContainerIdentityUnavailable{"Unable to determine container identity"}; // TSK901_Security_Hardening
 inline constexpr std::string_view kUnsupportedArgon2HashLength{"Unsupported Argon2 hash length"};
 inline constexpr std::string_view kArgon2DerivationFailed{"Argon2id derivation failed"};
 inline constexpr std::string_view kArgon2Unavailable{"Argon2id support not available in this build"};
