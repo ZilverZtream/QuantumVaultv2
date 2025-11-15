@@ -12,11 +12,15 @@
 
 #include "qv/crypto/hkdf.h" // TSK106_Cryptographic_Implementation_Weaknesses
 #include "qv/crypto/random.h" // TSK106_Cryptographic_Implementation_Weaknesses
+
+// TSK_CRIT_10: liboqs is now a required dependency for PQC security
 #if !defined(QV_USE_STUB_CRYPTO) && __has_include(<oqs/oqs.h>)
 #define QV_HAVE_LIBOQS 1
 #include <oqs/oqs.h>
 #else
 #define QV_HAVE_LIBOQS 0
+// TSK_CRIT_10: Fail build if liboqs is not available
+#error "liboqs is required for PQC security. Install liboqs and configure with -DQV_HAVE_LIBOQS=1 or disable PQC entirely."
 #endif
 
 #include <openssl/evp.h>
@@ -82,33 +86,26 @@ std::vector<uint8_t> MakeStableAad(std::span<const uint8_t, 16> volume_uuid,
 
 PQCKeyEncapsulation::KeyPair PQCKeyEncapsulation::GenerateKeypair() {
   KeyPair kp;
-#if !QV_HAVE_LIBOQS
-  RandomBytes(std::span<uint8_t>(kp.pk.data(), kp.pk.size()));
-  RandomBytes(kp.sk.AsSpan());
-#else
+  // TSK_CRIT_04: Enforce strict locking for PQC secret keys
+  kp.sk.RequireLocking();
+  // TSK_CRIT_10: No fallback - liboqs is required
   auto kem = MakeKem();
   auto sk_span = kp.sk.AsSpan();
   if (OQS_KEM_keypair(kem.get(), kp.pk.data(), sk_span.data()) != OQS_SUCCESS) {
     throw Error(ErrorDomain::Crypto, -1, "OQS_KEM_keypair failed");
   }
-#endif
   return kp;
 }
 
 PQCKeyEncapsulation::EncapsulationResult
 PQCKeyEncapsulation::Encapsulate(const std::array<uint8_t, PQC::PUBLIC_KEY_SIZE>& pk) {
   EncapsulationResult r{};
-#if !QV_HAVE_LIBOQS
-  (void)pk;
-  RandomBytes(std::span<uint8_t>(r.ciphertext.data(), r.ciphertext.size()));
-  RandomBytes(std::span<uint8_t>(r.shared_secret.data(), r.shared_secret.size()));
-#else
+  // TSK_CRIT_10: No fallback - liboqs is required
   auto kem = MakeKem();
   if (OQS_KEM_encaps(kem.get(), r.ciphertext.data(), r.shared_secret.data(), pk.data()) !=
       OQS_SUCCESS) {
     throw Error(ErrorDomain::Crypto, -1, "OQS_KEM_encaps failed");
   }
-#endif
   return r;
 }
 
@@ -116,16 +113,11 @@ std::array<uint8_t, PQC::SHARED_SECRET_SIZE>
 PQCKeyEncapsulation::Decapsulate(std::span<const uint8_t, PQC::SECRET_KEY_SIZE> sk,
                                  std::span<const uint8_t, PQC::CIPHERTEXT_SIZE> ct) {
   std::array<uint8_t, PQC::SHARED_SECRET_SIZE> ss{};
-#if !QV_HAVE_LIBOQS
-  (void)sk;
-  (void)ct;
-  RandomBytes(std::span<uint8_t>(ss.data(), ss.size()));
-#else
+  // TSK_CRIT_10: No fallback - liboqs is required
   auto kem = MakeKem();
   if (OQS_KEM_decaps(kem.get(), ss.data(), ct.data(), sk.data()) != OQS_SUCCESS) {
     throw Error(ErrorDomain::Crypto, -1, "OQS_KEM_decaps failed");
   }
-#endif
   return ss;
 }
 
@@ -190,30 +182,23 @@ PQCHybridKDF::Mount(std::span<const uint8_t, 32> classical_key,
   auto aad = MakeStableAad(volume_uuid, header_version, epoch_tlv);
   ByteScopeWiper aad_guard(std::span<uint8_t>(aad.data(), aad.size())); // TSK125_Missing_Secure_Deletion_for_Keys scoped AAD wipe
 
-  std::vector<uint8_t> sk_plain;
+  // TSK_CRIT_03: Decrypt directly into SecureBuffer to avoid PQC key in pageable memory
+  SecureBuffer<uint8_t> sk_plain_secure(PQC::SECRET_KEY_SIZE);
+  // TSK_CRIT_04: Enforce strict locking for PQC secret key
+  sk_plain_secure.RequireLocking();
+
   try {
-    sk_plain = AES256_GCM_Decrypt(
+    AES256_GCM_Decrypt_Secure(
         std::span<const uint8_t>(kem_blob.sk_encrypted.data(), kem_blob.sk_encrypted.size()),
         aad,
         std::span<const uint8_t, AES256_GCM::NONCE_SIZE>(kem_blob.sk_nonce.data(), kem_blob.sk_nonce.size()),
         std::span<const uint8_t, AES256_GCM::TAG_SIZE>(kem_blob.sk_tag.data(), kem_blob.sk_tag.size()),
-        classical_key);
+        classical_key,
+        sk_plain_secure);
   } catch (const AuthenticationFailureError&) {
-    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe transient buffer on auth failure
     throw;
   } catch (const std::exception& ex) {
-    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe transient buffer on generic failure
     throw AuthenticationFailureError(std::string("Failed to decrypt PQC secret key: ") + ex.what());
-  }
-  ByteScopeWiper sk_plain_vector_guard(std::span<uint8_t>(sk_plain.data(), sk_plain.size())); // TSK125_Missing_Secure_Deletion_for_Keys decrypt buffer wipe
-  if (sk_plain.size() != PQC::SECRET_KEY_SIZE) {
-    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe rejected plaintext
-    throw Error(ErrorDomain::Validation, -1, "PQC secret key length mismatch");
-  }
-  SecureBuffer<uint8_t> sk_plain_secure(sk_plain.size()); // TSK097_Cryptographic_Key_Management secure PQC secret key buffer
-  if (!sk_plain.empty()) {
-    std::memcpy(sk_plain_secure.data(), sk_plain.data(), sk_plain.size());
-    Zeroizer::WipeVector(sk_plain); // TSK097_Cryptographic_Key_Management wipe temporary decrypt buffer
   }
   ByteScopeWiper sk_plain_guard(sk_plain_secure.AsSpan());
 

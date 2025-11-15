@@ -4,6 +4,9 @@
 #include <span>
 #include <vector>
 
+// TSK_CRIT_03: Forward declare SecureBuffer for secure decrypt interface
+namespace qv::security { template<typename T> class SecureBuffer; }
+
 namespace qv::crypto {
 
 struct AES256_GCM {
@@ -30,4 +33,15 @@ std::vector<uint8_t> AES256_GCM_Decrypt(std::span<const uint8_t> ciphertext,
                                         std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
                                         std::span<const uint8_t, AES256_GCM::TAG_SIZE> tag,
                                         std::span<const uint8_t, AES256_GCM::KEY_SIZE> key);
+
+// TSK_CRIT_03: Secure decrypt directly into locked, non-pageable memory
+// Decrypts |ciphertext| directly into |dest_buffer| without intermediate pageable buffers.
+// Throws AuthenticationFailureError on tag mismatch and qv::Error on other provider failures.
+void AES256_GCM_Decrypt_Secure(std::span<const uint8_t> ciphertext,
+                               std::span<const uint8_t> aad,
+                               std::span<const uint8_t, AES256_GCM::NONCE_SIZE> nonce,
+                               std::span<const uint8_t, AES256_GCM::TAG_SIZE> tag,
+                               std::span<const uint8_t, AES256_GCM::KEY_SIZE> key,
+                               qv::security::SecureBuffer<uint8_t>& dest_buffer);
+
 } // namespace qv::crypto

@@ -341,7 +341,7 @@ namespace {
     void Release() noexcept { path_.clear(); }
 
   private:
-    void Cleanup() {
+    void Cleanup() { // TSK_CRIT_17: Remove false security - modern filesystems don't guarantee in-place overwrites
       if (path_.empty()) {
         return;
       }
@@ -350,22 +350,10 @@ namespace {
         path_.clear();
         return;
       }
-      std::error_code size_ec;
-      const std::uintmax_t size = std::filesystem::file_size(path_, size_ec);
-      if (!size_ec) {
-        std::fstream out(path_, std::ios::binary | std::ios::in | std::ios::out);
-        if (out) {
-          std::vector<uint8_t> zeros(4096, 0);
-          out.seekp(0, std::ios::beg);
-          std::uintmax_t remaining = size;
-          while (remaining > 0) {
-            const size_t chunk = static_cast<size_t>(std::min<std::uintmax_t>(remaining, zeros.size()));
-            out.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(chunk));
-            remaining -= chunk;
-          }
-          out.flush();
-        }
-      }
+      // TSK_CRIT_17: Removed insecure zeroing attempt - CoW and journaling filesystems
+      // provide no guarantee that writing zeros will overwrite data in-place.
+      // Sensitive data may persist on disk. For true secure deletion, use
+      // platform-specific APIs if available or accept data remanence.
       std::error_code remove_ec;
       if (!std::filesystem::remove(path_, remove_ec) && remove_ec) { // TSK101_File_IO_Persistence_and_Atomicity surface cleanup failures
         std::cerr << "TempFileGuard cleanup failed for " << path_ << ": "
@@ -570,10 +558,13 @@ namespace {
     return hash;
   }
 
+  // TSK_CRIT_19: The binding parameter should contain a hash of PLAINTEXT data or other
+  // critical unencrypted metadata, NOT ciphertext (which is already authenticated by the AEAD tag).
+  // Proper use: bind hash of plaintext chunk, file path, user ID, or other metadata.
   std::array<uint8_t, kMacSize> ComputeMac(std::span<const uint8_t, kMacSize> prev_mac,
                                            uint64_t counter,
                                            std::span<const uint8_t, kMacSize> key,
-                                           std::span<const uint8_t> binding) { // TSK128_Missing_AAD_Validation_in_Chunks bind ciphertext
+                                           std::span<const uint8_t> binding) { // TSK128_Missing_AAD_Validation_in_Chunks bind metadata
     struct MACHeader {
       std::array<uint8_t, kMacSize> previous;
       uint64_t counter_be;
@@ -927,10 +918,10 @@ void NonceLog::ReloadUnlocked() {
                                                        "Nonce log header overhead overflow"),
                                             kMacSize,
                                             "Nonce log MAC overhead overflow"); // TSK100_Integer_Overflow_and_Arithmetic header guard
-  if (entries_bytes < header_overhead) {
+  if (entries_bytes < header_overhead) { // TSK_CRIT_15 prevent underflow
     throw Error{ErrorDomain::Validation, 0, "Nonce log entries truncated"};
   }
-  const size_t entry_bytes = entries_bytes - header_overhead;
+  const size_t entry_bytes = entries_bytes - header_overhead; // TSK_CRIT_15 safe after bounds check
   if (entry_bytes % kEntrySize != 0) {
     throw Error{ErrorDomain::Validation, 0, "Nonce log entry misalignment"};
   }
@@ -1161,10 +1152,10 @@ size_t NonceLog::Repair() { // TSK032_Backup_Recovery_and_Disaster_Recovery
                                                        "Nonce log header overhead overflow"),
                                             kMacSize,
                                             "Nonce log MAC overhead overflow"); // TSK100_Integer_Overflow_and_Arithmetic header guard
-  if (entries_bytes < header_overhead) {
+  if (entries_bytes < header_overhead) { // TSK_CRIT_15 prevent underflow
     throw Error{ErrorDomain::Validation, 0, "Nonce log entries truncated"};
   }
-  const size_t entry_bytes = entries_bytes - header_overhead;
+  const size_t entry_bytes = entries_bytes - header_overhead; // TSK_CRIT_15 safe after bounds check
   const size_t entry_slots = entry_bytes / kEntrySize;
   const size_t trailing_bytes = entry_bytes % kEntrySize;
 
