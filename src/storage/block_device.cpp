@@ -52,6 +52,22 @@ constexpr uint32_t kHeaderIntegrityVersion = 1; // TSK122_Weak_CRC32_for_Chunk_H
 
 using HeaderMac = std::array<uint8_t, qv::crypto::HMAC_SHA256::TAG_SIZE>;
 
+bool SafeMultiply(uint64_t lhs, uint64_t rhs, uint64_t& result) { // TSK302_Integer_Overflow_in_Chunk_Calculations
+  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+    return false;
+  }
+  result = lhs * rhs;
+  return true;
+}
+
+bool SafeAdd(uint64_t lhs, uint64_t rhs, uint64_t& result) { // TSK302_Integer_Overflow_in_Chunk_Calculations
+  if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
+    return false;
+  }
+  result = lhs + rhs;
+  return true;
+}
+
 HeaderMac ComputeHeaderMAC(const ChunkHeader& header, std::span<const uint8_t> key) {
   ChunkHeader canonical = header;
   canonical.header_mac.fill(0);
@@ -229,17 +245,18 @@ uint64_t BlockDevice::ByteOffsetForChunk(int64_t chunk_index) const { // TSK107_
     throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};
   }
   const uint64_t u_index = static_cast<uint64_t>(chunk_index);
-  if (record_size_ != 0 && u_index > 0 &&
-      record_size_ > std::numeric_limits<uint64_t>::max() / u_index) {
-    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"};  // TSK100_Integer_Overflow_and_Arithmetic guard chunk offset // TSK119_Integer_Overflow_in_Chunk_Calculations avoid division-based overflow
+  uint64_t offset = 0;
+  if (!SafeMultiply(record_size_, u_index, offset)) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"};  // TSK100_Integer_Overflow_and_Arithmetic guard chunk offset // TSK302_Integer_Overflow_in_Chunk_Calculations safe multiply
   }
-  return u_index * record_size_;
+  return offset;
 }
 
 std::streampos BlockDevice::OffsetForChunk(int64_t chunk_index) const { // TSK107_Platform_Specific_Issues
   const uint64_t offset = ByteOffsetForChunk(chunk_index);
-  if (offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-    throw Error{ErrorDomain::Validation, 0, "Chunk offset exceeds stream range"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard cast
+  const auto max_stream_offset = static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max());
+  if (offset > max_stream_offset) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk offset exceeds stream range"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard cast // TSK302_Integer_Overflow_in_Chunk_Calculations validate stream conversion
   }
   static_assert(sizeof(std::streamoff) >= sizeof(int64_t),
                 "BlockDevice requires 64-bit stream offsets"); // TSK107_Platform_Specific_Issues enforce large file support
@@ -260,10 +277,10 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
     throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};
   }
   const uint64_t chunk_index_u = static_cast<uint64_t>(header.chunk_index);
-  if (chunk_index_u > std::numeric_limits<uint64_t>::max() / kPayloadSize) {
-    throw Error{ErrorDomain::Validation, 0, "Logical offset overflow"};
+  uint64_t expected_offset = 0;
+  if (!SafeMultiply(chunk_index_u, kPayloadSize, expected_offset)) {
+    throw Error{ErrorDomain::Validation, 0, "Logical offset overflow"};  // TSK108_Data_Structure_Invariants // TSK302_Integer_Overflow_in_Chunk_Calculations safe multiply
   }
-  const uint64_t expected_offset = chunk_index_u * kPayloadSize;  // TSK108_Data_Structure_Invariants
   if (header.logical_offset != expected_offset) {
     throw Error{ErrorDomain::Validation, 0, "Header logical offset mismatch"};
   }
@@ -279,11 +296,15 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   const uint64_t base_offset = ByteOffsetForChunk(header.chunk_index); // TSK107_Platform_Specific_Issues preserve 64-bit arithmetic
   const uint64_t current_size =
       std::filesystem::exists(path_) ? std::filesystem::file_size(path_) : 0ULL;
-  const uint64_t final_size = std::max<uint64_t>(base_offset + record_size_, current_size);
+  uint64_t record_end = 0;
+  if (!SafeAdd(base_offset, record_size_, record_end)) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk end offset overflow"};  // TSK302_Integer_Overflow_in_Chunk_Calculations safe add
+  }
+  const uint64_t final_size = std::max<uint64_t>(record_end, current_size);
   const uint64_t staging_offset_value = final_size;
 
   std::vector<uint8_t> previous_record; // TSK098_Exception_Safety_and_Resource_Leaks
-  if (base_offset + record_size_ <= current_size) {
+  if (record_end <= current_size) {
     previous_record.resize(static_cast<size_t>(record_size_));
     file_.seekg(offset);
     if (!file_) {
@@ -303,7 +324,11 @@ void BlockDevice::WriteChunk(const ChunkHeader& header, std::span<const uint8_t>
   std::memcpy(record.data(), &prepared_header, sizeof(prepared_header));
   std::memcpy(record.data() + sizeof(prepared_header), ciphertext.data(), ciphertext.size());
 
-  EnsureSizeUnlocked(staging_offset_value + record_size_);
+  uint64_t staging_end = 0;
+  if (!SafeAdd(staging_offset_value, record_size_, staging_end)) {
+    throw Error{ErrorDomain::Validation, 0, "Staging offset overflow"};  // TSK302_Integer_Overflow_in_Chunk_Calculations safe add
+  }
+  EnsureSizeUnlocked(staging_end);
   ResizeRollbackGuard rollback(path_, current_size); // TSK098_Exception_Safety_and_Resource_Leaks
 
   auto write_buffer = [&](std::streampos position) {

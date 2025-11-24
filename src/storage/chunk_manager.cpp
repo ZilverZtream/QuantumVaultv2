@@ -46,6 +46,14 @@ std::array<uint8_t, 32> DeriveChunkKey(std::span<const uint8_t, 32> master) {
   return qv::core::DeriveDataKey(master);
 }
 
+bool SafeMultiply(uint64_t lhs, uint64_t rhs, uint64_t& result) { // TSK302_Integer_Overflow_in_Chunk_Calculations shared guard
+  if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+    return false;
+  }
+  result = lhs * rhs;
+  return true;
+}
+
 size_t ExpectedTagSize(qv::crypto::CipherType cipher) { // TSK083_AAD_Recompute_and_Binding
   switch (cipher) {
     case qv::crypto::CipherType::AEGIS_128X:
@@ -232,14 +240,19 @@ std::vector<uint8_t> ChunkManager::ReadChunkFromDevice(int64_t chunk_index) {
   if (record.ciphertext.size() != kChunkPayloadSize) {  // TSK078_Chunk_Integrity_and_Bounds
     throw Error{ErrorDomain::Validation, 0, "Ciphertext payload size mismatch"};
   }
+  if (record.header.chunk_index < 0) {
+    throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};  // TSK302_Integer_Overflow_in_Chunk_Calculations header bounds
+  }
   if (record.header.chunk_index != chunk_index) {  // TSK078_Chunk_Integrity_and_Bounds
     throw Error{ErrorDomain::Validation, 0, "Chunk index mismatch"};
   }
   if (record.header.epoch != epoch_) {  // TSK078_Chunk_Integrity_and_Bounds
     throw Error{ErrorDomain::Validation, 0, "Chunk epoch mismatch"};
   }
-  const uint64_t expected_offset =
-      static_cast<uint64_t>(record.header.chunk_index) * kChunkPayloadSize; // TSK083_AAD_Recompute_and_Binding
+  uint64_t expected_offset = 0;
+  if (!SafeMultiply(static_cast<uint64_t>(record.header.chunk_index), kChunkPayloadSize, expected_offset)) {
+    throw Error{ErrorDomain::Validation, 0, "Logical offset overflow"};  // TSK083_AAD_Recompute_and_Binding // TSK302_Integer_Overflow_in_Chunk_Calculations safe multiply
+  }
   if (record.header.logical_offset != expected_offset) {
     throw Error{ErrorDomain::Validation, 0, "Logical offset mismatch"};
   }
@@ -331,14 +344,13 @@ QV_SENSITIVE_FUNCTION void ChunkManager::PersistChunk(int64_t chunk_index,
     throw Error{ErrorDomain::Validation, 0, "Negative chunk index"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard bounds
   }
   const uint64_t chunk_index_u = static_cast<uint64_t>(chunk_index);
-  if (chunk_index_u > 0 &&
-      kChunkPayloadSize > std::numeric_limits<uint64_t>::max() / chunk_index_u) {
-    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard logical offset
+  uint64_t logical_offset = 0;
+  if (!SafeMultiply(chunk_index_u, kChunkPayloadSize, logical_offset)) {
+    throw Error{ErrorDomain::Validation, 0, "Chunk offset overflow"};  // TSK119_Integer_Overflow_in_Chunk_Calculations guard logical offset // TSK302_Integer_Overflow_in_Chunk_Calculations safe multiply
   }
   std::array<uint8_t, kChunkPayloadSize> plaintext{};
   qv::security::Zeroizer::ScopeWiper plaintext_guard(plaintext.data(), plaintext.size()); // TSK028A_Memory_Wiping_Gaps
   std::fill(plaintext.begin(), plaintext.end(), 0);
-  auto logical_offset = chunk_index_u * kChunkPayloadSize;  // TSK119_Integer_Overflow_in_Chunk_Calculations
   auto copy_size = std::min<size_t>(data.size(), plaintext.size());
   if (copy_size > std::numeric_limits<uint32_t>::max()) {
     throw Error{ErrorDomain::Validation, 0, "Chunk payload too large"}; // TSK100_Integer_Overflow_and_Arithmetic guard cast
